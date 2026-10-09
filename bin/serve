@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Entry point — see poolhound/server.py.
+
+Seeds config.toml beside the readings on a first run, and REFUSES to do so on
+a deployment that already has a history and has lost sight of it. Both live in
+config.seed_config(), because bin/ is a thin entry point and a guard that
+cannot be tested is a guard nobody has seen work — see the note there.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from poolhound import config                                      # noqa: E402
+
+config.seed_config()
+
+from poolhound import server                                      # noqa: E402
+sys.exit(server.main())

@@ -1,0 +1,132 @@
+# poolhound, complete, on a server that runs nothing else.
+#
+# This is the whole stack: a web server that gets its own certificate, and the
+# application behind it. No cloud account, no identity provider, no second
+# repository. `docker compose up -d` and you have a pool.
+#
+#   cp deploy/server.env.example deploy/.env    # then edit it
+#   docker compose -f deploy/compose.yml --env-file deploy/.env up -d
+#
+# THE AUTHOR'S OWN DEPLOYMENT DOES NOT USE THIS FILE. It merges
+# compose.poolhound.yml into a stack that was already running other things, and
+# keeps its data on an Azure Files share and its passwords in Key Vault. Both
+# arrangements run the same image and the same vhost; what differs is where the
+# bytes live and who checks the password. If you are not that deployment, this
+# is the file you want.
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # THE ONLY PUBLISHED PORTS IN THE STACK. poolhound itself is never
+    # published — see the note on its `expose` below, which is the other half
+    # of the same sentence.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # The shared secret that proves a request reached this container through
+      # Caddy rather than straight off the docker bridge. Empty is allowed and
+      # means the check is OFF — /api/health then reports the boundary as
+      # unproven, because an upgrade that started refusing every identity
+      # header would lock the owner out of their own pool. Generate one with
+      # `openssl rand -hex 32` and put it in the env file that feeds BOTH this
+      # service and caddy.
+      POOLHOUND_PROXY_SECRET: "${POOLHOUND_PROXY_SECRET:-}"
+      # The address(es) this answers on, comma-separated. Caddy asks Let's
+      # Encrypt for a certificate for each, so they must resolve to this host.
+      POOLHOUND_PUBLIC_HOSTS: "${PUBLIC_HOSTS:?set PUBLIC_HOSTS in your .env}"
+      POOLHOUND_ACME_EMAIL: "${ACME_EMAIL:?set ACME_EMAIL in your .env — Let's Encrypt wants a contact address}"
+      # Only read by the oauth2-proxy snippet, and harmless when unused.
+      POOLHOUND_OAUTH2_HOST: "${OAUTH2_HOST:-}"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./poolhound.caddy:/etc/caddy/conf.d/poolhound.caddy:ro
+      # ONE auth snippet, mounted under a fixed name. AUTH_MODE picks which.
+      # Mounting both would define (poolhound_auth) twice and Caddy refuses.
+      - ./caddy/auth-${AUTH_MODE:-password}.caddy:/etc/caddy/conf.d/auth.caddy:ro
+      # WHO MAY SIGN IN. A file rather than an environment variable because a
+      # bcrypt hash contains three `$` and compose would interpolate them away.
+      # Create it before the first `up`:
+      #   docker run --rm caddy:2 caddy hash-password --plaintext 'secret' \
+      #     | sed "s|^|owner |" > deploy/caddy/users.caddy
+      - ./caddy/users.caddy:/etc/caddy/users.caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - poolhound
+
+  poolhound:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        REVISION: "${REVISION:-unknown}"
+    image: poolhound:local
+    restart: unless-stopped
+    environment:
+      # The shared secret that proves a request reached this container through
+      # Caddy rather than straight off the docker bridge. Empty is allowed and
+      # means the check is OFF — /api/health then reports the boundary as
+      # unproven, because an upgrade that started refusing every identity
+      # header would lock the owner out of their own pool. Generate one with
+      # `openssl rand -hex 32` and put it in the env file that feeds BOTH this
+      # service and caddy.
+      POOLHOUND_PROXY_SECRET: "${POOLHOUND_PROXY_SECRET:-}"
+      # Inside the container this is the bind above: the host's local disk,
+      # which is the one place guaranteed to fail separately from the share.
+      POOLHOUND_BACKUP_DIR: "/backups"
+      # AND THE ONE FAILURE THE LOCAL DISK DOES NOT COVER: losing the VM.
+      #
+      # A SECOND destination rather than a different one, so the fast local
+      # copy keeps its RPO and this is the one that survives the host. It is a
+      # directory on purpose — a blobfuse mount, an SMB mount of another
+      # machine, a second Azure Files share — so there is no protocol here and
+      # nothing holding a credential of its own.
+      #
+      # bin/backup refuses a destination on the same FILESYSTEM as either the
+      # history or the local backups, by st_dev rather than by name, because a
+      # second directory on the same disk is this defect wearing the fix's
+      # clothes and would look like it worked. Unset is the honest state and
+      # `bootstrap-server.sh --check` says so every run.
+      POOLHOUND_BACKUP_OFFBOX: "${POOLHOUND_BACKUP_OFFBOX:-}"
+      # 0.0.0.0 is safe ONLY because of `expose` below — the port is reachable
+      # from Caddy on the compose network and from nowhere else. Those two
+      # lines have to be read together: publishing this port would put an
+      # unauthenticated control API on the internet, because the sign-in is
+      # enforced by Caddy and not by the application.
+      POOLHOUND_BIND: "0.0.0.0"
+      POOLHOUND_PORT: "8787"
+      POOLHOUND_PUBLIC_HOST: "${PUBLIC_HOSTS:?set PUBLIC_HOSTS in your .env}"
+      POOLHOUND_DATA: "/data"
+      POOLHOUND_SITE: "/site"
+      # The encrypted credential store. NO POOLHOUND_KEYVAULT here: vault.py
+      # tries Key Vault, then this, then a mode-600 file, so leaving it unset
+      # is what "local passwords" means and needs no other change.
+      POOLHOUND_VAULT: "/vault"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      # A named volume, not a bind mount: this is the pool's whole history and
+      # a bind mount to a path that does not exist yet is a silently empty
+      # install. `docker compose down` keeps it; only `down -v` does not.
+      - poolhound_data:/data
+      - poolhound_site:/site
+      # THE BACKUP DESTINATION, on the HOST's disk and not on the share.
+      # A bind rather than a named volume so an operator can find the tarballs
+      # with ls, and so `docker compose down -v` cannot take the only copy of
+      # the history with it. bootstrap-server.sh creates it 1010:1010.
+      - /var/lib/poolhound/backups:/backups
+      - poolhound_vault:/vault
+    expose:
+      - "8787"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 256
+
+volumes:
+  poolhound_data:
+  poolhound_site:
+  poolhound_vault:
+  caddy_data:
+  caddy_config:

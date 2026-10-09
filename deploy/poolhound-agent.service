@@ -1,0 +1,130 @@
+[Unit]
+# The poolhound agent: pushes samples up to the server and executes the commands it
+# sends back.
+#
+# WHY THIS RUNS HERE AND NOT ON THE SERVER
+# AqualinkD has no authentication. Anything that can reach it on this LAN can
+# start the spa heater, so it is never exposed and never proxied. This agent
+# makes one outbound connection to the server and waits; nothing on the internet can
+# open a connection toward the pool.
+#
+# IT DOES NOW LISTEN, ON LOOPBACK, AND ONLY TO BE TOLD SOMETHING.
+# 127.0.0.1:8791 (POOLHOUND_CLAIM_PORT) accepts one thing: "a change you are about to see came through
+# me", from a door named in commands.DOORS. It has no path to the panel, no
+# path to the server's write API and no credential, so the worst a caller
+# achieves is a false `door:` on an audit row that was going to be written
+# anyway. The sentence above still holds for everything that matters: nothing
+# outside the house can open a connection toward the pool, and nothing at all
+# can command it through this port.
+#
+# A browser cannot reach 127.0.0.1 of THIS machine -- a phone's loopback is the
+# phone -- so poolhound local reaches it through a reverse-proxy hop on the
+# Pi's own web server, the same way that page already reaches AqualinkD.
+Description=poolhound agent (pushes samples to the server, executes pool commands)
+Documentation=https://github.com/jchirayath/poolhound
+# NOT After=aqualinkd.service, AND THIS COST THREE DAYS OF SAMPLES.
+#
+# aqualinkd.service ships with `After=network.target multi-user.target` while
+# also being `WantedBy=multi-user.target`. Ordering ourselves behind it put
+# this unit inside a cycle, and systemd resolves a cycle by DELETING one job:
+#
+#   multi-user.target: Found ordering cycle on poolhound-agent.service/start
+#   multi-user.target: Job poolhound-agent.service/start deleted to break
+#                      ordering cycle starting with multi-user.target/start
+#
+# It picked ours. The unit then sits `inactive (dead)` with Result=success,
+# NRestarts=0 and no ExecStart in the journal — indistinguishable at a glance
+# from a service nobody asked to start, which is why `systemctl is-enabled`
+# said "enabled" and the agent had not run since the reboot.
+#
+# The ordering was only ever a nicety: the agent polls AqualinkD over HTTP and
+# retries with backoff, so starting first costs a few seconds of retries and
+# nothing else. Depending on a third party's unit ordering to be correct is
+# the part that was not worth it.
+After=network-online.target
+Wants=network-online.target
+
+# IN [Unit], WHICH IS THE ONLY SECTION THAT HAS THEM. These sat in [Service],
+# where systemd ignores them and says so once per boot:
+#   poolhound-agent.service:28: Unknown key 'StartLimitIntervalSec' in
+#   section [Service], ignoring.
+# So the generous window below was never in force; the unit ran on the default
+# 5 starts in 10s. The agent reconnects on its own with backoff, so a restart
+# storm here would only fight it, and systemd should give up only on a real
+# loop.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=poolhound
+Group=poolhound
+# The token is read from a root-owned file the poolhound user may read and
+# nobody else can. It is NOT an Environment= line: those are visible in
+# `systemctl show` and in /proc to any local user.
+EnvironmentFile=/etc/poolhound/agent.env
+ExecStart=/usr/bin/python3 /opt/poolhound/bin/agent
+Restart=always
+RestartSec=10
+
+# A HUNG AGENT IS STILL AN `active` AGENT, which is what this closes.
+#
+# After a reboot with DNS not yet up, the agent sat active for eight minutes
+# logging "stream lost (URLError); retrying in 60s" and reaching nothing.
+# poolhound-agent-ensure.timer correctly did nothing: `is-active` asks whether
+# a process exists, and the process was fine. The two cover different
+# questions, and both are needed —
+#
+#   Restart=always              it died
+#   ensure.timer                it is not running
+#   WatchdogSec (this)          it is running and not working
+#
+# NotifyAccess IS LOAD-BEARING. Its default is `none` for every Type except
+# notify, so WATCHDOG=1 would be received and silently discarded, and systemd
+# would kill the agent every WatchdogSec for never pinging. The pair has to be
+# read together.
+#
+# Type is left alone on purpose. Type=notify is the usual way to do this, but
+# it adds a READY=1 handshake the agent must complete or the unit never
+# becomes active at all — trading "might not notice a wedged agent" for "might
+# not start". This way a bug in the notify code can only cost the watchdog.
+NotifyAccess=main
+# Four missed pings. agent.WATCHDOG_PING_S is 30s, so this is generous on
+# purpose: the ping is withheld on a stale LINK, not on a slow thread, and
+# that judgement is already made over ten minutes in the agent.
+WatchdogSec=120
+
+# It needs the network and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/poolhound
+RuntimeDirectory=poolhound
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# AF_UNIX IS HERE FOR THE WATCHDOG, AND LEAVING IT OUT KILLED THE AGENT EVERY
+# TWO MINUTES.
+#
+# MEASURED, on the first deploy of WatchdogSec. sd_notify opens an AF_UNIX
+# datagram socket to $NOTIFY_SOCKET; this line allowed only AF_INET and
+# AF_INET6, so socket() raised EAFNOSUPPORT, the agent's own "never fatal"
+# handler swallowed it exactly as designed, and not one ping was ever sent.
+# systemd killed the process at start+120s for being silent, restarted it, and
+# would have done so every two minutes forever: NRestarts went to 1 at 21:10:26
+# against a 21:08:15 start.
+#
+# Two correct behaviours composing into a reboot loop, with nothing in the
+# journal saying so — the agent logged "pinging while the link is under 600s
+# old" and then silently failed to ping. That is the whole argument for
+# verifying a watchdog against real systemd rather than against a unit file.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

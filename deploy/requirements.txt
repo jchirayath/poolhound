@@ -1,0 +1,40 @@
+# Pinned exactly, and bumped for CVEs rather than for features (SEC-15).
+# `osv-scanner scan source --lockfile=requirements.txt:deploy/requirements.txt`
+# is run by the image build and must come back clean; see deploy/Dockerfile.
+#
+# The WaterGuru collector needs the first four; the server, the renderer, the
+# agent and the Leslie's scraper are stdlib.
+boto3==1.43.108
+pycognito==2024.5.1
+requests==2.34.2
+requests-aws4auth==1.3.2
+
+# The public volume calculator's photo tracer. Everything it needed was a host
+# binary — sips, magick, convert, exiftool — and this image had none of them, so
+# resizing, EXIF and HEIC decoding had never run on the server at all: a 2000px
+# PNG came back verbatim, every camera field read null, and HEIC (the iPhone
+# default) was refused outright. Wheels rather than an apt tree, which keeps the
+# image close to the size the Dockerfile argues for.
+#
+# BOTH ARE REACHED BY AN ANONYMOUS CALLER. /api/photo is a deliberate public
+# POST, so these two decode bytes from the internet and are the most exposed
+# packages in the image. pillow-heif 0.22.0 carried a 9.1 and Pillow 11.3.0
+# carried seventeen advisories while nothing in the repo scanned dependencies.
+Pillow==12.3.0
+pillow-heif==1.8.0
+
+# TRANSITIVE, AND PINNED HERE ON PURPOSE — each one for a reason the resolver
+# does not know about.
+#
+# pyjwt arrives under pycognito and carried a 9.1 (PYSEC-2026-4145) at the
+# version pip happened to pick; idna arrives under requests. Neither is a
+# direct import, so neither was pinned, so both were whatever PyPI served on
+# the day the image was built.
+#
+# cryptography is the one that matters most and was the least visible: it is
+# what encrypts the credential vault (vault.py AES-GCM), and it was a
+# transitive of a transitive, re-resolved on every build. The package
+# protecting every stored password was whatever came down that morning.
+cryptography==50.0.2
+idna==3.20
+PyJWT==2.15.1

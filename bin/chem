@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Entry point — see poolhound/chem.py"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import chem, config
+
+# A dose is a row in the pool's history, so it belongs where that
+# history is. Logged from a workstation it lands in a local file the
+# site never reads -- which has happened, twice, with doses that were
+# never added to any pool. Use the Chemicals tab.
+config.refuse_off_deployment("chem")
+rc = chem.main()
+
+# Re-render so the Chemicals tab shows the dose immediately.
+try:
+    from poolhound import render
+    render.build()
+except Exception as e:
+    print(f"  (render skipped: {e})", file=sys.stderr)
+
+sys.exit(rc)

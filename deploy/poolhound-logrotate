@@ -1,0 +1,12 @@
+# The collectors' stderr, which used to go to MAILTO="" and therefore nowhere.
+# A log nobody rotates is a disk that fills quietly, which is the same class of
+# problem as the silence it replaced.
+/var/log/poolhound-cron.log {
+	weekly
+	rotate 8
+	compress
+	delaycompress
+	missingok
+	notifempty
+	create 0640 root adm
+}

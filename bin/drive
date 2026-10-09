@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""Drive both built pages in a real browser and assert what only a browser knows.
+
+WHY THIS EXISTS
+
+Of the defects found in one week of review, the eight most user-visible were
+invisible to every static check and to reading the diff:
+
+  * the public site told every anonymous visitor "signed in — view only";
+  * invisible screen-reader spans escaped their container and scrolled the
+    whole page 251px sideways at phone width, carrying the tab bar off-screen;
+  * the agent-presence check ran once at load, so every control stayed live
+    and the "no agent is connected" banner stayed hidden after the Pi dropped;
+  * fourteen control buttons were named "On" and "Off" with nothing tying them
+    to a device, and twenty charts announced their own axis ticks as their name.
+
+Each was found by asking the browser what it actually had — computed styles,
+accessible names, real clicks — and none by analysis. So this is a gate rather
+than a habit: "drive it" belongs in done, not in review.
+
+    bin/drive [--port N]          the local build, both pages
+    bin/drive --url URL           the DEPLOYED page, read-only
+
+Needs a Playwright browser. Without one it says so and exits 0: a released copy
+must build without a browser toolchain, and a missing browser is a fact worth
+one line, not a failure. It is NOT silent about being skipped — that is how
+bin/selftest and bin/contrast came to have no __main__ and run nothing at all.
+"""
+import http.server
+import json
+import os
+import re
+import socketserver
+import sys
+import threading
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import config, contrast, headers, render      # noqa: E402
+
+FAILS = []
+
+# What the page resolved, as the browser sees it rather than as the stylesheet
+# spells it. getPropertyValue on :root follows the cascade, the media query and
+# any data-theme stamp, which is the whole point of asking here.
+THEME_PROBE = r"""
+() => {
+  const cs = getComputedStyle(document.documentElement);
+  const body = getComputedStyle(document.body);
+  const tok = n => (cs.getPropertyValue(n) || '').trim();
+  return {
+    stamped: document.documentElement.getAttribute('data-theme'),
+    dark: matchMedia('(prefers-color-scheme: dark)').matches,
+    bodyBg: body.backgroundColor,
+    bodyFg: body.color,
+    tokens: {pump: tok('--pump'), spa: tok('--spa'), sheer: tok('--sheer'),
+             ink: tok('--ink'), panel: tok('--panel')}
+  };
+}
+"""
+
+
+def _hex(css_colour):
+    """'rgb(18, 32, 43)' -> '#12202b', for poolhound.contrast.ratio().
+
+    A browser answers in rgb()/rgba() whatever the stylesheet said, and
+    contrast.ratio takes hex. Converting here keeps one WCAG implementation
+    in the project instead of a second one written in JavaScript.
+    """
+    nums = [int(float(n)) for n in re.findall(r"[\d.]+", css_colour or "")[:3]]
+    if len(nums) != 3:
+        return "#000000"
+    return "#%02x%02x%02x" % tuple(max(0, min(255, n)) for n in nums)
+
+
+def csp_watch(pg):
+    """Collect every console line the browser wrote about the policy.
+
+    A Content-Security-Policy that does not match the page it is serving fails
+    in exactly one place: "Refused to execute inline script because it violates
+    the following Content Security Policy directive", on the console, with the
+    page then half-dead and still returning 200. That is the same shape as
+    every user-visible defect this file exists for — the server is fine, the
+    markup is fine, and the product does not work.
+
+    Read as a list rather than asserted here so the caller can report what the
+    browser actually said, which names the directive and the digest it wanted.
+    """
+    seen = []
+    pg.on("console", lambda m: seen.append(m.text)
+          if "Content Security Policy" in m.text else None)
+    return seen
+
+
+def check(name, got, want):
+    ok = got == want
+    if not ok:
+        FAILS.append((name, got, want))
+    print(f"    {'ok  ' if ok else 'FAIL'}  {name}")
+    if not ok:
+        print(f"            got  {got!r}\n            want {want!r}")
+
+
+def serve(site, port, identity):
+    """The built pages, plus the one API answer the page reads at load.
+
+    The page asks /api/health for who you are and what you may do, and three of
+    the defects above were the page believing the wrong answer. So the answer
+    is supplied here rather than mocked inside the browser: the thing under
+    test is what the PAGE does with a real response.
+
+    AND IT SENDS THE REAL SECURITY HEADERS. A Content-Security-Policy is an
+    HTTP header, so it does not exist on a file:// page and cannot be read out
+    of the markup — which means the digest-based policy in poolhound/headers.py
+    is a claim no static check can settle. Getting a digest wrong produces a
+    page whose own script is refused, and the browser says so in the console
+    and nowhere else. So the policy is served here, from the same module the
+    server sends it from, and the console is read back below.
+    """
+    class H(http.server.SimpleHTTPRequestHandler):
+        def translate_path(self, path):
+            p = path.split("?")[0].split("#")[0]
+            if p in ("/", "/index.html"):
+                p = "/index.html"
+            return os.path.join(site, p.lstrip("/"))
+
+        def end_headers(self):
+            p = self.path.split("?")[0].split("#")[0]
+            csp = (headers.csp_for_file(self.translate_path(p))
+                   if p.endswith(".html") or p.endswith("/")
+                   else headers.BASELINE_CSP)
+            for name, value in headers.for_response(csp):
+                self.send_header(name, value)
+            super().end_headers()
+
+        def do_GET(self):
+            if self.path.startswith("/api/health"):
+                raw = json.dumps(identity).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            return super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    # allow_reuse_address, and server_close() below: shutdown() stops the loop
+    # and leaves the socket bound, so the second case in the list could not
+    # bind and the whole run died after the first page passed. A gate that
+    # crashes halfway is a gate that reports on half the product.
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    httpd = socketserver.ThreadingTCPServer(("127.0.0.1", port), H)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+STEADY_JUMPS = r"""() => {
+  // Each panel is shown for the measurement, because a hidden one has no
+  // layout to ask about, and put back exactly as it was afterwards.
+  const moved = [];
+  for (const nav of document.querySelectorAll('.subnav')) {
+    const panel = nav.closest('.panel'), wasHidden = panel && panel.hidden;
+    if (panel) panel.hidden = false;
+    const links = [...nav.querySelectorAll('a')];
+    const saved = links.map(a => a.getAttribute('aria-current'));
+    const widths = state => {
+      links.forEach(a => a.setAttribute('aria-current', state));
+      return links.map(a => a.getBoundingClientRect().width);
+    };
+    const plain = widths('false'), current = widths('true');
+    links.forEach((a, i) => {
+      if (Math.abs(current[i] - plain[i]) > 0.5)
+        moved.push(a.textContent.trim().slice(0, 32) + ': ' +
+                   plain[i].toFixed(1) + ' -> ' + current[i].toFixed(1));
+      if (saved[i] === null) a.removeAttribute('aria-current');
+      else a.setAttribute('aria-current', saved[i]);
+    });
+    if (panel) panel.hidden = wasHidden;
+  }
+  return moved;
+}"""
+
+
+PROBE = r"""
+(build) => {
+  const nameOf = e => e.getAttribute('aria-label')
+    || (e.getAttribute('aria-labelledby') || '').split(' ')
+         .map(id => (document.getElementById(id) || {}).textContent || '').join(' ').trim()
+    || (e.textContent || '').trim();
+
+  // Horizontal scroll, per tab. The page body must never scroll sideways;
+  // a wide table scrolls inside its own box.
+  const scroll = {};
+  for (const t of [...document.querySelectorAll('[role=tab]')]) {
+    const key = t.getAttribute('data-tab');
+    t.click();
+    window.scrollTo(99999, 0);
+    scroll[key] = Math.round(window.scrollX);
+    window.scrollTo(0, 0);
+  }
+
+  // A CHART'S NAME MUST BE EXPLICIT. nameOf falls back to textContent, and an
+  // SVG's text subtree is its axis ticks and its per-point tooltips — which is
+  // the ORIGINAL defect: charts announced as "target 2.90.84.17.3Leslie's 21
+  // May…". So a chart counts as named only via aria-label or aria-labelledby.
+  // Found by stripping aria-labelledby from a chart and watching this pass.
+  const svgs = [...document.querySelectorAll('svg[role=img]')];
+  const svgNamed = s => !!(s.getAttribute('aria-label')
+    || (s.getAttribute('aria-labelledby') || '').split(' ')
+         .some(id => (document.getElementById(id) || {}).textContent));
+  const ctl  = [...document.querySelectorAll('#tab-control .ctl button, #tab-control input.ctl-val')];
+
+  return {
+    scroll,
+    unnamedCharts: svgs.filter(s => !svgNamed(s)).length,
+    charts: svgs.length,
+    unnamedControls: ctl.filter(e => !nameOf(e)).length,
+    controls: ctl.length,
+    duplicateControlNames: ctl.length - new Set(ctl.map(nameOf)).size,
+    liveRegions: document.querySelectorAll('[aria-live],[role=status],[role=alert],output').length,
+    tabsTied: [...document.querySelectorAll('[role=tab]')].filter(t => t.getAttribute('aria-controls')).length,
+    tabs: document.querySelectorAll('[role=tab]').length,
+    apiState: (document.getElementById('api-state') || {}).textContent || '',
+  };
+}
+"""
+
+
+def drive_live(url, sync_playwright):
+    """Drive the page a real visitor gets, over the network.
+
+    WHY BOTH MODES EXIST. Driving the local build tests the CODE — names,
+    wiring, scroll, the status line — because those come from the template and
+    not from this pool's data. It does not test what the server is actually serving,
+    and the two can differ: a stale render, a proxy rewriting something, a
+    deploy that put the public page beside a stale private one. This project
+    has already shipped that exact pair once.
+
+    PUBLIC PAGE ONLY, and read-only. /admin.html is gated by Entra and a
+    browser here has no session; a GET of it answers 302, which the deploy's
+    own probes already assert. Nothing here POSTs to production.
+    """
+    fails_before = len(FAILS)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        pg = browser.new_page(viewport={"width": 390, "height": 800})
+        errors = []
+        pg.on("pageerror", lambda e: errors.append(str(e)))
+        violations = csp_watch(pg)
+        pg.goto(url, wait_until="networkidle")
+        r = pg.evaluate(PROBE, "live")
+        print(f"\n  {url} — what a visitor actually gets")
+        sideways = {k: v for k, v in r["scroll"].items() if v}
+        check("no tab scrolls the page sideways", sideways, {})
+        check("every chart has a name of its own", r["unnamedCharts"], 0)
+        check("the page can announce what it did", r["liveRegions"] > 0, True)
+        check("every tab is tied to its panel", r["tabsTied"], r["tabs"])
+        # The live public page is served to nobody signed in, so the status
+        # line must say so. This is the sentence that read "signed in — view
+        # only" to every anonymous visitor for two hours.
+        check("the status line tells the truth", r["apiState"], "read-only")
+        check("and the script raised nothing", errors, [])
+        # ON THE DEPLOYED PAGE THIS IS THE INTERESTING ONE. The policy is
+        # derived from the bytes being served, so a server running an older
+        # image than the page it is serving — the exact pair this project has
+        # shipped once — would refuse that page's script and still answer 200.
+        check("the served policy refused nothing the page needs", violations, [])
+        browser.close()
+    return len(FAILS) == fails_before
+
+
+def main():
+    port = 8788
+    if "--port" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--port") + 1])
+    live_url = ""
+    if "--url" in sys.argv:
+        live_url = sys.argv[sys.argv.index("--url") + 1]
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  bin/drive: no Playwright here, so the browser checks did not run.")
+        print("            pip install playwright && playwright install chromium")
+        return 0
+
+    # --url drives the DEPLOYED page instead of the local build. Used by
+    # bootstrap-server.sh --check, which verifies what is live and changes
+    # nothing.
+    if live_url:
+        print("  poolhound — the deployed page, driven at phone width")
+        drive_live(live_url, sync_playwright)
+        print()
+        if FAILS:
+            print(f"  {len(FAILS)} FAILURE(S):")
+            for n, got, want in FAILS:
+                print(f"    {n}: got {got!r}, wanted {want!r}")
+            return 1
+        print(f"  {live_url} behaves, in a browser, at 390px")
+        return 0
+
+    site = config.site_dir(config.load())
+    for name in ("index.html", "admin.html"):
+        if not os.path.exists(os.path.join(site, name)):
+            print(f"  bin/drive: {name} has not been rendered. Run bin/render first.")
+            return 1
+
+    print("  poolhound — driven in a browser, at phone width")
+    CASES = [
+        ("index.html", "public, nobody signed in",
+         {"ok": True, "user": "anonymous", "public": True, "signed_in": False},
+         "read-only"),
+        ("admin.html", "authenticated, view-only",
+         {"ok": True, "user": "someone@example.com", "public": True,
+          "signed_in": True, "token": "t", "role": "view"},
+         "signed in — view only"),
+    ]
+    httpd = None
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            for page_name, why, identity, want_state in CASES:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                httpd = serve(site, port, identity)
+                pg = browser.new_page(viewport={"width": 390, "height": 800})
+                errors = []
+                pg.on("pageerror", lambda e: errors.append(str(e)))
+                violations = csp_watch(pg)
+                pg.goto(f"http://127.0.0.1:{port}/{page_name}", wait_until="networkidle")
+                r = pg.evaluate(PROBE, page_name)
+                print(f"\n  {page_name} — {why}")
+                sideways = {k: v for k, v in r["scroll"].items() if v}
+                check("no tab scrolls the page sideways", sideways, {})
+                check("every chart has a name of its own", r["unnamedCharts"], 0)
+                check("every control has a name", r["unnamedControls"], 0)
+                check("and no two controls share one", r["duplicateControlNames"], 0)
+                check("the page can announce what it did",
+                      r["liveRegions"] > 0, True)
+                check("every tab is tied to its panel", r["tabsTied"], r["tabs"])
+                check("the status line tells the truth", r["apiState"], want_state)
+                check("and the script raised nothing", errors, [])
+                # THE POLICY MATCHES THE PAGE. The only proof that the digests
+                # in headers.py are the ones this browser computes.
+                check("the policy refused nothing the page needs", violations, [])
+                # MARKING A SECTION CURRENT MUST NOT MOVE ANYTHING. The
+                # jump-list wraps, and the current link used to be set bolder
+                # and so wider: on a list sitting at its wrap point, marking a
+                # section pushed the list onto a second line, the content moved
+                # 34px, the observer chose a different section, and the list
+                # unwrapped -- about thirty times a second, at every window
+                # width from 1140 to 1480, scrolled a little from the top of
+                # Poolhound info. Asked of every link at once, so it does not
+                # depend on finding the one width where it shows.
+                check("marking a section current changes no link's width",
+                      pg.evaluate(STEADY_JUMPS), [])
+                pg.close()
+
+            # AND AGAIN IN THE DARK, which nothing drove until now.
+            #
+            # bin/contrast reads the palettes out of the stylesheet and checks
+            # them as text. It cannot say whether the dark block APPLIES: a
+            # token defined only inside the media query, a selector that wins
+            # over it, a colour that resolves to nothing and falls back to
+            # black — all are invisible to a reader of the CSS and to every
+            # screenshot taken in light mode. The un-stamped "follow the
+            # system" state is the common one, so that is what is driven here:
+            # a fresh context has no localStorage, so nothing has stamped
+            # data-theme and the page is deciding for itself.
+            for page_name, why, identity, _want in CASES:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                httpd = serve(site, port, identity)
+                seen = {}
+                for scheme in ("light", "dark"):
+                    pg = browser.new_page(viewport={"width": 390, "height": 800},
+                                          color_scheme=scheme)
+                    pg.goto(f"http://127.0.0.1:{port}/{page_name}",
+                            wait_until="networkidle")
+                    seen[scheme] = pg.evaluate(THEME_PROBE)
+                    seen[scheme]["scroll"] = pg.evaluate(PROBE, page_name)["scroll"]
+                    pg.close()
+
+                print(f"\n  {page_name} — in the dark, as the system asks")
+                d, lt = seen["dark"], seen["light"]
+                check("the browser really was asked for dark", d["dark"], True)
+                check("and nothing had stamped a theme on the page",
+                      d["stamped"] in (None, "", "auto"), True)
+
+                # THE DARK BLOCK APPLIES AT ALL. A colour whose only
+                # definition sits inside the media query does not reach the
+                # un-stamped state, and the page then renders light-on-light.
+                check("the page is not identical to its light build",
+                      d["bodyBg"] != lt["bodyBg"], True)
+
+                # NOTHING FELL BACK TO BLACK. The whole series palette did
+                # exactly this for several commits while every screenshot
+                # looked plausible.
+                for scheme in ("light", "dark"):
+                    unresolved = sorted(k for k, v in seen[scheme]["tokens"].items()
+                                        if not v)
+                    check(f"every colour token resolves ({scheme})",
+                          unresolved, [])
+
+                # AND THE TEXT IS READABLE, measured from what the browser
+                # computed rather than from the stylesheet. ratio() comes from
+                # poolhound.contrast, which bin/contrast uses, so there is one
+                # WCAG implementation and not two.
+                for scheme in ("light", "dark"):
+                    s = seen[scheme]
+                    r = contrast.ratio(_hex(s["bodyFg"]), _hex(s["bodyBg"]))
+                    check(f"body text on body background is legible ({scheme},"
+                          f" {r:.1f}:1)", r >= 4.5, True)
+
+                sideways = {k: v for k, v in d["scroll"].items() if v}
+                check("no tab scrolls the page sideways in the dark",
+                      sideways, {})
+
+            browser.close()
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+
+    print()
+    if FAILS:
+        print(f"  {len(FAILS)} FAILURE(S):")
+        for n, got, want in FAILS:
+            print(f"    {n}: got {got!r}, wanted {want!r}")
+        return 1
+    print("  the page behaves, in a browser, at 390px")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

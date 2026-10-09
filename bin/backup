@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Copy the pool's history OFF the share it lives on.
+
+WHY THIS EXISTS
+
+Every irreplaceable thing in this product — samples, readings, the two labs'
+results, doses, corrections, the audit trail, the run log, the traced outline
+and config.toml — lives in exactly one place: one Azure Files share. The repo
+provisioned no snapshot policy, no backup vault and no copy job, so there was
+no RPO and no RTO for the only asset that cannot be re-measured.
+
+locking.migrate_columns does make a backup before it rewrites a file, and that
+one is genuinely load-bearing — but it writes the `.bak` BESIDE the original,
+on the same share, so the one copy the code takes shares the fate of what it is
+copying. Share soft-delete, where it is enabled, protects against deleting the
+SHARE; it does nothing about a bad rewrite, a wrong migrate, an `rm` inside
+/mnt/poolhound, or ransomware on the host that holds the 0600 mount key.
+
+WHAT IT PROTECTS AGAINST, AND WHAT IT DOES NOT
+
+  recoverable:      a corrupting write, a bad migration, a mistaken delete,
+                    the share being lost
+  NOT recoverable:  the whole VM going away with its local disk, unless
+                    BACKUP_DIR is pointed somewhere else or the tarballs are
+                    copied off the host by something else
+
+That second line is the honest limit and is why the destination is a setting
+rather than a constant. The default is local disk because local disk is the one
+place guaranteed to fail separately from the share.
+
+WHY A TARBALL AND NOT A SYNC
+
+A tarball is a point in time. A sync mirrors a corruption as eagerly as it
+mirrors a correction, which is the failure mode this is for.
+"""
+import os
+import shutil
+import sys
+import tarfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from poolhound import config, locking, runlog     # noqa: E402
+
+# Everything whose loss would be permanent. Derived from config.HISTORY_FILES
+# — the same list seed_config() uses to decide whether a directory holds a pool
+# — plus the records that are about what we DID rather than what we measured.
+EXTRA = ("corrections.csv", "audit.csv", "runs.csv", "wg_targets.csv",
+         "pool_shape.json", "config.toml")
+
+KEEP_DAYS = 30
+
+
+def backup_dir(cfg):
+    """Where tarballs go. NOT the share: that is the whole point."""
+    d = (os.environ.get("POOLHOUND_BACKUP_DIR")
+         or ((cfg.get("backup") or {}).get("dir") if cfg else None)
+         or "/var/lib/poolhound/backups")
+    return os.path.expanduser(d)
+
+
+def offbox_dir(cfg):
+    """A second destination that does not fail with this host, or "".
+
+    THE THIRD OPEN ITEM IN docs/THREAT_MODEL.md. The nightly tarball goes to
+    the host's local disk, which is the one place guaranteed to fail separately
+    from the Azure Files share — and that is the whole of what it buys. It does
+    not survive losing the VM, and `deploy/README.md` has always said so and
+    named no way to fix it.
+
+    So there is one now, and it is a directory rather than a protocol: a
+    blobfuse mount, an SMB mount of another host, a second share, a USB disk.
+    No new dependency, nothing to hold a credential, and the copy is the same
+    bytes that were just verified locally. Unset is the normal state and costs
+    nothing, which is what keeps this from being a half-configured feature
+    everybody ignores.
+    """
+    d = (os.environ.get("POOLHOUND_BACKUP_OFFBOX")
+         or ((cfg.get("backup") or {}).get("offbox") if cfg else None)
+         or "")
+    return os.path.expanduser(d) if d else ""
+
+
+def _same_device(a, b):
+    """Are these two paths on one filesystem?
+
+    THE DEFECT WEARING THE FIX'S CLOTHES, which this file already refuses one
+    version of: a backup directory inside the data directory. "Off-box" has
+    the same failure mode one level out — a second directory on the same disk
+    looks configured, passes every check that counts tarballs, and dies with
+    the host it was supposed to outlive. st_dev is the question actually being
+    asked, and it answers correctly for a bind mount, a symlink and a second
+    path into the same volume, none of which string comparison does.
+    """
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def copy_offbox(path, cfg, dest=None):
+    """Put the tarball somewhere that does not fail with this host.
+
+    Returns (destination or "", reason-it-did-not). NEVER RAISES past its own
+    report: the local tarball is already written and verified, and a mount that
+    is down must not turn a successful backup into a failed run. It is reported
+    in the run detail and graded by `bootstrap-server.sh --check`, because a
+    copy that silently stopped happening is worse than one that was never
+    configured.
+    """
+    off = dest if dest is not None else offbox_dir(cfg)
+    if not off:
+        return "", "not configured"
+    data = config.data_dir(cfg)
+    primary = backup_dir(cfg)
+    try:
+        os.makedirs(off, exist_ok=True)
+    except OSError as e:
+        return "", f"cannot be created ({type(e).__name__})"
+    if os.path.abspath(off).startswith(os.path.abspath(data) + os.sep):
+        return "", "is inside the data directory"
+    if _same_device(off, data):
+        return "", "is on the same filesystem as the history itself"
+    if _same_device(off, primary):
+        return "", ("is on the same filesystem as the local backups, so it "
+                    "does not survive losing this host")
+    try:
+        tmp = os.path.join(off, "." + os.path.basename(path) + ".part")
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, os.path.join(off, os.path.basename(path)))
+    except OSError as e:
+        return "", f"could not be written ({type(e).__name__})"
+    return os.path.join(off, os.path.basename(path)), ""
+
+
+def run(cfg=None, out=None):
+    cfg = cfg if cfg is not None else config.load()
+    data = config.data_dir(cfg)
+    dest = out or backup_dir(cfg)
+    os.makedirs(dest, exist_ok=True)
+
+    if os.path.abspath(dest).startswith(os.path.abspath(data) + os.sep):
+        raise SystemExit(
+            f"REFUSING: the backup directory {dest} is inside the data directory\n"
+            f"{data}. A copy that dies with the thing it is copying is not a backup —\n"
+            f"that is the defect this tool exists for. Set POOLHOUND_BACKUP_DIR.")
+
+    names = list(config.HISTORY_FILES) + list(EXTRA)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(dest, f"poolhound-{stamp}.tgz")
+
+    # Under the locks the writers take, so a tarball cannot catch a half-written
+    # append. One lock per file rather than one global one, because the writers
+    # are per-file and a global lock here would block collection for the whole
+    # copy.
+    copied, missing = [], []
+    with tarfile.open(path, "w:gz") as tar:
+        for n in names:
+            src = os.path.join(data, n)
+            if not os.path.exists(src):
+                missing.append(n)
+                continue
+            with locking.exclusive(data, os.path.splitext(n)[0], timeout=30.0):
+                tar.add(src, arcname=n)
+            copied.append(n)
+
+    size = os.path.getsize(path)
+    pruned = prune(dest, KEEP_DAYS)
+    # AFTER the local copy is closed and sized, never instead of it. The local
+    # disk fails separately from the share, which is the failure this has
+    # always covered; the off-box copy is the one that survives the VM.
+    off, off_why = copy_offbox(path, cfg)
+    if off:
+        prune(os.path.dirname(off), KEEP_DAYS)
+    return {"path": path, "bytes": size, "copied": copied,
+            "missing": missing, "pruned": pruned,
+            "offbox": off, "offbox_why": off_why}
+
+
+def prune(dest, days):
+    """Drop tarballs older than `days`. A disk that fills is an outage."""
+    cutoff = time.time() - days * 86400
+    gone = []
+    for f in sorted(os.listdir(dest)):
+        if not (f.startswith("poolhound-") and f.endswith(".tgz")):
+            continue
+        p = os.path.join(dest, f)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                os.unlink(p)
+                gone.append(f)
+        except OSError:
+            pass
+    return gone
+
+
+def newest(dest):
+    """(path, age_seconds) of the most recent tarball, or (None, None)."""
+    try:
+        files = [os.path.join(dest, f) for f in os.listdir(dest)
+                 if f.startswith("poolhound-") and f.endswith(".tgz")]
+    except OSError:
+        return None, None
+    if not files:
+        return None, None
+    p = max(files, key=os.path.getmtime)
+    return p, time.time() - os.path.getmtime(p)
+
+
+def main():
+    config.refuse_off_deployment("backup")
+    cfg = config.load()
+    with runlog.Run("backup", by=runlog.started_by(), cfg=cfg) as r:
+        res = run(cfg)
+        r.detail = (f"{len(res['copied'])} file(s), "
+                    f"{res['bytes'] / 1024:.0f} KB -> {res['path']}")
+        print(f"  wrote {res['path']}  ({res['bytes'] / 1024:.0f} KB)")
+        print(f"  copied: {', '.join(res['copied']) or 'nothing'}")
+        if res["missing"]:
+            print(f"  not present: {', '.join(res['missing'])}")
+        if res["pruned"]:
+            print(f"  pruned {len(res['pruned'])} older than {KEEP_DAYS} days")
+        # SAID EVERY TIME, in both directions. "not configured" is the honest
+        # state of an install that has not chosen a second destination, and it
+        # reads differently from a mount that has quietly stopped accepting
+        # writes — which is the whole reason this line exists.
+        if res["offbox"]:
+            print(f"  off-box copy: {res['offbox']}")
+            r.detail += f"; off-box {res['offbox']}"
+        else:
+            print(f"  off-box copy: none — the destination {res['offbox_why']}")
+            r.detail += f"; off-box {res['offbox_why']}"
+            if res["offbox_why"] != "not configured":
+                # A destination that was chosen and did not work is a failure
+                # of this run, not a note on it: somebody believes there is a
+                # copy off this host.
+                raise SystemExit(
+                    f"the off-box destination {res['offbox_why']} — the local "
+                    f"tarball was written, but nothing left this host")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

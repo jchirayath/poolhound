@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Entry point — regenerate the site.
+
+Two files: index.html carries the chemistry and is safe to serve without a
+login; admin.html carries everything and is what the authenticated path serves.
+"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import render, runlog
+
+# The render is a collection too, in the sense that matters here: cron runs it
+# on a schedule and its failure is invisible until somebody looks at a stale
+# page. It used to be the one job whose outcome nothing recorded.
+with runlog.Run("render", by=runlog.started_by()) as _r:
+    _built = []
+    for public in (True, False):
+        p, s = render.build(public=public)
+        _built.append(f"{'public' if public else 'authenticated'} {s/1024:.0f} KB")
+        print(f"  wrote {p}  ({s/1024:.1f} KB)  {'public' if public else 'authenticated'}")
+    _r.detail = ", ".join(_built)

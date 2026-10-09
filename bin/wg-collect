@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Entry point — see poolhound/collect_wg.py"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import cadence, collect_wg, config, runlog
+
+# Collection runs on the web server. See config.refuse_off_deployment().
+config.refuse_off_deployment("wg-collect")
+
+# IS IT DUE? ASKED BEFORE ANYTHING IS SPENT.
+#
+# Cron ticks hourly and the cadence lives in config.toml, so most ticks are
+# meant to do nothing -- see poolhound/cadence.py for why the schedule moved
+# off the crontab. This runs ahead of every network call, so a tick that is not
+# due costs the vendor nothing and appears nowhere in their rate limit.
+#
+# NOT RECORDED IN runs.csv, deliberately. That file answers "did collection
+# work", and twenty-three no-ops a day would bury the one row that matters
+# under the ones that never tried. The tick's own heartbeat is the status file
+# collect.sh writes on every run, due or not, which is what
+# bootstrap-server.sh --check reads.
+_by = runlog.started_by()
+_go, _why = cadence.tick_gate("wg-collect", _by)
+if not _go:
+    print(f"  not due \u2014 {_why}")
+    sys.exit(0)
+
+# ON THE RECORD WHICHEVER WAY IT ENDS. The run log is written from a context
+# manager so a crash is a row rather than the reason there is no row — which is
+# how bin/watch came to die on every run for weeks with nothing saying so.
+# Counting the rows before and after is what separates "it ran" from "it
+# worked": a pull that returns 200 and adds nothing is a different event.
+with runlog.Run("wg-collect", by=_by) as _r:
+    before = runlog.row_count("readings.csv")
+    rc = collect_wg.main() if hasattr(collect_wg, "main") else 0
+    _r.added = max(runlog.row_count("readings.csv") - before, 0)
+    _r.outcome = "ok" if rc == 0 else "failed"
+    _r.detail = ("WaterGuru: " + (f"{_r.added} new row(s)" if _r.added
+                 else "nothing new — the vendor returned what we already had"))
+
+# Re-render the dashboard so the page never lags the data it reports on. A
+# failure here must not fail the collection — the CSV row is the thing that
+# cannot be recovered later; the HTML can always be rebuilt with bin/render.
+try:
+    from poolhound import render
+    render.build()
+except Exception as e:
+    print(f"  (render skipped: {e})", file=sys.stderr)
+
+sys.exit(rc)

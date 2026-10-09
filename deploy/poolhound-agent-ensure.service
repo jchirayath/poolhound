@@ -1,0 +1,47 @@
+[Unit]
+# IS THE AGENT RUNNING? IF NOT, START IT.
+#
+# WHY A SECOND UNIT INSTEAD OF Restart=always
+# The agent already has Restart=always, and that covers the agent CRASHING.
+# It cannot cover the failure that actually happened: systemd found an
+# ordering cycle at boot and DELETED the agent's start job, so the process
+# never existed and there was nothing to restart. The unit sat `inactive
+# (dead)` with Result=success for 71 hours while `is-enabled` said "enabled".
+#
+# Restart= answers "it died". This answers "it is not running", which is the
+# larger question and the one nobody was asking.
+#
+# NO After= ON THE AGENT'S OWN DEPENDENCIES, deliberately. This unit exists
+# because an ordering dependency got the agent's job deleted; inheriting that
+# dependency would put the healer in the same cycle as the thing it heals.
+Description=Ensure the poolhound agent is running
+Documentation=https://github.com/jchirayath/poolhound
+
+[Service]
+Type=oneshot
+
+# NOTHING WRITES TO THIS PI'S CARD, and that includes the journal. Two boards
+# have already died of write wear. systemd's own "Started/Finished" pair for a
+# unit that runs every five minutes is about 600 journal records a day for the
+# days when the answer is "yes, it is running" — so info is suppressed and the
+# one message worth keeping is raised to warning.
+#
+# Quiet when there is nothing to do, loud when it healed. A self-healer that
+# logs nothing is a fault that stops being visible: the agent would come back
+# on its own and the reason it went away would never be written down.
+LogLevelMax=warning
+
+# TO STOP THE AGENT ON PURPOSE, STOP THIS TIMER FIRST:
+#
+#   sudo systemctl stop poolhound-agent-ensure.timer poolhound-agent
+#
+# Otherwise this starts it again within five minutes, which is the whole
+# point and is also exactly wrong if somebody stopped it to work on the
+# panel. It cannot tell the two apart: `inactive` is `inactive`, and a healer
+# that tried to guess intent would be a healer that declined to heal.
+# `systemctl mask poolhound-agent` also holds it down, and survives a reboot.
+
+ExecStart=/bin/sh -c 'systemctl is-active --quiet poolhound-agent.service \
+  || { systemd-cat -t poolhound-heal -p warning \
+         echo "poolhound-agent was not running — starting it"; \
+       systemctl start poolhound-agent.service; }'

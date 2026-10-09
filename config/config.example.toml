@@ -1,0 +1,238 @@
+# Copy to config/config.toml and edit. config.toml is gitignored.
+
+# THERE IS NO [aqualink] SECTION, and its absence is the architecture.
+#
+# Nothing on the server side has a route to the controller. The agent on the Pi
+# reads AqualinkD over the Pi's own loopback and pushes readings OUT; the host
+# that serves this page never opens a connection toward the house. The agent
+# takes that address from $POOLHOUND_AQUALINK (default http://127.0.0.1:8000),
+# set in poolhound-agent.service, because it is a fact about the Pi rather than
+# a setting about the pool.
+#
+# This file used to carry `[aqualink] host`, read only by a poller that ran on
+# a workstation. That poller was deleted rather than left unused — it wrote a
+# second pool history that nothing served and nothing reconciled — so the key
+# stayed here for a while describing a component that no longer exists.
+
+[waterguru]
+# Path to a file containing two lines: email, then password. Kept out of this
+# file so config.toml stays safe to read, diff and share.
+credentials = "~/.waterguru"
+
+[leslies]
+# Leslie's has no API — the collector logs in as a browser would. Two lines:
+# email, then password. Kept out of this file for the same reason as WaterGuru.
+credentials = "~/.leslies"
+
+[collection]
+# HOW OFTEN EACH LAB IS PULLED. Optional, and opt-in: leave this section out
+# and each source keeps the cadence its crontab already had, so upgrading an
+# existing install changes nothing about when it collects.
+#
+# Cron TICKS hourly and poolhound/cadence.py decides, because the cadence has
+# to be changeable from Settings and the container cannot edit a file on the
+# host. The due test runs before any network call, so a tick that is not due
+# costs the vendor nothing.
+#
+# `_every_hours` is the interval. WaterGuru will not go below 12 whatever is
+# written here -- the upstream project asks for no more than two calls a day
+# and the floor is enforced where the call is spent, not only in the form.
+# Leslie's will not go below 6, because one call returns the whole history and
+# a second is a re-read. Neither goes above a week: beyond that the staleness
+# alarm would ring permanently about a state you had chosen.
+#
+# `_hour_utc` is the earliest hour a DAILY-or-longer pull may land in, in UTC,
+# and is ignored for anything more frequent -- with two pulls a day there is no
+# one hour to name. 23 is the default because the WaterGuru pod measures
+# between 19:37 and 21:15 UTC: a pull before that fetches yesterday's reading,
+# which is what happened, every day, for five days.
+#
+# waterguru_every_hours = 24
+# waterguru_hour_utc    = 23
+# leslies_every_hours   = 24
+# leslies_hour_utc      = 23
+
+[pool]
+# Used to convert a dose into an expected change. The WaterGuru API reports
+# most of this; these are the fallbacks if you do not use WaterGuru.
+#
+# volume_gallons IS DELIBERATELY NOT SET HERE. The first-run error message tells
+# you to copy this file, so anything it states becomes a fact about YOUR pool the
+# moment you do — and 15,000 gallons was exactly the generic-chart number the
+# Pool Volume tab exists to argue against. Left unset, the page says the volume
+# is unknown and every dose figure says so too, which is true. Trace the pool on
+# the Pool Volume tab, or put your own number here:
+#
+#   volume_gallons = 16250
+#   volume_estimated = true    # true if it is a guess; the dose maths says so on the page
+acid_pct = 31.45          # muriatic: 31.45% (20 Baume) or 14.5%
+# The filter pump's RATED draw, off the motor's label — not a measurement. The
+# Power section uses it to estimate a cost when the panel reports no watts, and
+# says "estimated" when it does. Left unset, that section says it cannot work
+# the cost out rather than inventing a pump. Same rule as volume_gallons.
+#
+#   pump_watts = 1800
+# A spillover spa circulates with the pool, so every dose is diluted by both and
+# the chemistry uses the combined volume. A spa isolated behind a valve is a
+# separate body of water. The two figures are stored separately either way.
+spa_shares_water = true
+sanitiser = "salt_cell"   # salt_cell | liquid | tablet
+
+[notify]
+# What is worth a desktop notification. Collectors going quiet and chemistry
+# going badly wrong are on by default; equipment is per item, because a
+# notification that fires every sunny afternoon is one nobody keeps reading.
+# Where notifications go. Desktop reaches you at this Mac; email reaches you
+# anywhere, so it is held to a higher bar by default — a banner is free to
+# glance past, an email competes with everything else on a phone.
+desktop = true
+email = false
+email_to = ""
+email_from = ""
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_tls = true
+# Two lines: username, then password. Gmail requires an APP password, not the
+# account password. chmod 600, and never put the password in this file.
+smtp_credentials = "~/.poolhound_smtp"
+# "serious" sends chlorine, pH and collector failures. "info" adds heaters
+# coming on and everything recovering.
+email_min_severity = "serious"
+# The domain a notification is sent FROM when email_from is blank and the
+# credentials file carries no address. Unset, poolhound falls back to the
+# author's domain, which is wrong on every install but one — so if you are
+# going to leave email_from blank, say whose mail this is:
+#
+#   mail_domain = "example.com"
+
+collectors = true
+chemistry  = true
+pool_heat  = true      # gas: costs money, and warms the water
+spa_heat   = true
+spa        = false
+
+[paths]
+data = "data"             # runtime data; never committed
+site = "site"             # generated dashboard; never committed
+
+# ---------------------------------------------------------------------- power
+# What a kilowatt-hour costs you. NO DEFAULT, and that is the point: a made-up
+# tariff turns an honest energy figure into a fabricated money figure, and money
+# is the number people act on hardest. Unset, the Power section reports hours
+# and kilowatt-hours and declines to price them.
+#
+# [power]
+# kwh_cost = 0.31
+
+# ---------------------------------------------------------------------- prices
+# What you pay for each chemical, per gallon or per pound. Unset, the upkeep
+# and by-month tables on the Chemicals tab fall back to a typical retail price
+# and SAY SO beside every figure priced that way; set, they use yours. Acid is
+# per gallon at the strength set as acid_pct above.
+#
+# [prices]
+# acid_per_gal       = 9.75
+# chlorine_per_gal   = 7.50
+# shock_per_lb       = 6.99
+# bicarb_per_lb      = 1.00
+# soda_ash_per_lb    = 3.30
+# calcium_per_lb     = 1.62
+# cya_per_lb         = 5.00
+# cya_liquid_per_gal = 39.99
+# nophos_per_gal     = 50.46
+# salt_per_lb        = 0.20
+
+# ----------------------------------------------------------------------- site
+# Facts about THIS deployment. Every one of these has a built-in fallback that
+# is the author's, so an install that says nothing here inherits somebody else's
+# hostname in its alert emails and somebody else's placeholders in Help.
+#
+#   host           where this install is reachable, e.g. "poolhound.example.com".
+#                  Notification emails link to it; unset, every alert points at
+#                  http://127.0.0.1:8787 — the loopback address of the machine
+#                  that SENT the mail, which is a dead link everywhere else.
+#   user, serial   substituted into the Help tab's wiring and shell instructions
+#                  in the AUTHENTICATED build only. Unset, both builds render
+#                  "pi" and "XXXXXXXX" and lose nothing but specificity.
+#
+#   never_publish  THE ONE THAT FAILS OPEN AND SILENTLY.
+#                  bin/render asserts that no private string survived into the
+#                  public index.html, and it carries the generic patterns — LAN
+#                  addresses, token paths, control endpoints. It cannot carry
+#                  yours: a guard that has to name the secret in a public
+#                  repository is a guard that publishes it. So your street name,
+#                  your surname, the pool company's account number — anything
+#                  that must never reach the page you hand a neighbour — goes
+#                  here, in the file that is not committed. An EMPTY list is
+#                  legal and means only the generic patterns are checked; it is
+#                  not a statement that you have nothing to hide.
+#
+# [site]
+# host          = "poolhound.example.com"
+# user          = "pi"
+# serial        = "XXXXXXXX"
+# never_publish = ["Acacia Avenue", "Your Surname", "AC-90210"]
+
+# ------------------------------------------------------------------- circuits
+# What YOU call each circuit, where the panel cannot say.
+#
+# Aux_4 and Aux_5 are switchable and the panel reports no name and no state for
+# either, so poolhound offers two buttons labelled "Aux 4" and "Aux 5" that it
+# cannot describe and cannot confirm. Every other control on that tab carries a
+# sentence about what pressing it costs; these two can only carry one if you
+# write it. Until you do, the card says plainly that nobody has said what the
+# circuit does — it does not guess, and it does not hide the button either.
+#
+# The name is display only. It changes what the card and the audit log say and
+# changes nothing about what the agent will accept, so the server and the Pi can hold
+# different files here and still be unable to drift. 32 characters, plain text.
+#
+# [circuits]
+# Aux_4 = "Booster pump"
+# Aux_5 = "Landscape lighting"
+
+# ------------------------------------------------------------------------- ai
+# The Ask AI tab: a question answered from this pool's own record.
+#
+# ANY OpenAI-compatible endpoint, which is the whole point of naming a base_url
+# rather than a provider — a model on your own network is a one-line change and
+# then nothing leaves the house at all. The KEY is not here: it is a vault
+# service like every other credential ("ai"), set from the Settings tab, and it
+# is never written to this file.
+#
+# Leave this out entirely and the tab says it is not configured and sends
+# nothing. Asking needs `operate`, not `view`, because it spends money.
+#
+# [ai]
+# base_url   = "https://api.openai.com/v1"
+# model      = "gpt-4o-mini"
+# timeout_s  = 45
+# max_tokens = 700
+
+# --------------------------------------------------------------------- access
+# WHO MAY DO WHAT, once your sign-in has said who they are.
+#
+# Leave this whole section out and poolhound behaves as it always has: everyone
+# the proxy admits is an administrator. That is correct when the proxy admits
+# exactly your household. It is not correct if you are behind a shared
+# oauth2-proxy, or an Entra group that can grow, or you have ever added somebody
+# for one afternoon -- authentication says who, and without this nothing says
+# what they may do.
+#
+#   view     read the private tabs; change nothing
+#   operate  switch equipment, log doses, record readings, correct a bad one
+#   admin    all of that, plus settings, credentials and the export
+#
+# Addresses are matched case-insensitively against whatever your sign-in puts in
+# the identity header -- the Settings tab shows you what that is for you.
+#
+# Once ANY name is listed the section is live, and anyone not named gets
+# `default` (which is `view` unless you say otherwise). A loopback session with
+# no proxy in front is always admin: being on the machine is the authentication,
+# and somebody with a shell can edit this file anyway.
+#
+# [access]
+# admins    = ["you@example.com"]
+# operators = ["partner@example.com"]
+# viewers   = ["guest@example.com"]
+# default   = "view"

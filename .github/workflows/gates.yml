@@ -1,0 +1,124 @@
+# The four gates, on every push and pull request.
+#
+# WHY THIS EXISTS
+#
+# Every gate in this project ran only where somebody remembered to run it. The
+# properties they defend are ones that decay by ordinary editing — the
+# publishable-repository check exists because "somebody pastes a real URL into
+# a comment while debugging" is a normal thing to do, and nothing was asking
+# between one person's workstation and a deploy.
+#
+# THE GATES ARE RUN THE WAY THE PROJECT RUNS THEM, not reimplemented here. A
+# second copy of what "checking" means is the defect poolhound/seams.py exists
+# for, so each step is one of the documented commands and nothing else.
+#
+# ORDER MATTERS IN ONE PLACE: bin/contrast asserts the RENDERED page still
+# carries the three non-colour fallbacks the green series colour depends on,
+# so it needs bin/render to have run. Measured, not assumed — on a clean tree
+# it says "admin.html: NOT RENDERED ... Run bin/render first."
+name: gates
+
+on:
+  push:
+  # pull_request, NEVER pull_request_target. The latter runs with the base
+  # repository's token and secrets against code from the fork, which is how a
+  # CI job becomes a way to read them. This workflow runs untrusted code by
+  # definition — a pull request is somebody else's patch — so it gets the
+  # fork-safe trigger, a read-only token, and no secrets to leak.
+  pull_request:
+
+# ACTIONS ARE PINNED TO COMMIT SHAs, not to tags. A tag is a mutable pointer in
+# somebody else's repository: `actions/checkout@v4` is whatever that reference
+# names on the morning the job runs, and the three packages this project
+# already pins transitively exist because "re-resolve on every build" is the
+# property that makes "what did we ship" impossible to answer. The same
+# argument reaches a CI runner, which handles a fork's code with this
+# repository's checkout. The `# v4` comment is what a human reads; the SHA is
+# what runs, and dependabot raises it.
+
+permissions:
+  contents: read
+
+# No ${{ }} anywhere in this file, deliberately. Every documented Actions
+# injection starts with an event field — a branch name, a commit message, a PR
+# title — interpolated into a shell. Nothing here reads the event at all.
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gates read the tree; none of them pushes. A token left in
+          # .git/config is a token a later step can use, and this workflow
+          # runs a pull request's code by design.
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # The image is python:3.12-slim; the gates should run on what ships.
+          python-version: "3.12"
+
+      # THE RUNTIME IS STDLIB PLUS SIX PACKAGES and the gates need only a
+      # couple of them. Playwright is a WORKSTATION dependency, deliberately
+      # not in deploy/requirements.txt, so it is installed here and not there.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r deploy/requirements.txt
+          # Unpinned ON PURPOSE, unlike everything in requirements.txt. Those
+          # pins exist because that file IS the shipped image and a CVE in it
+          # is a CVE in production; playwright is never shipped, and a stale
+          # pin here would mean the browser gate stops matching the browsers
+          # people use.
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      # config/config.toml is never committed — it is one household's settings.
+      # The gates need A config, not THAT config, and the example is what the
+      # product itself seeds a first run from.
+      - name: Seed a config
+        run: cp config/config.example.toml config/config.toml
+
+      - name: bin/selftest
+        run: python bin/selftest
+
+      # NOT THE SAME COMMAND, and that is the point. `-m` runs the file as
+      # __main__, a second module object, and for a while every checks_*.py
+      # appended its failures to the other one: nine FAIL lines, then "all
+      # checks pass", exit 0. This is the Dockerfile's build gate, so it is
+      # run here as well as the bin/ form.
+      - name: python -m poolhound.selftest
+        run: python -m poolhound.selftest
+
+      - name: bin/render
+        run: python bin/render
+
+      - name: bin/contrast
+        run: python bin/contrast
+
+      - name: bin/brand --check
+        run: python bin/brand --check
+
+      # THE ONE GATE NO STATIC CHECK REACHES. It holds the most user-visible
+      # defects this project has shipped, and it exits 0 with a line when
+      # there is no browser — so a silent skip here would look exactly like a
+      # pass. There IS a browser on this runner, installed above, so a skip
+      # means something is wrong and the grep makes it fail rather than pass.
+      - name: bin/drive
+        run: |
+          python bin/drive 2>&1 | tee drive.log
+          if grep -q "no Playwright here" drive.log; then
+            echo "::error::bin/drive did not run — the browser gate was skipped"
+            exit 1
+          fi
+
+      # The built pages are one household's readings rendered from the example
+      # config, but they are also the thing bin/drive and bin/contrast judged.
+      - name: Keep what was judged
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: built-pages
+          path: site/
+          retention-days: 7

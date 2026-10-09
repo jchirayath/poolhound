@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Regenerate docs/screenshots/ from the synthetic demo pool.
+
+WHY THIS EXISTS
+
+README promises the screenshots come from a demo pool and carry no real
+household data. That promise used to be kept by hand: somebody built a dataset,
+took five pictures, and did not keep the generator — so retaking them was a
+from-scratch job, which is why they went stale and ended up beneath a note
+telling the reader to trust the text over the pictures.
+
+bin/demo-data made the DATA reproducible. This makes the PICTURES reproducible,
+which is the other half: the two together mean a screenshot is a build artefact
+rather than a keepsake, and a stale one is a command away from being current.
+
+    bin/screenshots [--out docs/screenshots]
+
+Needs Playwright. Without it, says so and exits 0 — a released copy must build
+without a browser toolchain — but says it out loud, because "did not run" has to
+be distinguishable from "passed".
+
+NO REAL DATA REACHES THESE. The demo pool is built into a temporary directory
+and POOLHOUND_DATA/SITE/CONFIG all point inside it, asserted before anything
+renders. Two reviewers damaged real household files this session by assuming
+isolation rather than checking it.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+# (file stem, tab, theme, viewport height) — every tab that gets shown as a
+# picture anywhere: info.FIGURES embeds the cards on the landing page, and
+# README embeds the full captures. The comment here used to say "the tabs
+# README actually shows", which stopped being true the moment Ask AI and
+# Collection were added to info.FIGURES and not to README.
+SHOTS = [
+    ("home-light", "home", "light", 1500),
+    ("home-dark", "home", "dark", 1500),
+    ("control-light", "control", "light", 1400),
+    ("chemistry-light", "chemistry", "light", 1700),
+    ("volume-light", "volume", "light", 1300),
+    ("collection-light", "collection", "light", 1300),
+    ("ask-light", "ask", "light", 1500),
+]
+
+# TWO SIZES, BECAUSE THEY HAVE TWO JOBS.
+#
+# The files above are whole-panel captures — chemistry is 11,495 pixels tall —
+# and that is right for README, where a reader wants the entire tab in one
+# image they can open and scroll. It is wrong for a page: nothing legible
+# survives scaling an 11,495-pixel column into a card, and the landing page
+# would be carrying a megabyte to show an unreadable stripe.
+#
+# So each one also yields a CARD: the top of the panel, which is the part that
+# actually characterises the tab, cropped and scaled to the width it is
+# displayed at. These are what the Poolhound info tab embeds.
+#
+# Committed, and under docs/ rather than site/. site/ is a build output that is
+# never committed, so a card written there would exist on the workstation that
+# took it and nowhere else — the image has no browser in it and cannot retake
+# them. bin/render copies this directory into the site directory, which is how
+# they reach the served page in both places.
+CARD_W = 880           # the card's pixel width; shown at about 440 CSS px
+CARD_RATIO = 0.63      # height as a fraction of width — a shade wider than 16:10
+CARDS = ROOT + "/docs/screenshots/cards"
+WIDTH = 1180
+# 2x looked right and produced 8.4 MB of PNG across six files — 3.3 MB for one
+# of them. These are read on a landing page over somebody's phone connection
+# and committed to a repository that is meant to be cloned, so the crispness
+# was bought with the two things that actually matter here. 1.5x keeps text
+# sharp on a retina screen at the size these are displayed, and Pillow (already
+# a runtime dependency, for the photo tracer) squeezes the rest.
+SCALE = 1.5
+# What a single card may weigh once quantised. Not a style preference: these
+# six files are fetched by every anonymous visitor to the landing page, and a
+# budget that is never checked is a budget that drifts. The full captures are
+# deliberately NOT held to it — they are documentation, fetched on purpose.
+MAX_CARD_BYTES = 180_000
+
+
+def _shrink(path):
+    """Quantise a screenshot down to something a page can carry.
+
+    A flat UI screenshot is a few dozen colours wearing 24-bit paint, so an
+    adaptive palette costs almost nothing visible and saves most of the file.
+    Falls back to the original if Pillow is not importable — the picture being
+    large is better than no picture.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return os.path.getsize(path)
+    im = Image.open(path).convert("RGB")
+    im.quantize(colors=192, method=Image.MEDIANCUT).save(path, optimize=True)
+    return os.path.getsize(path)
+
+
+def _card(src, dest, top=0):
+    """Cut the top of a full-panel capture down to a page-sized card.
+
+    Cropped from the TOP rather than scaled whole: the first screenful of a
+    panel is the part that says what the panel is, and it is the part a reader
+    of the landing page is being shown as a promise of what they would get.
+    Scaling the whole 11,495-pixel chemistry column to card width renders every
+    word of it illegible, which is a picture that shows nothing while looking
+    like it shows something.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    im = Image.open(src).convert("RGB")
+    keep = min(im.height - top, round(im.width * CARD_RATIO))
+    im = im.crop((0, top, im.width, top + keep))
+    im = im.resize((CARD_W, round(CARD_W * keep / im.width)), Image.LANCZOS)
+    im.quantize(colors=192, method=Image.MEDIANCUT).save(dest, optimize=True)
+    return os.path.getsize(dest)
+
+
+# POOLHOUND LOCAL, which is not a tab. deploy/poolhound-local.html is a
+# copy of the optional page on the author's Pi; it talks to AqualinkD and to the
+# agent, neither of which exists here. So it is served from a made-up origin
+# and EVERY request it makes is answered by the route below from the demo
+# pool's newest sample — or refused. Nothing it asks for reaches a network,
+# and the WebSocket it opens for the live feed is stubbed before the page's
+# script runs, because page.route() does not see a socket and an unrouted
+# socket would go and resolve the made-up name for real.
+PI_STEM = "poolhound-local-dark"
+PI_ORIGIN = "http://pool.example.com"
+PI_WIDTH = 900
+
+# The panel's own labels, as AqualinkD reports them — the page shows these
+# under its friendly names. (device id, panel label, samples.csv column)
+_PI_SWITCHES = [
+    ("Filter_Pump", "Filter Pump", "pump"), ("Spa", "Spa", "spa"),
+    ("Aux_1", "Pool Light", "pool_light"), ("Aux_2", "SHEER DSCNT", "sheer"),
+    ("Aux_3", "Spa Light", "spa_light"), ("Pool_Heater", "Pool Heat", "pool_heat"),
+    ("Spa_Heater", "Spa Heat", "spa_heat"), ("Extra_Aux", "Solar Heat", "solar_valve"),
+]
+
+
+def _pi_payloads(data):
+    """(devices, status, activity) for the page, from the demo pool's samples."""
+    import csv
+    from poolhound import agent
+    with open(os.path.join(data, "samples.csv"), newline="") as f:
+        rows = list(csv.DictReader(f))
+    s = rows[-1]
+    on = lambda c: "on" if s.get(c) == "1" else "off"      # noqa: E731
+    devices = [{"id": i, "name": n, "state": on(c)} for i, n, c in _PI_SWITCHES]
+    by = {d["id"]: d for d in devices}
+    by["Filter_Pump"]["Pump_RPM"] = s["pump_rpm"]
+    by["Pool_Heater"]["spvalue"] = s["pool_set"].split(".")[0]
+    by["Spa_Heater"]["spvalue"] = s["spa_set"].split(".")[0]
+    for i, c in (("Temperature/Air", "air_temp"), ("Temperature/Pool", "pool_temp"),
+                 ("Temperature/Spa", "spa_temp")):
+        devices.append({"id": i, "name": i, "value": s[c] or "-999"})
+    devices += [{"id": "SWG/Percent", "name": "SWG", "value": s["swg_pct"]},
+                {"id": "SWG/PPM", "name": "SWG PPM", "value": s["salt_ppm"]},
+                {"id": "SWG/Boost", "name": "SWG Boost", "state": "off"}]
+    status = {"frz_protect_set_pnt": s["freeze_set"].split(".")[0]}
+
+    # The activity list: every switch change in the demo history, worded by
+    # the agent's own describe_change() so this picture cannot word a change
+    # differently from the page it is a picture of. Which DOOR each came
+    # through is the one invented part — the demo history has no doors — so
+    # the three are dealt round in turn to show what the list can say.
+    doors = ["panel or AqualinkD", "poolhound app", "door:pool.html"]
+    events, prev = [], rows[0]
+    for r in rows[1:]:
+        for _, _, c in _PI_SWITCHES:
+            if r.get(c) != prev.get(c) and r.get(c) in ("0", "1"):
+                what = agent.describe_change(c, r[c])
+                if what:
+                    events.append({"at": r["ts"], "what": what,
+                                   "how": doors[len(events) % 3], "ok": True})
+        prev = r
+    return devices, status, {"events": list(reversed(events))[:12]}
+
+
+def _pi_page(browser, data, out):
+    import json
+    devices, status, activity = _pi_payloads(data)
+    with open(os.path.join(ROOT, "deploy", "poolhound-local.html"), encoding="utf-8") as f:
+        page_html = f.read()
+    answers = {"/pool.html": ("text/html", page_html),
+               "/poolapi/api/devices": ("application/json",
+                                        json.dumps({"devices": devices})),
+               "/poolapi/api/status": ("application/json", json.dumps(status)),
+               "/poolactivity": ("application/json", json.dumps(activity))}
+
+    def answer(route):
+        from urllib.parse import urlsplit
+        u = urlsplit(route.request.url)
+        hit = (answers.get(u.path) if f"{u.scheme}://{u.netloc}" == PI_ORIGIN
+               and route.request.method == "GET" else None)
+        if hit:
+            route.fulfill(status=200, content_type=hit[0], body=hit[1])
+        else:
+            route.abort()
+
+    pg = browser.new_page(viewport={"width": PI_WIDTH, "height": 1300},
+                          color_scheme="dark", device_scale_factor=SCALE)
+    pg.add_init_script("window.WebSocket = function () {"
+                       " throw new Error('no live feed in a screenshot'); };")
+    pg.route("**/*", answer)
+    pg.goto(PI_ORIGIN + "/pool.html", wait_until="networkidle")
+    pg.wait_for_selector("#circuits .tile")
+    pg.wait_for_timeout(350)
+    # The card starts at the Circuits heading, not the page top. Cropped from
+    # the top it ended at the salt cell; from the status bar, at the
+    # setpoints — three rows of readouts either way, and never the switches,
+    # which are what the page is for. The full capture keeps all of it.
+    top = round(pg.eval_on_selector(
+        "#circuits", "e => e.previousElementSibling.previousElementSibling"
+                     ".getBoundingClientRect().top + scrollY") * SCALE) \
+        - round(12 * SCALE)
+    dest = os.path.join(out, f"{PI_STEM}.png")
+    pg.screenshot(path=dest, full_page=True)
+    pg.close()
+    card = _card(dest, os.path.join(CARDS, f"{PI_STEM}.png"), top=top)
+    return PI_STEM, (_shrink(dest), card)
+
+
+GLANCE_STEM = "glance"
+
+
+def _glance(browser, page_path, out):
+    """The three-piece drawing at the top of Poolhound info, for README.
+
+    A picture of the page's own figure rather than a second drawing of it:
+    GitHub will not resolve the stylesheet tokens the SVG is coloured with, and
+    a copy redrawn for README is a copy that can disagree. It sits on the dark
+    showpiece ground in both themes, so one capture serves both. No card: the
+    landing page shows the figure itself.
+    """
+    pg = browser.new_page(viewport={"width": WIDTH, "height": 900},
+                          device_scale_factor=SCALE)
+    pg.goto("file://" + page_path, wait_until="networkidle")
+    pg.evaluate("() => document.querySelector("
+                "'[role=tab][data-tab=\"info\"]').click()")
+    pg.wait_for_timeout(350)
+    dest = os.path.join(out, f"{GLANCE_STEM}.png")
+    # Without its caption: "the full picture is further down" points at a
+    # section of the landing page, and README has its own words around it.
+    pg.evaluate("() => document.querySelector("
+                "'#info-glance figcaption').style.display = 'none'")
+    pg.query_selector("#info-glance .showpiece").screenshot(path=dest)
+    pg.close()
+    return GLANCE_STEM, _shrink(dest), False
+
+
+def main():
+    out = ROOT + "/docs/screenshots"
+    if "--out" in sys.argv:
+        out = sys.argv[sys.argv.index("--out") + 1]
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  bin/screenshots: no Playwright here, so nothing was retaken.")
+        print("            pip install playwright && playwright install chromium")
+        return 0
+
+    work = tempfile.mkdtemp(prefix="poolhound-shots-")
+    try:
+        print(f"  building a synthetic pool in {work}")
+        subprocess.run([sys.executable, f"{ROOT}/bin/demo-data", work],
+                       check=True, capture_output=True, text=True)
+        data = os.path.join(work, "data")
+        site = os.path.join(work, "site")
+        cfg = os.path.join(work, "config.toml")
+        # THE VAULT IS SANDBOXED FOR THE RENDER, not only for the probe below.
+        # It was set on the probe alone, so the probe proved isolation for a
+        # process that then handed the render the REAL credential store —
+        # which decides, among other things, whether the Ask AI tab renders as
+        # configured. A screenshot of this pool's setup state is not a
+        # screenshot of a pool that does not exist.
+        env = dict(os.environ, POOLHOUND_DATA=data, POOLHOUND_SITE=site,
+                   POOLHOUND_CONFIG=cfg,
+                   POOLHOUND_VAULT=os.path.join(work, "vault"),
+                   # The watchdog is not run here, but bin/render imports the
+                   # world and a future panel that notifies must not be able to.
+                   POOLHOUND_NO_NOTIFY="1")
+        os.makedirs(site, exist_ok=True)
+
+        # ISOLATION, ASSERTED. The render below writes pages and a run record;
+        # if any of these resolved to the real install it would write there.
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "from poolhound import config, vault; import os;"
+             "print(config.data_dir(config.load())); print(vault.ISOLATED)"],
+            env=env, capture_output=True, text=True, cwd=ROOT)
+        seen = (probe.stdout or "").strip().split("\n")
+        if not seen or os.path.realpath(seen[0]) != os.path.realpath(data):
+            print(f"  REFUSING: data dir resolved to {seen[:1]}, not {data}")
+            return 1
+
+        # A DEMONSTRATION CREDENTIAL, IN THE SANDBOX ONLY. The Ask AI tab shows
+        # a disabled form and "not configured" until a key is stored, which is
+        # the honest state of a fresh install and a poor picture of the
+        # feature. This writes a fake one into the temporary vault — it is
+        # never used to call anything, and it cannot reach the real store,
+        # which the assertion above has just proved is somewhere else.
+        subprocess.run(
+            [sys.executable, "-c",
+             "from poolhound import vault; vault.put('ai', 'OpenAI', 'demo-key-not-real')"],
+            env=env, capture_output=True, text=True, cwd=ROOT)
+
+        subprocess.run([sys.executable, f"{ROOT}/bin/render"], check=True,
+                       env=env, capture_output=True, text=True)
+        page_path = os.path.join(site, "admin.html")
+        if not os.path.exists(page_path):
+            print("  the demo render produced no admin.html")
+            return 1
+
+        os.makedirs(out, exist_ok=True)
+        os.makedirs(CARDS, exist_ok=True)
+        taken = []
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            for stem, tab, theme, height in SHOTS:
+                pg = browser.new_page(
+                    viewport={"width": WIDTH, "height": height},
+                    color_scheme=theme, device_scale_factor=SCALE)
+                pg.goto("file://" + page_path, wait_until="networkidle")
+                # The identity the page asks for never answers on file://, so
+                # it settles into its no-API state — which is the honest thing
+                # to photograph: a reader looking at these has no session
+                # either.
+                pg.evaluate(
+                    "(t) => { const b = document.querySelector("
+                    "'[role=tab][data-tab=\"' + t + '\"]'); if (b) b.click(); }", tab)
+                pg.wait_for_timeout(350)
+                panel = pg.query_selector(f"#tab-{tab}")
+                dest = os.path.join(out, f"{stem}.png")
+                (panel or pg).screenshot(path=dest)
+                card = _card(dest, os.path.join(CARDS, f"{stem}.png"))
+                taken.append((stem, _shrink(dest), card))
+                pg.close()
+            stem, (size, card) = _pi_page(browser, data, out)
+            taken.append((stem, size, card))
+            taken.append(_glance(browser, page_path, out))
+            browser.close()
+        for stem, size, card in taken:
+            card_note = ("none, by design" if card is False else
+                         "no Pillow" if card is None else f"{card/1024:5.0f} KB")
+            print(f"    {stem+'.png':26} {size/1024:6.0f} KB   card {card_note}")
+        print(f"  {len(taken)} screenshot(s) into {out}")
+        print(f"  {sum(1 for t in taken if t[2] is not False)} card(s) into {CARDS}")
+
+        # The budget, enforced rather than described. A card that has grown past
+        # it is a card the landing page should not be serving, and finding that
+        # out here is the difference between a number in a comment and a rule.
+        heavy = [(s, c) for s, _, c in taken if c and c > MAX_CARD_BYTES]
+        if heavy:
+            for stem, c in heavy:
+                print(f"  {stem}.png is {c/1024:.0f} KB — over the "
+                      f"{MAX_CARD_BYTES/1024:.0f} KB card budget")
+            return 1
+        return 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

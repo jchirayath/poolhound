@@ -1,0 +1,266 @@
+# poolhound — pool chemistry and pool control.
+#
+# A TEMPLATE, not a deployed file. bootstrap-server.sh substitutes the two
+# doubled-at placeholders below from deploy/server.env when it installs this
+# into Caddy's sites/ directory, using the same convention render.fill() uses
+# for the page. There is deliberately no second, concrete copy of this file kept
+# anywhere: the reason this repository can be read at all is that the
+# deployment's facts live in server.env, and a "real" vhost beside a template
+# one is two copies of a routing table that will disagree.
+#
+#   PUBLIC_HOSTS   the site addresses, comma-separated
+#   OAUTH2_HOST    the host serving oauth2-proxy's /oauth2/start, where an
+#                  unauthenticated browser is sent to sign in
+#
+# Named without their doubled-at markers on purpose: the installer substitutes
+# by literal text, so documenting a placeholder by writing it out means the
+# installed file's own comments get rewritten too.
+#
+# THREE CLASSES OF REQUEST, AND THEY MUST NOT BE CONFUSED
+#
+#   public      the stats, the chemistry reference, and the volume calculator.
+#               Anyone may read them. No sign-in, by design — they are the
+#               useful, harmless part, and putting them behind a login makes
+#               them useless to anybody the pool is being explained to. The
+#               calculator also POSTs: /api/pool-shape/compute and /api/photo
+#               are pure functions that keep nothing, and poolhound rate-limits
+#               them separately from its write budget.
+#
+#   private     the control panel, the dose log, the settings and every write
+#               API. Entra ID, same gate as every other private vhost here.
+#
+#   agent       /api/agent/* — the Pi. Authenticated by BEARER TOKEN at the
+#               application, and it MUST bypass Entra entirely: oauth2-proxy
+#               answers a machine with an HTML sign-in redirect, which the agent
+#               cannot satisfy and would retry forever.
+#
+# ── WHY ONE `route` BLOCK ────────────────────────────────────────────────────
+# Same reason as every other vhost here: Caddy sorts bare directives into its own
+# canonical order, so `request_header -X-...` written before forward_auth runs
+# AFTER it, deleting the identity that had just been established. `route`
+# preserves written order, which is the only way to guarantee
+# strip-then-authenticate-then-forward. Verify after any edit with:
+#
+#     docker compose exec caddy caddy adapt --config /etc/caddy/Caddyfile \
+#       | python3 -m json.tool
+#
+# and read the handler sequence: the DELETE must appear BEFORE the oauth2-proxy
+# hop, never after it.
+#
+# ── THE PUBLIC BUILD IS A DIFFERENT FILE, NOT A HIDDEN TAB ──────────────────
+# `/` serves index.html, which is rendered WITHOUT the private panels in it.
+# `/admin.html` is the build that has them. So even if every rule below were
+# deleted, an anonymous visitor would get a page that does not contain the
+# house address or the control markup — this vhost is the second lock, not the
+# only one. poolhound's own server also refuses /admin.html without an identity
+# header, which is the third.
+
+{$POOLHOUND_PUBLIC_HOSTS} {
+	route {
+		# ---- 1. Distrust anything the client says about who it is ----------
+		# poolhound trusts these headers because only Caddy can set them. That
+		# is true only because they are deleted here first, on every request,
+		# before anything has a chance to authenticate.
+		request_header -X-MS-CLIENT-PRINCIPAL-NAME
+		request_header -X-MS-CLIENT-PRINCIPAL-ROLES
+		request_header -X-MS-CLIENT-PRINCIPAL-ID
+		request_header -X-MS-CLIENT-PRINCIPAL
+		request_header -X-Auth-Request-User
+		request_header -X-Auth-Request-Email
+		request_header -X-Forwarded-User
+		request_header -X-Forwarded-Email
+
+		# AND NOW PROVE THE REQUEST CAME THROUGH HERE.
+		#
+		# The eight deletions above stop a CLIENT forging an identity. They do
+		# nothing about a sibling container, which does not traverse this vhost
+		# at all and can open poolhound:8787 directly — so until this line the
+		# identity headers were trusted on docker network membership alone, and
+		# poolhound's own source says so: "Anything that can already open a
+		# socket to this container can claim to be anybody."
+		#
+		# Set AFTER the strips, so a client supplying it has already had it
+		# removed. poolhound compares it with hmac.compare_digest before it
+		# reads any identity header, and ignores every one of them when it does
+		# not match. Empty value => the check is off and poolhound says so on
+		# /api/health, rather than silently trusting the network again.
+		request_header X-Poolhound-Proxy-Auth "{$POOLHOUND_PROXY_SECRET}"
+
+		# ---- 2. Scanners --------------------------------------------------
+		@badpath path_regexp badpath (?i)(wp-login|wp-admin|wp-content|xmlrpc\.php|/\.env|/\.git|/\.aws|/\.ssh|phpmyadmin|/vendor/|/cgi-bin/|/actuator|/boaform)
+		respond @badpath 403
+		@badbots header_regexp User-Agent (?i)(nikto|sqlmap|nmap|masscan|zgrab|nuclei|dirbuster|gobuster|wpscan)
+		respond @badbots 403
+
+		# ---- 3. The agent, before any auth ---------------------------------
+		# SSE: the command stream is held open indefinitely and must not be
+		# buffered or timed out. flush_interval -1 disables response buffering;
+		# without it Caddy holds each event until its buffer fills and commands
+		# arrive in batches minutes late, which looks exactly like a dead agent.
+		handle /api/agent/* {
+			reverse_proxy poolhound:8787 {
+				flush_interval -1
+				transport http {
+					read_timeout 0
+					write_timeout 0
+				}
+			}
+		}
+
+		# ---- 4. Identity WITHOUT requiring it --------------------------------
+		# Two paths need to KNOW who you are without REQUIRING it.
+		#
+		# "/" is the second one. The gate is on /admin.html, so the bare domain
+		# always served the public build — and anybody who signed in and came
+		# back later silently lost the refresh control, Pool control, Chemicals
+		# and Settings, with nothing explaining why. It reads as features
+		# vanishing rather than as a different page. With the identity passed
+		# through, poolhound redirects a signed-in visitor to the build that has
+		# their tools. /index.html still serves the public page unconditionally.
+		#
+		# /api/health is how the page learns who you are, whether it may write,
+		# and whether the pool agent is connected. Both builds call it, so it
+		# can be neither public nor gated:
+		#
+		#   left public  — a signed-in user's call arrives with no identity
+		#                  header, poolhound sees "local", issues no session
+		#                  token, and the authenticated page reports "not signed
+		#                  in" with every control disabled. The gate is fine;
+		#                  the page is useless.
+		#   made private — the PUBLIC page's health call gets a 302 to
+		#                  sign-in, so anonymous visitors lose the volume
+		#                  calculator.
+		#
+		# So: ask oauth2-proxy, pass the identity through when there is a
+		# session, and on 401 proxy the request ANYWAY, anonymously. That is
+		# what handle_response does here instead of redirecting — the caller
+		# gets a truthful answer either way, and poolhound decides what to
+		# disclose to whom rather than Caddy deciding whether to answer.
+		# A named matcher, because `handle` takes ONE argument — `handle / /api/health`
+		# is a config-time error, not a two-path shorthand.
+		# WHETHER CREDENTIALS WERE OFFERED, not whether they are required.
+		# Under a password this cannot simply `import poolhound_auth`:
+		# basic_auth challenges a caller who sent nothing, and the PUBLIC page
+		# calls /api/health before anybody has signed in — so the volume
+		# calculator would meet a browser password box. Splitting on the presence
+		# of an Authorization header gives both callers a truthful answer: no
+		# credentials means anonymous, credentials mean they are checked and the
+		# identity passed through. A WRONG password is still refused; only the
+		# ABSENCE of one is waved past, and poolhound issues an anonymous caller
+		# no write token, so nothing here decides what may be done — only who.
+		@identity path / /api/health
+		handle @identity {
+			import poolhound_identity
+		}
+
+		# ---- 5. Everything that changes something, or shows the house ------
+		# Listed explicitly. This block used to claim that "a new endpoint is
+		# closed until somebody deliberately opens it, and the failure mode of
+		# forgetting is a 401 rather than an exposure". THAT WAS NOT TRUE, and
+		# being written down is what would have stopped anyone checking: section
+		# 6 below is a catch-all that proxies anything unmatched, so a route
+		# missing from this list reaches poolhound anonymously and is refused
+		# only by poolhound's own session-token guard. /api/reading -- a write
+		# that records a lab result -- had been missing from here, and was
+		# refused in production solely by that one remaining layer.
+		#
+		# The guard does hold: /api/health issues no token to an anonymous
+		# caller behind the proxy, so every write route answers 403 whether it
+		# is listed here or not (verified against production). But defence in
+		# depth means the layers are independent, and a comment asserting a
+		# layer that is not there is worse than no comment.
+		#
+		# bin/selftest now compares this list against access.NEEDS, so the
+		# next route cannot go missing quietly.
+		@private {
+			path /admin.html /admin
+			path /api/control /api/control/*
+			path /api/chemical /api/chemical/*
+			path /api/settings /api/credential /api/credential/*
+			# /api/pool-shape SAVES the answer as this pool's volume — a write,
+			# and it stays here. Its /compute sibling and /api/photo are pure
+			# (they read nothing, write nothing, keep nothing) and are the
+			# volume calculator, which is offered to everybody, so they are
+			# deliberately NOT in this list. Note the trailing-wildcard form is
+			# gone: "/api/pool-shape/*" would have swept /compute back in.
+			path /api/pool-shape
+			path /api/notify-test /api/refresh /api/lab-correction
+			# Asking the assistant sends this pool's readings to a provider
+			# and spends money doing it. Gated like every other route that
+			# acts rather than reads.
+			path /api/ask
+			# /api/reading records a by-hand lab result -- a write, and it names
+			# the person who made it. /api/commands returns the command log AND
+			# audit.csv: who switched what, and when.
+			path /api/reading /api/commands
+			# /api/rows pages through the same history /api/export hands out
+			# whole. Gated for the same reason.
+			path /api/rows
+			# The whole pool history, as files. Read-only, but it is the most
+			# sensitive read there is — every measurement, every dose, every
+			# change and who made it. The wildcard is wanted here, unlike on
+			# /api/pool-shape: every path under /api/export is a download of
+			# this household's own data and none of them is public.
+			path /api/export /api/export/*
+		}
+		handle @private {
+			# HOW you sign in is a snippet; WHAT is behind the sign-in is the
+			# list above. Two mechanisms ship — a password held by Caddy, and a
+			# hand-off to oauth2-proxy — and they are separate files so that this
+			# route list stays the only copy of itself. A whole second Caddyfile
+			# per mechanism would be two routing tables that can disagree about
+			# which paths are private, and the gate comparing this list against
+			# access.NEEDS reads one file by design.
+			import poolhound_auth
+			reverse_proxy poolhound:8787
+		}
+
+		# ---- 6. The public site -------------------------------------------
+		handle {
+			reverse_proxy poolhound:8787
+		}
+	}
+
+	encode zstd gzip
+
+	# THE SAME SET poolhound/headers.py sends, and that is a check rather
+	# than a convention: this block and the server's end_headers() were two
+	# owners of one fact, and the two sent different sets. The vhost had
+	# HSTS, which only it can meaningfully send, and lacked the
+	# Content-Security-Policy entirely -- so a Caddy-generated error page,
+	# which never reaches poolhound, was served with no policy at all.
+	#
+	# checks_gates.t_the_vhost_sends_the_same_headers_the_server_does
+	# compares the two in both directions.
+	header {
+		# The one header the vhost owns alone. TLS terminates here; sent from
+		# poolhound it would reach a loopback workstation over http:// and
+		# tell the browser to stop using the URL the tool is served at.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), display-capture=(), document-domain=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+
+		# `?` MEANS DEFAULT, AND IS LOAD-BEARING. A bare `Content-Security-Policy`
+		# here would REPLACE what poolhound sent, and what poolhound sends is
+		# the per-page policy naming that page's one inline script by digest --
+		# so writing the baseline without the `?` would downgrade every page to
+		# a policy that refuses its own script. With `?` this value reaches
+		# exactly the responses poolhound never saw: Caddy's own error pages.
+		?Content-Security-Policy "default-src 'none'; img-src 'self' data: blob:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'; script-src-attr 'none'; script-src 'none'; style-src 'none'"
+
+		-Server
+		-X-Powered-By
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

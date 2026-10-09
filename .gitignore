@@ -1,0 +1,22 @@
+# Runtime data — never published. Contains this household's pool history.
+data/
+# Generated dashboard
+site/
+# Local, site-specific config (config.example.toml is the template)
+config/config.toml
+.venv/
+__pycache__/
+*.pyc
+deploy/server.env
+REVISION
+.playwright-mcp/
+.claude/
+
+# Scratch proof sheets. Three of these — a mark contact sheet, an interaction
+# matrix and a tab strip — were committed to the repository root by accident and
+# sat there being mistaken for assets. Pictures that belong to the product live
+# in docs/ and are written by bin/screenshots or bin/brand.
+/*.png
+
+# Who may sign in. Bcrypt hashes; one "username hash" line per person.
+deploy/caddy/users.caddy

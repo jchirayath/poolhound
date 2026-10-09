@@ -1,0 +1,762 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>poolhound local — pool &amp; spa</title>
+<meta name="description" content="Jandy pool and spa control with friendly names, explicit refresh, and verified switching.">
+<!--
+  WHAT THIS FILE IS. poolhound local: a copy of the page served by the
+  author's Pi, with the Pi's hostname taken out. (The poolhound server is the
+  web app; poolhound local is this optional page at the pool.) poolhound neither installs it nor needs it:
+  nothing deploys this file, and update-pi.sh does not touch it. It is here so
+  the page can be read, adapted and photographed — bin/screenshots drives it
+  against a synthetic AqualinkD for the landing page's card. It needs the Pi's
+  web server to proxy /poolapi/ to AqualinkD, and, for the activity list and
+  the door claim, /poolactivity and /poolclaim to the agent (deploy/README.md,
+  "Naming the door a panel change came through"). /resync is a household
+  extra and answers nothing without its own small service.
+
+  WHY THIS PAGE EXISTS, GIVEN AQUALINKD ALREADY HAS A UI
+
+  1. Names. In AqualinkD 3.1.0 the circuit label IS the key it uses to find the
+     item in the panel's PDA menu (button_NN_PDA_label, which used to separate
+     the two, was removed — the binary rejects it outright). So renaming a
+     circuit in aqualinkd.conf does not rename it, it MISDIRECTS it. Renaming
+     AUX2 to "SHEER DESCENT" made it match nothing, because the panel abbreviates
+     to "SHEER DSCNT" in its 16-character display.
+
+     This page maps friendly names in the BROWSER and commands by device ID,
+     which is label-independent. The backend keeps the panel's exact text and
+     cannot break again.
+
+  2. Refresh. Readings are stamped with the second they arrived and the stamp
+     ages visibly, so the page never implies it knows the current state when it
+     is showing something from two minutes ago.
+
+  3. Honest switching. PDA commands take ~5s (the panel is driven into
+     programming mode) and the spa is slower still. So this page does not assume
+     success: it re-reads after a delay and reports what actually happened.
+
+  THE API CALL THAT COST AN AFTERNOON
+     Switching is  PUT /api/<id>/set  with a form body  value=0|1.
+     NOT           GET /api/<id>/set/<value>.
+     The path form answers 200 and looks correct, but carries no value, so the
+     daemon parses nothing, compares the device against itself, logs
+     "not changing state, is same" and never presses. That reads exactly like a
+     daemon bug — it was a malformed request.
+
+  No external assets — same reasoning as the landing page. This is pool control
+  on a LAN; it must render when the internet does not.
+-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230A0A0B'/%3E%3Ccircle cx='16' cy='16' r='6.5' fill='%2358B4D1'/%3E%3C/svg%3E">
+<meta name="theme-color" content="#0A0A0B">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pool">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png">
+<style>
+:root{
+  --ink:#0A0A0B; --ink-2:#101012; --panel:#151517;
+  --line:#26262B; --line-soft:#1E1E22;
+  --text:#F2F0EC; --muted:#9C9891; --faint:#6A6862;
+  --water:#58B4D1; --water-lt:#7FCDE4; --water-glow:rgba(88,180,209,.28);
+  --gold:#E0A227;
+  --ok:#5FBF7F; --ok-dim:rgba(95,191,127,.14);
+  --bad:#D2544B; --bad-dim:rgba(210,84,75,.14);
+  --warn:#E0A227; --warn-dim:rgba(224,162,39,.14);
+  --display:"Instrument Serif","Times New Roman",serif;
+  --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --maxw:820px; --pad:clamp(18px,5vw,40px); --radius:14px;
+  --ease:cubic-bezier(.22,1,.36,1);
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+@media (prefers-reduced-motion:reduce){*{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);
+     font-weight:300;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--water);outline-offset:3px;border-radius:6px}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 var(--pad)}
+
+header{border-bottom:1px solid var(--line-soft);position:sticky;top:0;z-index:10;
+       background:rgba(10,10,11,.9);backdrop-filter:blur(12px)}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:1rem;
+     padding:.85rem 0;min-height:60px;flex-wrap:wrap}
+.mark{font-family:var(--mono);font-size:.92rem}
+.mark b{font-weight:600;color:var(--water)}
+.mark span{color:var(--faint)}
+.back{font-family:var(--mono);font-size:.72rem;color:var(--faint)}
+.back:hover{color:var(--water)}
+
+h1{font-family:var(--display);font-weight:400;margin:0;
+   font-size:clamp(1.9rem,5vw,2.7rem);line-height:1.05;letter-spacing:-.015em}
+.hero{padding:clamp(1.8rem,5vw,2.6rem) 0 1.2rem}
+.lede{color:var(--muted);font-size:.96rem;max-width:56ch;margin:.8rem 0 0}
+
+/* Freshness. The stamp is the point: this page must never imply it knows the
+   current state when it is showing a reading from two minutes ago. */
+.status-bar{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;
+  padding:.75rem .95rem;border:1px solid var(--line);border-radius:var(--radius);
+  background:linear-gradient(160deg,var(--panel),var(--ink-2));margin:1.2rem 0}
+.stamp{font-family:var(--mono);font-size:.76rem;color:var(--muted);flex:1 1 auto}
+.stamp b{color:var(--text);font-weight:500}
+.stamp.stale b{color:var(--warn)}
+button{font-family:var(--sans);font-size:.84rem;font-weight:500;cursor:pointer;
+  padding:.5rem .95rem;border-radius:999px;border:1px solid var(--line);
+  background:var(--ink-2);color:var(--text);transition:border-color .25s,background .25s}
+button:hover:not(:disabled){border-color:var(--water);background:rgba(88,180,209,.08)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.primary{border-color:rgba(88,180,209,.5);color:var(--water-lt)}
+button.danger{border-color:rgba(210,84,75,.45);color:var(--bad)}
+button.danger:hover:not(:disabled){border-color:var(--bad);background:rgba(210,84,75,.1)}
+
+/* A readout with nothing behind it should look absent, not look like zero. */
+.ro.empty .v{color:var(--faint)}
+.ro .why{font-family:var(--sans);font-size:.72rem;color:var(--faint);margin-top:.3rem;line-height:1.4}
+
+.grid{display:grid;gap:.7rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));margin:1rem 0}
+.tile{padding:1rem 1.1rem;border:1px solid var(--line);border-radius:var(--radius);
+      background:linear-gradient(160deg,var(--panel),var(--ink-2));
+      display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.tile .nm{font-size:1rem;font-weight:500;display:flex;align-items:center;gap:.55rem}
+.tile .sub{font-family:var(--mono);font-size:.68rem;color:var(--faint);
+           letter-spacing:.06em;text-transform:uppercase;margin-top:.15rem}
+.dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--faint);
+     box-shadow:0 0 0 3px rgba(106,104,98,.12)}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-dim)}
+.dot.off{background:var(--faint);box-shadow:0 0 0 3px rgba(106,104,98,.12)}
+.dot.busy{background:var(--warn);box-shadow:0 0 0 3px var(--warn-dim)}
+
+/* Toggle reflects CONFIRMED state only. It never latches optimistically —
+   that is precisely the lie the AqualinkD UI was telling. */
+.tgl{width:52px;height:30px;border-radius:999px;border:1px solid var(--line);
+     background:var(--ink);position:relative;flex:0 0 auto;padding:0;transition:background .3s var(--ease),border-color .3s}
+.tgl::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;
+  border-radius:50%;background:var(--faint);transition:transform .3s var(--ease),background .3s}
+.tgl[aria-pressed="true"]{background:rgba(95,191,127,.2);border-color:rgba(95,191,127,.5)}
+.tgl[aria-pressed="true"]::after{transform:translateX(22px);background:var(--ok)}
+.tgl[data-busy="1"]{border-color:rgba(224,162,39,.55)}
+.tgl[data-busy="1"]::after{background:var(--warn)}
+
+.readouts{display:grid;gap:.7rem;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));margin:1rem 0}
+.ro{padding:.85rem 1rem;border:1px solid var(--line);border-radius:var(--radius);
+    background:linear-gradient(160deg,var(--panel),var(--ink-2))}
+.ro .k{font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.ro .v{font-size:1.5rem;font-weight:300;margin-top:.15rem;font-variant-numeric:tabular-nums}
+.ro .v small{font-size:.85rem;color:var(--muted)}
+
+h2{font-family:var(--display);font-weight:400;font-size:1.35rem;margin:1.8rem 0 .2rem}
+.sub2{color:var(--faint);font-family:var(--mono);font-size:.7rem;
+      letter-spacing:.1em;text-transform:uppercase;margin-bottom:.9rem}
+
+.call{border:1px solid var(--line);border-left:3px solid var(--warn);
+      background:linear-gradient(160deg,var(--panel),var(--ink-2));
+      border-radius:0 var(--radius) var(--radius) 0;padding:.9rem 1.1rem;margin:1.1rem 0}
+.call .lbl{font-family:var(--mono);font-size:.66rem;letter-spacing:.12em;
+           text-transform:uppercase;color:var(--warn);display:block;margin-bottom:.35rem}
+.call p{margin:0;color:var(--muted);font-size:.88rem}
+.call p+p{margin-top:.5rem}
+
+#log{margin:1rem 0;font-family:var(--mono);font-size:.76rem;color:var(--muted);
+     border:1px solid var(--line);border-radius:var(--radius);background:var(--ink-2);
+     padding:.8rem 1rem;max-height:11rem;overflow-y:auto}
+#log div{padding:.15rem 0;border-bottom:1px solid var(--line-soft)}
+#log div:last-child{border-bottom:0}
+#log .ok{color:var(--ok)} #log .bad{color:var(--bad)} #log .warn{color:var(--warn)}
+
+/* The agent's record: every change at the panel, whichever way it came. Same
+   surface as #log, taller, because this one is the history. */
+#activity{margin:1rem 0;font-family:var(--mono);font-size:.76rem;color:var(--muted);
+     border:1px solid var(--line);border-radius:var(--radius);background:var(--ink-2);
+     padding:.8rem 1rem;max-height:18rem;overflow-y:auto}
+/* Which way it came sits UNDER what happened, not beside it: three columns at
+   phone width left the description one word per line. */
+#activity div{display:grid;grid-template-columns:6.4rem 1fr;column-gap:.8rem;
+     padding:.3rem 0;border-bottom:1px solid var(--line-soft)}
+#activity div:last-child{border-bottom:0}
+#activity .t{grid-row:span 2;color:var(--faint)}
+#activity .w{color:var(--text)}
+#activity .h{color:var(--faint);font-size:.68rem}
+#activity .bad .w{color:var(--bad)}
+#activity .warn{color:var(--warn);display:block}
+
+footer{margin-top:2.4rem;padding:1.4rem 0 2.2rem;border-top:1px solid var(--line-soft);
+       color:var(--faint);font-family:var(--mono);font-size:.72rem}
+</style>
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <div class="mark"><b>poolhound</b><span> local · jandy pda-6</span></div>
+  <a class="back" href="/">← home</a>
+</div></header>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>Pool &amp; spa</h1>
+    <p class="lede">
+      Friendly names here, the panel's own labels underneath. Commands go by device
+      ID, so renaming on this page can never misdirect a circuit.
+    </p>
+  </div>
+
+  <div class="status-bar">
+    <span class="dot" id="conn"></span>
+    <span class="stamp" id="stamp">never read</span>
+    <button class="primary" id="refresh">Refresh</button>
+    <button class="danger" id="alloff">All off</button>
+    <button id="resync" title="Restart AqualinkD to re-read the panel">Resync</button>
+  </div>
+
+  <div class="readouts" id="readouts"></div>
+
+  <h2>Salt cell</h2>
+  <div class="sub2">aquapure swg</div>
+  <div class="readouts" id="swg"></div>
+
+  <h2>Setpoints</h2>
+  <div class="sub2">targets held by the panel</div>
+  <div class="readouts" id="setpoints"></div>
+
+  <h2>Circuits</h2>
+  <div class="sub2">tap to switch · verified against the panel</div>
+  <div class="grid" id="circuits"></div>
+
+  <div class="call">
+    <span class="lbl">If you script against this API yourself</span>
+    <p>
+      Switching is <code>PUT /api/&lt;id&gt;/set</code> with a form body
+      <code>value=0</code> or <code>value=1</code>. It is <strong>not</strong>
+      <code>GET /api/&lt;id&gt;/set/&lt;value&gt;</code>.
+    </p>
+    <p>
+      The path form is the trap: it answers <code>200</code> and looks like it
+      worked, but carries no value. The daemon parses nothing, compares the circuit
+      against itself, logs <code>not changing state, is same</code>, and never
+      presses. Every retry reaches the same conclusion, so it reads as a broken
+      panel or a daemon bug when the request was simply malformed.
+    </p>
+  </div>
+
+  <div class="call">
+    <span class="lbl">Two things that make a command look broken</span>
+    <p>
+      <strong>The filter pump gates most circuits.</strong> With the pump off, the
+      panel refuses aux circuits and the command reads as a failure when it is
+      actually an interlock. Turn the pump on first.
+    </p>
+    <p>
+      <strong>The spa switches off slowly.</strong> Valve actuator travel and heater
+      cooldown mean the state does not change immediately, so this page waits before
+      it judges the result.
+    </p>
+  </div>
+
+  <h2>Activity</h2>
+  <div class="sub2">every change at the panel · this page, the poolhound app, or the panel itself</div>
+  <div id="activity"><div>loading…</div></div>
+  <div class="sub2">this page, this visit · what was sent and what happened</div>
+  <div id="log"><div>ready</div></div>
+</div>
+
+<footer><div class="wrap">poolhound local · commands sent by device ID</div></footer>
+
+<script>
+(function () {
+  'use strict';
+
+  // Display names live HERE, in the browser — never in aqualinkd.conf, where the
+  // label doubles as the PDA menu lookup key and a rename misdirects the command.
+  var NAMES = {
+    Filter_Pump: { name: 'Filter Pump',   note: 'required for most circuits' },
+    Spa:         { name: 'Spa',           note: 'switches off slowly' },
+    Aux_1:       { name: 'Pool Light',    note: null },
+    Aux_2:       { name: 'Sheer Descent', note: 'water feature' },
+    Aux_3:       { name: 'Spa Light',     note: null },
+    Aux_4:       { name: 'Aux 4',         note: null },
+    Aux_5:       { name: 'Aux 5',         note: null },
+    Pool_Heater: { name: 'Pool Heat',     note: null },
+    Spa_Heater:  { name: 'Spa Heat',      note: null },
+    Extra_Aux:   { name: 'Solar Heat',    note: null }
+  };
+  var ORDER = ['Filter_Pump','Spa','Aux_1','Aux_2','Aux_3','Pool_Heater','Spa_Heater','Extra_Aux','Aux_4','Aux_5'];
+
+  // How long to wait before believing a switch worked. PDA commands take ~5s
+  // (the panel is driven into programming mode); the spa needs far longer.
+  var SETTLE = 14000, SETTLE_SLOW = 45000;
+  var SLOW = { Spa: 1, Spa_Heater: 1, Pool_Heater: 1 };
+
+  var API = '/poolapi/api';
+  var lastRead = 0, state = {}, busy = {}, st = {};
+
+  function log(msg, cls) {
+    var el = document.getElementById('log');
+    var d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) + '  ' + msg;
+    el.insertBefore(d, el.firstChild);
+    while (el.children.length > 40) el.removeChild(el.lastChild);
+  }
+
+  function fmtAge(ms) {
+    var s = Math.round(ms / 1000);
+    if (s < 60) return s + 's ago';
+    var m = Math.floor(s / 60);
+    return m + 'm ' + (s % 60) + 's ago';
+  }
+
+  function paintStamp() {
+    var el = document.getElementById('stamp');
+    if (!lastRead) { el.textContent = 'never read'; return; }
+    var age = Date.now() - lastRead;
+    el.innerHTML = 'panel read <b>' + fmtAge(age) + '</b>';
+    // Past a minute the reading is old enough that acting on it is a guess.
+    el.className = 'stamp' + (age > 60000 ? ' stale' : '');
+  }
+
+  function fetchJSON(url, opts) {
+    var ctl = new AbortController();
+    var t = setTimeout(function () { ctl.abort(); }, 20000);
+    return fetch(url, Object.assign({ cache: 'no-store', signal: ctl.signal }, opts || {}))
+      .then(function (r) { clearTimeout(t); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+  }
+
+  // Switching is PUT /api/<id>/set with a form-encoded value=0|1.
+  //
+  // NOT GET /api/<id>/set/<value>. That path form returns 200 and looks like it
+  // worked, but carries no value — so the daemon parses nothing, compares the
+  // device's current state against itself, logs "not changing state, is same",
+  // and never presses. It reads exactly like a daemon bug and is not one.
+  //
+  // Every command is preceded by a CLAIM, so poolhound's record can say the
+  // change came through this page rather than the wall panel. The agent watches
+  // the panel and attaches the newest claim from the last 60 s to the change it
+  // sees. A claim is a label, never a precondition: it is capped at 1.5 s and
+  // any failure (agent down, route missing) is swallowed, because a pool page
+  // that cannot switch the pump while poolhound is restarting is the wrong
+  // trade. The name must be in poolhound's commands.DOORS or it is refused.
+  function claim() {
+    var ctl = new AbortController();
+    var t = setTimeout(function () { ctl.abort(); }, 1500);
+    return fetch('/poolclaim', {
+      method: 'POST',
+      cache: 'no-store',
+      signal: ctl.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ door: 'pool.html' })
+    }).catch(function () { return null; })
+      .then(function () { clearTimeout(t); });
+  }
+
+  function command(path, value) {
+    return claim().then(function () { return send(path, value); });
+  }
+
+  function send(path, value) {
+    var ctl = new AbortController();
+    var t = setTimeout(function () { ctl.abort(); }, 30000);
+    return fetch(API + path, {
+      method: 'PUT',
+      cache: 'no-store',
+      signal: ctl.signal,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'value=' + encodeURIComponent(value)
+    }).then(function (r) {
+      clearTimeout(t);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();          // answers "Ok", not JSON
+    });
+  }
+
+  function read() {
+    document.getElementById('conn').className = 'dot busy';
+    // Both endpoints: /devices carries circuits and the salt cell, /status
+    // carries the freeze setpoint and panel identity, and neither is a superset
+    // of the other.
+    return Promise.all([
+      fetchJSON(API + '/devices'),
+      fetchJSON(API + '/status').catch(function () { return {}; })
+    ]).then(function (r) {
+      var d = r[0];
+      state = {};
+      (d.devices || []).forEach(function (x) { state[x.id] = x; });
+      st = r[1] || {};
+      lastRead = Date.now();
+      document.getElementById('conn').className = 'dot on';
+      paint();
+      return state;
+    }).catch(function (e) {
+      document.getElementById('conn').className = 'dot off';
+      log('could not reach the pool controller: ' + e.message, 'bad');
+      throw e;
+    });
+  }
+
+  function paint() {
+    paintStamp();
+
+    var ro = document.getElementById('readouts');
+    var items = [
+      ['air',  state['Temperature/Air'],  '°F'],
+      ['pool', state['Temperature/Pool'], '°F'],
+      ['spa',  state['Temperature/Spa'],  '°F'],
+      ['pump', state['Filter_Pump'],      ' RPM']
+    ];
+    ro.innerHTML = '';
+    items.forEach(function (it) {
+      var k = it[0], dev = it[1], unit = it[2], v = '—';
+      if (dev) {
+        if (k === 'pump') {
+          v = dev.Pump_RPM && dev.state === 'on' ? dev.Pump_RPM : '—';
+        } else {
+          // -999 is AqualinkD's "no reading" sentinel. Water temps read it
+          // whenever the pump is off, because the sensors sit in the plumbing
+          // and need flow — showing it as a temperature would be nonsense.
+          var raw = parseFloat(dev.value);
+          v = (!isNaN(raw) && raw > -100 && raw < 200) ? raw : '—';
+        }
+      }
+      var el = document.createElement('div');
+      el.className = 'ro';
+      el.innerHTML = '<div class="k">' + k + '</div><div class="v">' + v +
+                     (v !== '—' ? '<small>' + unit + '</small>' : '') + '</div>';
+      ro.appendChild(el);
+    });
+
+    paintSWG();
+    paintSetpoints();
+
+    var host = document.getElementById('circuits');
+    host.innerHTML = '';
+    ORDER.forEach(function (id) {
+      var dev = state[id];
+      if (!dev) return;
+      var meta = NAMES[id] || { name: dev.name };
+      var on = dev.state === 'on';
+
+      var tile = document.createElement('div');
+      tile.className = 'tile';
+
+      var left = document.createElement('div');
+      left.innerHTML = '<div class="nm"><span class="dot ' + (busy[id] ? 'busy' : (on ? 'on' : 'off')) + '"></span>' +
+                       meta.name + '</div>' +
+                       '<div class="sub">' + dev.name + (meta.note ? ' · ' + meta.note : '') + '</div>';
+
+      var b = document.createElement('button');
+      b.className = 'tgl';
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.setAttribute('aria-label', meta.name + ', currently ' + (on ? 'on' : 'off'));
+      if (busy[id]) b.setAttribute('data-busy', '1');
+      b.disabled = !!busy[id];
+      b.addEventListener('click', function () { toggle(id, !on); });
+
+      tile.appendChild(left);
+      tile.appendChild(b);
+      host.appendChild(tile);
+    });
+  }
+
+  function cell(host, k, v, unit, why) {
+    var el = document.createElement('div');
+    var empty = (v === null || v === undefined || v === '' || v === '—');
+    el.className = 'ro' + (empty ? ' empty' : '');
+    el.innerHTML = '<div class="k">' + k + '</div><div class="v">' + (empty ? '—' : v) +
+                   (!empty && unit ? '<small>' + unit + '</small>' : '') + '</div>' +
+                   (why ? '<div class="why">' + why + '</div>' : '');
+    host.appendChild(el);
+  }
+
+  // The SWG devices DISAPPEAR from the payload entirely when the cell is not
+  // reporting — they are absent, not zero — because the salt cell needs water
+  // moving through it. Saying so is more useful than rendering a blank.
+  function paintSWG() {
+    var host = document.getElementById('swg');
+    host.innerHTML = '';
+    var pct = state['SWG/Percent'], ppm = state['SWG/PPM'], boost = state['SWG/Boost'];
+    var pumpOff = !state['Filter_Pump'] || state['Filter_Pump'].state !== 'on';
+    var why = pumpOff ? 'needs the filter pump running' : 'cell not reporting';
+
+    cell(host, 'output', pct && pct.value !== undefined ? pct.value : null, '%', pct ? null : why);
+    cell(host, 'salt',   ppm && ppm.value !== undefined ? ppm.value : null, ' ppm', ppm ? null : why);
+    cell(host, 'boost',  boost ? (boost.state === 'on' ? 'on' : 'off') : null, '', boost ? null : why);
+  }
+
+  function paintSetpoints() {
+    var host = document.getElementById('setpoints');
+    host.innerHTML = '';
+    // Heater targets ride on the heater device as spvalue, not as a separate
+    // entity, and survive even when the water sensors read -999.
+    var ph = state['Pool_Heater'], sh = state['Spa_Heater'];
+    cell(host, 'pool heat', ph && ph.spvalue ? ph.spvalue : null, '°F');
+    cell(host, 'spa heat',  sh && sh.spvalue ? sh.spvalue : null, '°F');
+    cell(host, 'freeze',    st.frz_protect_set_pnt || null, '°F');
+  }
+
+  // No ALL OFF api exists — the string in the daemon is the menu landmark it
+  // navigates to, not a command. So this walks the circuits that are actually on
+  // and switches them off one at a time, slowly, because each PDA command drives
+  // the panel into programming mode and they must not overlap.
+  function allOff() {
+    var on = ORDER.filter(function (id) { return state[id] && state[id].state === 'on'; });
+    if (!on.length) { log('nothing is on', 'ok'); return; }
+    // Pump last: it gates the others, so switching it off first can leave the
+    // rest stranded on with no way to command them.
+    on.sort(function (a, b) { return (a === 'Filter_Pump') - (b === 'Filter_Pump'); });
+
+    var names = on.map(function (id) { return (NAMES[id] || {}).name || id; });
+    if (!window.confirm('Switch off ' + on.length + ' circuit(s)?\n\n' + names.join('\n') +
+                        '\n\nThis takes about ' + Math.round(on.length * 20) + 's.')) return;
+
+    document.getElementById('alloff').disabled = true;
+    log('all off: ' + names.join(', '));
+
+    var seq = Promise.resolve();
+    on.forEach(function (id) {
+      seq = seq.then(function () {
+        var nm = (NAMES[id] || {}).name || id;
+        log('  → ' + nm + ' off');
+        // Wake first, same as toggle(): the first command after a sleep is lost
+        // while the panel is still coming up.
+        return fetchJSON(API + '/status').catch(function () { return null; })
+          .then(function () { return new Promise(function (r) { setTimeout(r, 5000); }); })
+          .then(function () { return command('/' + id + '/set', 0); })
+          .catch(function () { return null; })
+          .then(function () { return new Promise(function (r) { setTimeout(r, 15000); }); });
+      });
+    });
+    seq.then(function () { return new Promise(function (r) { setTimeout(r, 20000); }); })
+      .then(read)
+      .then(function () {
+        var still = ORDER.filter(function (id) { return state[id] && state[id].state === 'on'; });
+        if (!still.length) log('everything is off', 'ok');
+        else log('still on: ' + still.map(function (id) { return (NAMES[id]||{}).name||id; }).join(', ') +
+                 ' — likely the "is same" bug; use the panel', 'bad');
+        document.getElementById('alloff').disabled = false;
+      })
+      .catch(function () { document.getElementById('alloff').disabled = false; });
+  }
+
+  function toggle(id, want) {
+    if (busy[id]) return;
+    var meta = NAMES[id] || { name: id };
+    var wait = SLOW[id] ? SETTLE_SLOW : SETTLE;
+
+    busy[id] = true; paint();
+    log('sending ' + meta.name + ' → ' + (want ? 'on' : 'off') + '…');
+
+    // With pda_sleep_mode the panel is asleep between polls, and the FIRST
+    // command after a sleep routinely fails while it is still waking — the
+    // daemon logs "didn't find a requested menu 19, current 3" and does nothing.
+    // The second attempt lands. So a read is issued first to wake the panel, and
+    // the command is retried rather than reported as a failure the user has to
+    // interpret. Measured: attempt 1 failed, attempt 2 switched the circuit.
+    var ATTEMPTS = 3;
+
+    function attempt(n) {
+      return fetchJSON(API + '/status')                       // wake it
+        .catch(function () { return null; })
+        .then(function () { return new Promise(function (r) { setTimeout(r, 5000); }); })
+        .then(function () { return command('/' + id + '/set', want ? 1 : 0); })
+        .catch(function () { return null; })
+        .then(function () { return new Promise(function (r) { setTimeout(r, wait); }); })
+        .then(read)
+        .then(function () {
+          var now = state[id] && state[id].state === 'on';
+          if (now === want) return true;
+          if (n < ATTEMPTS) {
+            log('  attempt ' + n + ' did not take (panel waking) — retrying', 'warn');
+            return attempt(n + 1);
+          }
+          return false;
+        });
+    }
+
+    attempt(1)
+      .then(function (ok) {
+        busy[id] = false;
+        loadActivity();
+        if (ok) {
+          log(meta.name + ' is now ' + (want ? 'on' : 'off'), 'ok');
+        } else if (id !== 'Filter_Pump' && state['Filter_Pump'] && state['Filter_Pump'].state !== 'on') {
+          // Name the most common real cause instead of just reporting failure.
+          log(meta.name + ' did not change — the filter pump is off, and the panel ' +
+              'requires it for most circuits', 'warn');
+        } else {
+          log(meta.name + ' did not change after ' + ATTEMPTS + ' attempts', 'bad');
+        }
+        paint();
+      })
+      .catch(function () { busy[id] = false; paint(); });
+  }
+
+  // Live feed, same source the AqualinkD portal uses.
+  //
+  // Polling every 30s meant this page and that one could show different states
+  // for up to half a minute — they were never actually disagreeing about the
+  // pool, this one was just behind. AqualinkD pushes over a websocket on the
+  // same port, and Caddy passes the upgrade through /poolapi (verified: 101),
+  // so subscribing keeps both views identical.
+  //
+  // The 30s poll stays as a fallback: if the socket drops, the page degrades to
+  // its old behaviour rather than silently freezing on stale data.
+  var ws = null, wsAlive = false;
+
+  function connectWS() {
+    if (ws) { try { ws.close(); } catch (e) {} }
+    var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/poolapi/';
+    try { ws = new WebSocket(url); } catch (e) { wsAlive = false; return; }
+
+    ws.onopen = function () {
+      wsAlive = true;
+      log('live feed connected', 'ok');
+      document.getElementById('conn').className = 'dot on';
+    };
+
+    ws.onmessage = function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+
+      if (m.type === 'devices' && m.devices) {
+        m.devices.forEach(function (x) { state[x.id] = x; });
+        lastRead = Date.now();
+        paint();
+      } else if (m.type === 'status') {
+        st = m;
+        // The status frame carries an leds map, which is the same truth the
+        // AqualinkD portal renders from — apply it so both agree instantly.
+        if (m.leds) {
+          Object.keys(m.leds).forEach(function (k) {
+            if (state[k]) state[k].state = (m.leds[k] === 'enabled') ? 'on' : m.leds[k];
+          });
+        }
+        lastRead = Date.now();
+        paint();
+      }
+    };
+
+    ws.onclose = function () {
+      if (wsAlive) log('live feed dropped — falling back to polling', 'warn');
+      wsAlive = false;
+      setTimeout(connectWS, 8000);
+    };
+    ws.onerror = function () { wsAlive = false; };
+  }
+
+  connectWS();
+
+  // THE RECORD, FROM POOLHOUND'S AGENT. #log below is this tab's memory: what
+  // this page sent, gone on reload, and blind to the poolhound app. The agent
+  // sees every change arrive at the panel and every command it runs for the
+  // app, and keeps the last 200 in /run, so this list is the same on every
+  // phone and survives a reload. It says which way a change came, never who.
+  //
+  // The failure is said, not hidden. When the agent is not answering nothing
+  // is being recorded anywhere -- the panel keeps no log of its own -- and an
+  // empty list would read as a quiet pool. That is exactly how 5 October went
+  // unrecorded: the agent was down for three days and nothing said so here.
+  var HOW = { 'poolhound app': 'poolhound app', 'door:pool.html': 'this page',
+              'panel or AqualinkD': 'panel / AqualinkD' };
+
+  function fmtWhen(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return iso;
+    var today = new Date().toDateString() === d.toDateString();
+    return (today ? '' : d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' ') +
+           d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function row(cls, t, w, h) {
+    var d = document.createElement('div');
+    if (cls) d.className = cls;
+    [['t', t], ['w', w], ['h', h]].forEach(function (p) {
+      var s = document.createElement('span');
+      s.className = p[0]; s.textContent = p[1];
+      d.appendChild(s);
+    });
+    return d;
+  }
+
+  function loadActivity() {
+    var el = document.getElementById('activity');
+    return fetchJSON('/poolactivity').then(function (j) {
+      var ev = j.events || [];
+      el.textContent = '';
+      if (!ev.length) {
+        var e = document.createElement('div');
+        e.textContent = 'nothing recorded yet \u2014 the list starts empty whenever the Pi reboots';
+        el.appendChild(e);
+        return;
+      }
+      ev.forEach(function (x) {
+        el.appendChild(row(x.ok === false ? 'bad' : '', fmtWhen(x.at), x.what,
+                           HOW[x.how] || x.how));
+      });
+    }).catch(function () {
+      el.textContent = '';
+      var w = document.createElement('span');
+      w.className = 'warn';
+      w.textContent = 'poolhound\u2019s agent is not answering \u2014 changes at the panel ' +
+                      'are not being recorded until it is back';
+      el.appendChild(w);
+    });
+  }
+
+  loadActivity();
+  setInterval(loadActivity, 20000);
+
+  // Resync. AqualinkD's model drifts from the panel — seen reporting lights ON
+  // while the panel screen and the lights themselves read OFF — and the periodic
+  // EQUIPMENT re-read does not always correct it. A restart does, every time.
+  // This is here so a wrong dashboard can be fixed from a phone rather than an
+  // ssh session. It costs ~100s of no data while the daemon re-walks the menus.
+  document.getElementById('resync').addEventListener('click', function () {
+    if (!window.confirm('Restart AqualinkD to re-read the panel?\n\n' +
+                        'Use this when the page disagrees with the actual pool.\n' +
+                        'Takes about 100 seconds, during which there is no data.')) return;
+    var b = this;
+    b.disabled = true;
+    log('resyncing — restarting AqualinkD…', 'warn');
+    fetch('/resync', { method: 'POST', cache: 'no-store' })
+      .then(function (r) { return r.json().then(function (j) { return { s: r.status, j: j }; }); })
+      .then(function (r) {
+        if (r.s === 429) { log('too soon — wait ' + r.j.retry_after + 's', 'warn'); b.disabled = false; return; }
+        if (r.s !== 200) { log('resync failed: ' + (r.j.error || r.s), 'bad'); b.disabled = false; return; }
+        log('restarted — waiting ' + r.j.ready_in + 's for the panel walk', 'warn');
+        // Poll back to life rather than guessing when it is ready.
+        var tries = 0;
+        var iv = setInterval(function () {
+          tries++;
+          read().then(function () {
+            clearInterval(iv); b.disabled = false;
+            log('resynced — state re-read from the panel', 'ok');
+            connectWS();
+          }).catch(function () {
+            if (tries > 20) { clearInterval(iv); b.disabled = false; log('resync: still no answer', 'bad'); }
+          });
+        }, 10000);
+      })
+      .catch(function (e) { log('resync failed: ' + e.message, 'bad'); b.disabled = false; });
+  });
+
+  document.getElementById('alloff').addEventListener('click', allOff);
+
+  document.getElementById('refresh').addEventListener('click', function () {
+    log('refreshing…');
+    read().then(function () { log('panel state re-read', 'ok'); }).catch(function () {});
+  });
+
+  read().catch(function () {});
+  // Backup poll only: skip it while the socket is healthy or a command is
+  // mid-flight, so it never fights the live feed or a verification read.
+  setInterval(function () {
+    if (wsAlive) return;
+    if (Object.keys(busy).some(function (k) { return busy[k]; })) return;
+    read().catch(function () {});
+  }, 15000);
+  setInterval(paintStamp, 1000);
+})();
+</script>
+</body>
+</html>

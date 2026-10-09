@@ -1,0 +1,50 @@
+# Sign-in delegated to an identity provider through oauth2-proxy.
+#
+# For an install that ALREADY has one. It needs a second container reachable as
+# oauth2-proxy:4180, a registered application at the provider, and a host to
+# send an unauthenticated browser to. If none of that is already running, use
+# auth-password.caddy instead — it is the default for a reason.
+(poolhound_auth) {
+	forward_auth oauth2-proxy:4180 {
+		uri /oauth2/auth
+		# oauth2-proxy must run with --set-xauthrequest=true or its auth
+		# response carries no X-Auth-Request-* headers and this copy silently
+		# yields nothing — which presents as a signed-in user being treated as
+		# anonymous.
+		copy_headers X-Auth-Request-Email>X-MS-CLIENT-PRINCIPAL-NAME X-Auth-Request-User
+
+		@unauth status 401
+		handle_response @unauth {
+			redir * https://{$POOLHOUND_OAUTH2_HOST}/oauth2/start?rd={scheme}%3A%2F%2F{host}{uri}
+		}
+	}
+}
+
+# IDENTITY WITHOUT REQUIRING IT, for the two paths that need to know who you
+# are without turning anybody away: "/" and /api/health. Both builds call
+# /api/health, so it can be neither public nor gated.
+#
+# Ask oauth2-proxy, pass the identity through when there is a session, and on
+# 401 proxy the request ANYWAY, anonymously — the caller gets a truthful answer
+# either way and poolhound decides what to disclose to whom.
+#
+# THIS IS A SNIPPET BECAUSE THE TWO MECHANISMS CARRY IDENTITY DIFFERENTLY, and
+# a version that assumed one broke the other. The vhost briefly did this with
+# `@offered header Authorization *` — right for basic_auth, where credentials
+# ARE that header, and wrong here, where the browser holds a session COOKIE and
+# sends no Authorization at all. Every signed-in reader's /api/health then took
+# the anonymous branch: the page reported "signed in — view only" to the owner
+# and "no agent is connected" beside a pool that was pushing samples, because
+# role and agents are both in the half of the body withheld from anonymous.
+(poolhound_identity) {
+	forward_auth oauth2-proxy:4180 {
+		uri /oauth2/auth
+		copy_headers X-Auth-Request-Email>X-MS-CLIENT-PRINCIPAL-NAME X-Auth-Request-User
+
+		@anon status 401
+		handle_response @anon {
+			reverse_proxy poolhound:8787
+		}
+	}
+	reverse_proxy poolhound:8787
+}

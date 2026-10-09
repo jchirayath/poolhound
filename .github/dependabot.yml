@@ -1,0 +1,55 @@
+# Who raises the pins, now that there are pins to raise.
+#
+# WHY THIS FILE EXISTS
+#
+# `deploy/requirements.txt` is nine exact versions, three of them transitives
+# pinned because a transitive is a thing nobody can answer for otherwise. That
+# pinning is the whole reason "what did we ship" is now a question with an
+# answer — and it is also the reason nothing moves on its own. A pin is a
+# decision to stay where you are until somebody decides otherwise, and before
+# this file the somebody did not exist.
+#
+# The two packages that matter most are the ones this project has already
+# written down: `cryptography` encrypts the credential vault and was a
+# transitive of a transitive, whatever PyPI served that morning; `pillow` and
+# `pillow-heif` decode bytes posted by an ANONYMOUS caller at /api/photo and
+# are the most exposed thing in the image.
+#
+# supply-chain.yml asks "is what we have pinned vulnerable", daily. This
+# answers "here is the version that fixes it", as a pull request that the
+# gates then run. The two halves are not interchangeable: a scan that fails
+# every morning with nobody raising the pin is a broken gate people learn to
+# ignore.
+version: 2
+updates:
+  # The shipped image. deploy/requirements.txt is the file osv-scanner reads
+  # and the file the Dockerfile installs, so it is the one that matters; the
+  # directory is "/" because that is where the ecosystem's manifest convention
+  # puts the search root, and `directories` below names the real location.
+  - package-ecosystem: pip
+    directories:
+      - "/deploy"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # GROUPED, deliberately. Nine pins, three of them transitives of the other
+    # six: raised one at a time they produce pull requests that cannot be
+    # merged independently, because a transitive bump that its parent has not
+    # caught up with is a version conflict rather than an upgrade.
+    groups:
+      runtime:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+
+  # The workflows' own actions, which are pinned to commit SHAs — see the
+  # argument in gates.yml. A SHA pin is only as good as the thing that moves
+  # it, and nothing in this repository can move it by hand without looking up
+  # a commit, which is exactly the friction that leaves a pin stale for years.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "actions"

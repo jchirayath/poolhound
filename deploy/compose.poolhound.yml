@@ -1,0 +1,91 @@
+# The poolhound service, to be merged into the server's compose.yml.
+#
+# Kept here as its own file so the repo carries the whole deployment and a
+# rebuild is a copy rather than a reconstruction from memory.
+#
+#   POOLHOUND_BIND=0.0.0.0 is safe ONLY because the port is `expose`d and never
+#   `ports:`-published. Those two lines have to be read together; publishing the
+#   port would put an unauthenticated control API on the internet, since Entra
+#   is enforced by Caddy and not by the app.
+  poolhound:
+    build:
+      context: $STACK/poolhound/src
+      dockerfile: deploy/Dockerfile
+      args:
+        # Set by bootstrap-server.sh at build time; see the Dockerfile.
+        REVISION: "${REVISION:-unknown}"
+    image: poolhound:local
+    restart: unless-stopped
+    environment:
+      POOLHOUND_BIND: "0.0.0.0"
+      POOLHOUND_PORT: "8787"
+      POOLHOUND_PUBLIC_HOST: "${PUBLIC_HOSTS:?set it in server.env}"
+      POOLHOUND_DATA: "/data"
+      POOLHOUND_SITE: "/site"
+      # Secrets are NOT here. The container reads them from Key Vault at the
+      # moment it needs them, using the VM's managed identity — so there is no
+      # credential in this file, in the image, or in `docker inspect`.
+      POOLHOUND_KEYVAULT: "${POOLHOUND_KEYVAULT:?set it in server.env}"
+      # The shared secret that proves a request reached this container through
+      # Caddy rather than straight off the docker bridge. Empty is allowed and
+      # means the check is OFF — /api/health then reports the boundary as
+      # unproven, because an upgrade that started refusing every identity
+      # header would lock the owner out of their own pool. Generate one with
+      # `openssl rand -hex 32` and put it in the env file that feeds BOTH this
+      # service and caddy.
+      POOLHOUND_PROXY_SECRET: "${POOLHOUND_PROXY_SECRET:-}"
+      # Inside the container this is the bind above: the host's local disk,
+      # which is the one place guaranteed to fail separately from the share.
+      POOLHOUND_BACKUP_DIR: "/backups"
+      # AND THE ONE FAILURE THE LOCAL DISK DOES NOT COVER: losing the VM.
+      #
+      # A SECOND destination rather than a different one, so the fast local
+      # copy keeps its RPO and this is the one that survives the host. It is a
+      # directory on purpose — a blobfuse mount, an SMB mount of another
+      # machine, a second Azure Files share — so there is no protocol here and
+      # nothing holding a credential of its own.
+      #
+      # bin/backup refuses a destination on the same FILESYSTEM as either the
+      # history or the local backups, by st_dev rather than by name, because a
+      # second directory on the same disk is this defect wearing the fix's
+      # clothes and would look like it worked. Unset is the honest state and
+      # `bootstrap-server.sh --check` says so every run.
+      POOLHOUND_BACKUP_OFFBOX: "${POOLHOUND_BACKUP_OFFBOX:-}"
+      # A durable home for the encrypted credential store. Without this it
+      # defaulted to ~/.poolhound INSIDE the container: any service Key Vault
+      # does not already answer for -- SMTP is the realistic one, since the KV
+      # names are poolhound-<service>-user/password -- was saved to a layer that
+      # --force-recreate deletes, while the badge said "stored" and audit.csv
+      # said "set". A dedicated named volume, NOT the CIFS share: that is
+      # mounted file_mode=0660, which is the wrong permissions for a secret.
+      POOLHOUND_VAULT: "/vault"
+      # THIS DEPLOYMENT ALREADY HAS A POOL HISTORY. /data is a bind mount of
+      # the Azure Files share; if that share is not mounted, /data is an empty
+      # directory on local disk and indistinguishable from a first install by
+      # content alone. This says which it is, so an unmounted share stops the
+      # container with the cause named instead of quietly starting a second
+      # history beside the real one. A first install does not set it.
+      POOLHOUND_REQUIRE_DATA: "1"
+      TZ: "America/Los_Angeles"
+    volumes:
+      # The Azure Files share. The container and the VM are disposable; this is
+      # the only thing in the deployment that is not.
+      - /mnt/poolhound:/data
+      # THE BACKUP DESTINATION, on the HOST's disk and not on the share.
+      # A bind rather than a named volume so an operator can find the tarballs
+      # with ls, and so `docker compose down -v` cannot take the only copy of
+      # the history with it. bootstrap-server.sh creates it 1010:1010.
+      - /var/lib/poolhound/backups:/backups
+      # The rendered site is a cache of what is in /data, so it is a plain
+      # named volume — losing it costs one `bin/render`.
+      - poolhound_site:/site
+      # Survives a container rebuild; deliberately not on the share.
+      - poolhound_vault:/vault
+    expose:
+      - "8787"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 256
+    logging: *logging

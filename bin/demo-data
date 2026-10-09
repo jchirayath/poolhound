@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Generate a synthetic pool, for screenshots and for trying the product out.
+
+WHY THIS EXISTS
+
+README says the screenshots come from "a synthetic demo pool" and that no real
+household data is in them. That promise was kept by hand: somebody built a
+dataset once, took five pictures, and did not keep the generator. So retaking
+them was a from-scratch job every time -- which is exactly why they went stale,
+sat five features behind the product, and ended up carrying a note telling the
+reader to trust the text over the pictures.
+
+A generator makes the pictures reproducible. It also gives anyone who clones
+this repository something to look at before they own a pool controller.
+
+NOT A FIXTURE FOR TESTS. bin/selftest builds its own data inline, because a
+test that reads a file somebody can regenerate is a test that changes meaning
+without anybody editing it.
+
+  bin/demo-data /tmp/demo          # writes /tmp/demo/data/*.csv and a config
+  POOLHOUND_DATA=/tmp/demo/data POOLHOUND_SITE=/tmp/demo/site \
+    POOLHOUND_CONFIG=/tmp/demo/config.toml bin/render
+
+The numbers are a plausible salt pool, not this one: 18,400 gal, alkalinity in
+the 70s where a salt pool belongs, free chlorine drifting with the cell output,
+and two labs that disagree slightly -- because the product's whole argument is
+that disagreement is data, and a demo where both labs agree hides the feature.
+"""
+import csv, datetime as dt, math, os, random, sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import aqualink, chemicals as CH
+
+R = random.Random(20260914)          # fixed: the same pool every run
+DAYS = 45
+
+# THE DEMO CLOCK IS PINNED, AND IT HAS TO BE PINNED TO THE PAST.
+#
+# This was `now().replace(hour=14, minute=12)`, which is 14:12 TODAY whatever
+# time it actually is. Run it before mid-afternoon and the newest reading is
+# AHEAD of the clock that reads it -- so the product says so, correctly and in
+# red, and `bin/screenshots` wrote "Pool controller has 25 reading(s) dated in
+# the future -- a clock is wrong somewhere" onto the landing page's Home card.
+# The same command at 15:00 produced "13 hours ago" and looked fine. A picture
+# whose content depends on the hour it was taken is the time-of-day shape of
+# the timezone defect CLAUDE.md already has a paragraph about: the machine was
+# the assumption.
+#
+# 14:12 is kept, because mid-afternoon with the pump block finished is what the
+# Power and Trend panels are there to show. It is the most recent 14:12 that
+# has PASSED, so the newest reading is between 0 and 24 hours old and never in
+# front of anybody's clock.
+_PIN = dt.datetime.now().replace(hour=14, minute=12, second=0, microsecond=0)
+NOW = _PIN if _PIN <= dt.datetime.now() else _PIN - dt.timedelta(days=1)
+
+
+def w(path, cols, rows):
+    with open(path, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        wr.writeheader()
+        for r in rows:
+            wr.writerow({c: r.get(c, "") for c in cols})
+    print(f"  {os.path.basename(path):18} {len(rows):5} rows")
+
+
+def iso(t):
+    return t.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def samples():
+    """Fifteen-minute controller samples. The pump runs one block a day."""
+    out = []
+    for d in range(DAYS, -1, -1):
+        day = NOW - dt.timedelta(days=d)
+        hours = 6.5 + R.uniform(-0.4, 0.4)
+        start = 8.0
+        for q in range(96):
+            t = day.replace(hour=0, minute=0) + dt.timedelta(minutes=15 * q)
+            if t > NOW:
+                break
+            h = q / 4.0
+            pump = start <= h < start + hours
+            spa = pump and 18.0 <= h < 18.75 and d % 9 == 0
+            # Water warms through the afternoon and cools overnight.
+            temp = 79 + 5 * math.sin((h - 9) / 24 * 2 * math.pi) - d * 0.08
+            air = 72 + 14 * math.sin((h - 9) / 24 * 2 * math.pi)
+            row = dict.fromkeys(aqualink.COLS, "")
+            row.update(
+                ts=iso(t),
+                pump="1" if pump else "0",
+                pump_rpm="2750" if pump else "",
+                pump_watts=f"{R.uniform(880, 910):.0f}" if pump else "",
+                swg_pct="45",
+                # The cell only reports salt while water is moving; the collector
+                # drops the stale repeat, so an off hour carries nothing.
+                salt_ppm=f"{R.uniform(3280, 3360):.0f}" if pump else "",
+                pool_temp=f"{temp:.1f}" if pump else "",
+                air_temp=f"{air:.1f}",
+                spa_temp=f"{temp + 21:.1f}" if spa else "",
+                spa="1" if spa else "0",
+                sheer="1" if pump and h > 12 else "0",
+                pool_light="1" if 19.5 <= h < 22 else "0",
+                spa_light="1" if spa else "0",
+                pool_heat="0",
+                spa_heat="1" if spa else "0",
+                solar_valve="1" if pump and 11 <= h < 16 else "0",
+                freeze="0",
+                pool_set="88.0", spa_set="102.0", freeze_set="36.0")
+            out.append(row)
+    return out
+
+
+def readings():
+    """The pod: free chlorine and pH, daily."""
+    out = []
+    for d in range(DAYS, -1, -1):
+        t = (NOW - dt.timedelta(days=d)).replace(hour=9, minute=40)
+        fc = 2.4 + 0.9 * math.sin(d / 7.0) + R.uniform(-0.25, 0.25)
+        ph = 7.52 + 0.10 * math.sin(d / 5.0) + R.uniform(-0.03, 0.03)
+        out.append({"fetched": iso(t + dt.timedelta(minutes=5)), "measured": iso(t),
+                    "free_cl": f"{max(0.2, fc):.1f}", "ph": f"{ph:.2f}",
+                    "water_temp": f"{82 - d * 0.08:.1f}", "skimmer_flow": "ok",
+                    "status": "ok",
+                    "alerts": "Total Alkalinity measurement outdated" if d < 3 else ""})
+    return out
+
+
+def lab_rows():
+    """WaterGuru's mail-in lab, monthly."""
+    out = []
+    for d in (38, 9):
+        t = (NOW - dt.timedelta(days=d)).replace(hour=11, minute=0)
+        out.append({"measured": iso(t), "fetched": iso(t + dt.timedelta(days=2)),
+                    "ta": "74" if d == 9 else "88", "ch": "310", "cya": "62",
+                    "salt": "3320", "phosphates": "180", "copper": "0.1",
+                    "iron": "0.0", "saturation_index": "-0.18"})
+    return out
+
+
+def leslies_rows(cols):
+    """The carried-in bench photometer. Deliberately a little different: two
+    labs disagreeing is data, and a demo where they agree hides that."""
+    out = []
+    for d in (30, 4):
+        t = (NOW - dt.timedelta(days=d)).replace(hour=16, minute=20)
+        r = {c: "" for c in cols}
+        r.update(measured=iso(t), fetched=iso(t), score="92",
+                 free_cl="2.8", total_cl="3.0", ph="7.6",
+                 ta="81" if d == 4 else "90", ch="288", cya="58",
+                 iron="0.0", copper="0.1", phosphates="150", salt="3260",
+                 tds="4100", total_hardness="300", borate="0",
+                 saturation_index="-0.11")
+        out.append(r)
+    return out
+
+
+def chem_rows():
+    out = []
+    for d, (what, amt, unit, pct) in ((26, ("acid", 32, "floz", 31.45)),
+                                      (17, ("calcium", 8, "lb", 77)),
+                                      (6,  ("acid", 24, "floz", 31.45))):
+        t = (NOW - dt.timedelta(days=d)).replace(hour=17, minute=5)
+        out.append({"ts": iso(t), "chemical": what, "amount": f"{amt:g}",
+                    "unit": unit, "pct": f"{pct:g}", "note": "", "by": "demo"})
+    return out
+
+
+def manual_rows(cols):
+    t = (NOW - dt.timedelta(days=2)).replace(hour=8, minute=30)
+    r = {c: "" for c in cols}
+    r.update(measured=iso(t), recorded=iso(t), by="demo", source="Test kit",
+             ph="7.5", free_cl="2.6", ta="76", ch="300", cya="60",
+             note="drop kit, morning")
+    return [r]
+
+
+def run_rows():
+    """The collection log: every attempt to fetch, and what came of it.
+
+    THE DEMO POOL HAD READINGS AND NO RECORD OF COLLECTING THEM. Nothing wrote
+    runs.csv, so the Collection tab -- whose whole subject is "every attempt
+    and what came of it" -- rendered six sources as "Never Run / Nothing
+    recorded yet", with a banner saying six needed attention. That was an
+    accurate picture of the synthetic data and a useless picture of the tab,
+    which is what a card on the landing page is for.
+
+    The cadences are the real ones, from collection.TOOLS and the crontab the
+    cards quote: the two labs daily, the watchdog every half hour, the render
+    every six, the backup nightly. Three days of it, which is more than the
+    tab shows and enough that "every 30 minutes" looks like every 30 minutes.
+
+    NOT ALL GREEN, because a wall of green says as little as a wall of skips.
+    The page's own argument is that a skip is not a success and a failure is
+    not an outage, so the log carries one of each: a leslies run that drew the
+    vendor's 500, and a render that skipped because the previous one was still
+    going. Both are states this tab was written to tell apart, and a picture
+    that cannot show them is a picture of the easy case.
+
+    THE REAL CLOCK, NOT THE PINNED ONE, and that is deliberate rather than a
+    shortcut. `NOW` is the demo POOL's timeline -- synthetic history, pinned to
+    a finished pump block. This is a record of what the collectors on THIS
+    machine did, and on a live deployment the watchdog ran half an hour ago
+    whatever the readings say. Stamping it from `NOW` made the watchdog and the
+    render read "Late" in the morning and "Working" after lunch, from the same
+    command, which is the defect this file's clock comment is about wearing a
+    different hat.
+    """
+    out = []
+    ran = dt.datetime.now().replace(second=0, microsecond=0)
+
+    def row(t, tool, outcome, **kw):
+        r = {"at": iso(t), "tool": tool, "outcome": outcome, "detail": "",
+             "alerts": "0", "sent": "0", "undelivered": "0", "by": "cron"}
+        r.update({k: str(v) for k, v in kw.items()})
+        out.append(r)
+
+    for d in range(3, -1, -1):
+        day = ran - dt.timedelta(days=d)
+        # The watchdog, every half hour, quiet when the answer is yes.
+        for q in range(48):
+            t = day.replace(hour=0, minute=0) + dt.timedelta(minutes=30 * q)
+            if t > ran:
+                break
+            row(t, "watch", "ok", seconds=f"{R.uniform(0.6, 1.4):.1f}")
+        # The safety-net render, every six hours.
+        for h in (0, 6, 12, 18):
+            t = day.replace(hour=h, minute=5)
+            if t > ran:
+                break
+            # ONE SKIP, and it keeps its own word: the ordinary skip means the
+            # previous run has not finished, which is not a failure.
+            skip = d == 1 and h == 12
+            row(t, "render", "skipped" if skip else "ok",
+                seconds="" if skip else f"{R.uniform(2.1, 3.4):.1f}",
+                detail="a render was already running" if skip else "")
+        # The two labs, once a day, and one of them had a bad afternoon.
+        t = day.replace(hour=16, minute=2)
+        if t <= ran:
+            row(t, "wg-collect", "ok", seconds=f"{R.uniform(3.0, 5.5):.1f}",
+                added=1 if d else 0)
+        t = day.replace(hour=16, minute=20)
+        if t <= ran:
+            bad = d == 2
+            row(t, "leslies", "failed" if bad else "ok",
+                seconds=f"{R.uniform(4.0, 7.0):.1f}",
+                added="" if bad else (1 if d == 3 else 0),
+                detail="500 from WaterTest-Home; retried next run" if bad
+                       else "")
+        # The backup, nightly, off the share.
+        t = day.replace(hour=2, minute=40)
+        if t <= ran:
+            row(t, "backup", "ok", seconds=f"{R.uniform(1.2, 2.0):.1f}",
+                detail="poolhound-%s.tgz" % day.strftime("%Y%m%d"))
+    # AND ONE ALARM THAT WAS ACTUALLY SENT, so the "Alerts, and whether they
+    # were delivered" panel has something to be about. Undelivered stays 0:
+    # an alarm recorded as sent that was not is the defect that panel exists
+    # to catch, and a demo must not assert it happened.
+    for r in out:
+        if r["tool"] == "watch" and r["at"] == iso(
+                (ran - dt.timedelta(days=2)).replace(hour=7, minute=30)):
+            r.update(alerts="1", sent="1",
+                     detail="free chlorine 2.1 ppm, under 3.0")
+    out.sort(key=lambda r: r["at"])
+    return out
+
+
+def main():
+    root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "demo")
+    data = os.path.join(root, "data")
+    os.makedirs(data, exist_ok=True)
+    os.makedirs(os.path.join(root, "site"), exist_ok=True)
+
+    from poolhound import server as S
+    LES = ["measured", "fetched", "score", "free_cl", "total_cl", "ph", "ta",
+           "ch", "cya", "iron", "copper", "phosphates", "salt", "tds",
+           "total_hardness", "borate", "saturation_index", "sanitizer",
+           "pool_type", "surface", "note"]
+
+    print(f"  writing a synthetic pool into {data}")
+    w(os.path.join(data, "samples.csv"), aqualink.COLS, samples())
+    w(os.path.join(data, "readings.csv"),
+      ["fetched", "measured", "free_cl", "ph", "water_temp", "skimmer_flow",
+       "status", "alerts"], readings())
+    w(os.path.join(data, "lab.csv"),
+      ["measured", "fetched", "ta", "ch", "cya", "salt", "phosphates", "copper",
+       "iron", "saturation_index"], lab_rows())
+    w(os.path.join(data, "leslies.csv"), LES, leslies_rows(LES))
+    w(os.path.join(data, "chemicals.csv"), CH.CHEM_COLS, chem_rows())
+    w(os.path.join(data, "manual.csv"), S.MANUAL_COLS, manual_rows(S.MANUAL_COLS))
+    # The columns from runlog, not retyped here: the header is written once at
+    # creation, so a COLS list with a column the writers do not know corrupts
+    # every row appended afterwards.
+    from poolhound import runlog as RL
+    w(os.path.join(data, RL.FILE), RL.COLS, run_rows())
+
+    cfg = os.path.join(root, "config.toml")
+    with open(cfg, "w") as f:
+        f.write('# A synthetic pool. Not anybody\'s real one.\n'
+                '[pool]\nvolume_gallons = 18400\nvolume_estimated = true\n'
+                'pool_only_gallons = 17600\nspa_gallons = 800\n'
+                'spa_shares_water = true\nacid_pct = 31.45\n'
+                'sanitiser = "salt_cell"\npump_watts = 900\n\n'
+                '[power]\nkwh_cost = 0.31\n')
+    print(f"  {os.path.basename(cfg):18} written")
+    print()
+    print("  render it with:")
+    print(f"    POOLHOUND_DATA={data} \\")
+    print(f"    POOLHOUND_SITE={os.path.join(root, 'site')} \\")
+    print(f"    POOLHOUND_CONFIG={cfg} bin/render")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

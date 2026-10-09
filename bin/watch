@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Entry point — see poolhound/watch.py"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import config, watch
+
+# The watchdog runs on the web server, every 30 minutes. Run here it
+# reads a data directory that is not the pool's and alerts on what it
+# finds there -- which is how a laptop came to raise notifications
+# about the chlorine of a pool that does not exist.
+config.refuse_off_deployment("watch")
+sys.exit(watch.main())

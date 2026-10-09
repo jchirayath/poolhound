@@ -1,0 +1,97 @@
+# poolhound collectors on the server.  Installed to /etc/cron.d/poolhound.
+#
+# THE SAMPLER IS NOT HERE, AND THAT IS THE POINT
+# On the Mac a job polled the pool controller every 15 minutes. the server cannot do
+# that and must not try: it has no route to the house LAN, and giving it one
+# would put an unauthenticated controller on a routable path. The Pi's agent
+# pushes samples up instead, so the 15-minute cadence now lives on the Pi.
+#
+# Times are UTC. See the block below for why they are not Pacific, and for the
+# step in the daily series that discovering it explained.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+# TIMES ARE UTC, BECAUSE CRON_TZ DOES NOT WORK HERE.
+#
+# This file used to carry `CRON_TZ=America/Los_Angeles` above a comment
+# promising the times matched what the Mac ran "so the daily series has no step
+# in it across the migration". CRON_TZ is a cronie feature; the server runs Debian's
+# vixie-cron, where the string does not occur in the binary at all
+# (`grep -c CRON_TZ /usr/sbin/cron` -> 0). It was parsed as an ordinary
+# environment assignment and never reached the scheduler, so every job ran at
+# its stated hour in UTC — and the server is Etc/UTC.
+#
+# The collectors therefore fired at 07:00 Pacific, seven hours early, from the
+# migration onward. The WaterGuru pod measures between 19:37 and 21:15 UTC, so
+# a 14:00 UTC pull is always BEFORE that day's measurement: every scheduled run
+# since 2026-09-13 fetched the PREVIOUS day's reading, spending the one API call
+# a day this project says it respects on data it already had. Measured in
+# readings.csv — fetched 2026-09-17T07:00:05-0700, measured 2026-09-16T19:38:04Z
+# — against the Mac era, fetched 2026-09-12T20:00:40, measured the same day.
+#
+# 23:00 UTC is 16:00 PDT and 15:00 PST: comfortably after the latest measurement
+# observed (21:15 UTC) in either half of the year, and the same calendar day in
+# Pacific, which is what the daily series is keyed on. A fixed UTC time shifts
+# an hour in local terms across DST and that is fine here; being after the pod
+# is the property that matters, not the wall-clock hour.
+
+# NOBODY WAS READING STDERR. MAILTO="" discards it, the server has no MTA so mail
+# would have bounced anyway, and every job below pipes its failures into that
+# nothing. bin/watch had been dying with a TypeError on EVERY run for weeks --
+# the one job whose entire purpose is to tell you a collector has gone quiet --
+# and this line is why nobody found out. The mail stays off, because it cannot
+# work; the output goes to a file that does, and collect.sh records each run's
+# exit status where --check can judge it.
+MAILTO=""
+POOLHOUND_LOG=/var/log/poolhound-cron.log
+# The run log records WHO started an attempt. This is the one place that knows
+# the answer is cron; everything else says "manual" rather than guessing from
+# whether stdin happens to be a terminal.
+POOLHOUND_RUN_BY=cron
+# WHERE THE STACK IS, substituted by bootstrap-server.sh from server.env's STACK.
+# cron.d assignments reach the shell that runs each command, so the lines below
+# expand it. It used to be one install's absolute path written out four times,
+# which made this repository's cron file a statement about one person's disk.
+STACK=@@STACK@@
+
+# THE TWO PULLS ARE TICKS NOW, NOT A SCHEDULE.
+#
+# These fired once a day from here, which meant "how often do you fetch
+# WaterGuru" was a question the product could state and not answer: the
+# container cannot edit a file on the host, and a web form that could rewrite
+# /etc/cron.d would be a web form that can run anything as root. So the cadence
+# moved to `[collection]` in config.toml -- which the container already owns,
+# already writes, and which lives on the share -- and these lines became a
+# heartbeat that asks.
+#
+# poolhound/cadence.py decides. `bin/wg-collect` calls cadence.tick_gate()
+# BEFORE any network call and exits 0 having spent nothing when the answer is
+# no, so an hourly tick against a two-calls-a-day budget costs exactly what a
+# daily one did. The floor is enforced there rather than here, because a
+# crontab cannot refuse a setting.
+#
+# HOURLY, AND THE HOUR STILL MATTERS. The cadence names the earliest hour a
+# daily pull may land in, and its default is read from THIS FILE so that an
+# install which never opens Settings keeps the hour it already had. 23:00 UTC
+# is that hour for the reason set out above: the pod measures between 19:37 and
+# 21:15 UTC and a pull before that fetches yesterday's reading every time.
+#
+# The minutes are kept apart so the two do not contend for the same lock.
+0 * * * * root $STACK/poolhound/collect.sh wg-collect >> $POOLHOUND_LOG 2>&1
+
+# Leslie's: in-store bench photometer results, scraped as a browser would.
+5 * * * * root $STACK/poolhound/collect.sh leslies >> $POOLHOUND_LOG 2>&1
+
+# Health and notifications: has a collector stopped, is the chemistry badly out,
+# did a heater come on.
+*/30 * * * * root $STACK/poolhound/collect.sh watch --quiet >> $POOLHOUND_LOG 2>&1
+
+# A safety-net render. Samples and writes re-render inline, so this exists only
+# to catch a day when nothing at all arrived — without it the page would still
+# show yesterday's "x hours ago" as though it were current.
+17 */6 * * * root $STACK/poolhound/collect.sh render >> $POOLHOUND_LOG 2>&1
+# THE ONLY COPY OF THIS POOL'S HISTORY IS THE SHARE. A tarball onto the host's
+# local disk is the one place guaranteed to fail separately from it — the .bak
+# migrate_columns writes lives on the share beside the file it is backing up,
+# so it is gone in exactly the case a backup is for. 40 past, so it does not
+# collide with the labs at :00 and :05 or the render at :17.
+40 2 * * * root $STACK/poolhound/collect.sh backup >> $POOLHOUND_LOG 2>&1

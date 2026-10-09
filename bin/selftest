@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Run the checks that need no browser, pool or network. See poolhound/selftest.py."""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound.selftest import main
+sys.exit(main())

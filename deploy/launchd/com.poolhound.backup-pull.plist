@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the daily off-box pull of the pool's history.
+
+  WHAT IT CLOSES
+    docs/THREAT_MODEL.md's third open item, and the first of the two gaps
+    docs/ASVS-L2.md names as the ones that would actually hurt. bin/backup
+    writes a nightly tarball to the VM's own local disk — the one place
+    guaranteed to fail separately from the Azure Files share, which is what it
+    was for, and not separately from the VM. This machine is off-box. That is
+    the whole argument.
+
+  WHY launchd AND NOT cron
+    macOS enters "Maintenance Sleep" even on a desktop wired to AC, and cron
+    does NOT fire while the system is asleep — so a 04:10 cron line is a backup
+    that silently does not happen on the nights it matters. launchd's
+    StartCalendarInterval reschedules the job for the next wake. (Same reason
+    the poker-manager backup moved off cron.)
+
+  WHY 04:10 LOCAL
+    bin/backup runs on the server at 02:40 UTC, which is 19:40 or 20:40 the
+    previous evening here. 04:10 local is several hours after that whatever the
+    daylight-saving offset is doing, so this never races the job it copies —
+    and if it ever does, pull-backup.sh grades the SERVER tarball's age and
+    says so rather than reporting a successful copy of yesterday's.
+
+  THE ONE THING THAT NEEDS A PERSON
+    The server is reached with an Entra SSH certificate minted by
+    `az ssh config`, and it is valid for about an hour — so every run mints a
+    fresh one. That works unattended for as long as the Azure CLI can refresh
+    its own token silently, and stops working when it cannot: a tenant policy,
+    a password change, a revoked session. pull-backup.sh then exits non-zero
+    with "not logged in to Azure — run: az login" rather than warning, and
+    `./deploy/pull-backup.sh --check` is the thing that notices the copies have
+    stopped arriving. A backup that quietly stopped is the failure this whole
+    project has a paragraph about; put --check somewhere you read.
+
+  Install:
+    mkdir -p ~/Library/LaunchAgents
+    cp deploy/launchd/com.poolhound.backup-pull.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.poolhound.backup-pull.plist
+
+  Verify scheduled:
+    launchctl list | grep poolhound.backup-pull
+    launchctl print gui/$(id -u)/com.poolhound.backup-pull | grep -iE 'next fire|last exit'
+
+  Run on demand (smoke test):
+    launchctl kickstart -k gui/$(id -u)/com.poolhound.backup-pull
+    ./deploy/pull-backup.sh --check
+
+  Uninstall:
+    launchctl unload -w ~/Library/LaunchAgents/com.poolhound.backup-pull.plist
+    rm ~/Library/LaunchAgents/com.poolhound.backup-pull.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.poolhound.backup-pull</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jacobc/code/poolhound/deploy/pull-backup.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>10</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jacobc/code/poolhound</string>
+
+    <!-- launchd gives a job a minimal PATH that has neither Homebrew nor the
+         Azure CLI in it, and the script's first act is `command -v az`. This
+         mirrors the PATH an interactive shell would have handed it; az lives
+         in /opt/homebrew/bin on Apple Silicon. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- The script prints a dated banner and one line per step, so these two
+         files ARE the log. Outside the checkout, beside the backups, because
+         this tree is published and the log names the server. Appended to by
+         launchd, never rotated by it — which is fine at a few hundred bytes a
+         day and is worth knowing. -->
+    <key>StandardOutPath</key>
+    <string>/Users/jacobc/Backups/poolhound/pull.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jacobc/Backups/poolhound/pull.err</string>
+
+    <!-- A periodic job, not a daemon: do not restart it when it exits, and do
+         not run it the moment this agent loads. The smoke test above is how
+         you run it now. -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

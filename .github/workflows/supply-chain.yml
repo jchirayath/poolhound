@@ -1,0 +1,120 @@
+# What we ship, and what we must never ship. On every push, and on a timer.
+#
+# WHY THIS IS A SECOND FILE
+#
+# gates.yml answers "does the product work", and the answer changes only when
+# somebody pushes. These two questions do not work like that:
+#
+#   * A CVE is published without anybody touching this repository. The
+#     dependency scan was a DEPLOY gate only — `bootstrap-server.sh` runs
+#     osv-scanner and refuses a dirty scan — which means an advisory filed
+#     today stayed invisible until the next deploy, and this project has gone
+#     four days without a successful image build while every probe read green.
+#     The first scan this repository ever ran came back 5 packages, 53
+#     advisories, 2 Critical and 31 High, and the two 9.1s were both TRANSITIVE
+#     and therefore pinned nowhere.
+#   * A committed credential is not fixed by the next commit. It is in the
+#     history, and the question is asked of the history rather than of the
+#     working tree.
+#
+# So this file carries the `schedule`, and gates.yml does not. Splitting them
+# is also what keeps both files free of `if:` conditions on the event name —
+# a job that must skip itself on a schedule is a job in the wrong file.
+#
+# NO THIRD-PARTY ACTION RUNS HERE. Both tools are installed with `go install`
+# at a pinned version, which the Go module proxy verifies against its own
+# checksum database; a tag can be moved, and a module version cannot. The
+# first-party actions are pinned to commit SHAs for the same reason — see
+# gates.yml, where the argument is written out.
+name: supply-chain
+
+on:
+  push:
+  # pull_request, NEVER pull_request_target — the reasoning is in gates.yml.
+  pull_request:
+  schedule:
+    # Daily, at an arbitrary minute rather than on the hour: GitHub drops
+    # scheduled runs under load, and :00 is where every cron in the world is.
+    - cron: "19 7 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- what we ship --------------------------------------------------------
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # UNPINNED ON PURPOSE, which is the same argument gates.yml makes
+          # about playwright: Go is never shipped, and a stale pin here would
+          # mean the scanner stops building. osv-scanner v2.6.0 already asks
+          # for go 1.27, so a version typed here is a version that expires.
+          go-version: stable
+
+      # PINNED, like everything in deploy/requirements.txt and for the same
+      # reason: a scanner that re-resolves itself on every run is a scanner
+      # whose answer nobody can reproduce. Raising this is an ordinary edit.
+      - name: Install osv-scanner
+        run: go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.6.0
+
+      # THE DOCUMENTED COMMAND, not a reimplementation of it. README and
+      # CLAUDE.md both print this line; bootstrap-server.sh runs the same one
+      # against the same file. A second definition of "scanned" is the defect
+      # poolhound/seams.py exists for.
+      #
+      # deploy/requirements.txt IS the shipped image — nine pins, including
+      # three transitives pinned because a transitive is a thing nobody can
+      # answer for otherwise. Non-zero on any advisory.
+      - name: osv-scanner over what the image installs
+        run: osv-scanner scan source --lockfile=requirements.txt:deploy/requirements.txt
+
+  # ---- what we must never ship --------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # THE WHOLE HISTORY, because that is what the question is about. The
+          # CSVs in this repository were tracked once and removing them was
+          # deliberate; a credential removed in the same way is still there.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # UNPINNED ON PURPOSE, which is the same argument gates.yml makes
+          # about playwright: Go is never shipped, and a stale pin here would
+          # mean the scanner stops building. osv-scanner v2.6.0 already asks
+          # for go 1.27, so a version typed here is a version that expires.
+          go-version: stable
+
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+
+      # TWO SCANS, TWO QUESTIONS, and the first one is the one people skip.
+      #
+      # `git` reads every commit: a key committed and then removed is a key
+      # that leaked, and nothing about the working tree says so. `dir` reads
+      # what is on disk now, which catches the file that is about to be
+      # committed and the one a .gitignore is quietly covering.
+      #
+      # bin/selftest already refuses a tracked file that names the deployment's
+      # host — that property is checked because it decays by ordinary editing,
+      # somebody pasting a real URL into a comment while debugging. This is the
+      # same argument one step along: "credentials are read, never printed" is
+      # a constraint this repository states, and until now nothing asked.
+      #
+      # MEASURED on 2026-10-07, before this file existed: 234 commits and
+      # 12.18 MB of working tree, no findings in either mode. It starts clean,
+      # which is the only state worth starting a gate from.
+      - name: gitleaks over the history
+        run: gitleaks git . --no-banner --redact --verbose
+
+      - name: gitleaks over the tree
+        run: gitleaks dir . --no-banner --redact --verbose

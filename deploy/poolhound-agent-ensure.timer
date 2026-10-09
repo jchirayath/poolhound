@@ -1,0 +1,19 @@
+[Unit]
+Description=Check regularly that the poolhound agent is running
+Documentation=https://github.com/jchirayath/poolhound
+
+[Timer]
+# TWO MINUTES AFTER BOOT, not at boot. The failure this heals is a start job
+# deleted from the BOOT transaction; by the time this fires that transaction is
+# finished, so starting the agent now cannot rejoin the cycle that removed it.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# A check that is thirty seconds late is still a check, and a loose accuracy
+# lets systemd batch the wakeup instead of waking the board on its own.
+AccuracySec=30s
+# NO Persistent=true. It would write a timestamp file on every run, onto the
+# card this project does not write to — and there is nothing to catch up on: a
+# check missed while the Pi was off is answered by the next one.
+
+[Install]
+WantedBy=timers.target

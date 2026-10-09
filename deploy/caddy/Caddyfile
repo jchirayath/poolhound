@@ -1,0 +1,13 @@
+# The whole Caddy configuration, for a server running poolhound and nothing
+# else. Two files are imported: the auth snippet, which decides HOW somebody
+# signs in, and the site, which decides WHAT is behind the sign-in.
+#
+# The glob is sorted, and "auth" sorts before "poolhound", which is what makes
+# the snippet defined before the site that imports it. compose.yml mounts
+# exactly one auth snippet here as auth.caddy — mounting both would define
+# (poolhound_auth) twice and Caddy would refuse the config.
+{
+	email {$POOLHOUND_ACME_EMAIL}
+}
+
+import /etc/caddy/conf.d/*.caddy

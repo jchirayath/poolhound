@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Regenerate the committed brand files from poolhound/brand.py.
+
+    bin/brand              write docs/poolhound*.svg
+    bin/brand --raster     also re-render the email logo PNG (needs a browser)
+    bin/brand --check      report drift and exit non-zero; change nothing
+
+WHY THIS EXISTS
+
+GitHub renders an <img> and cannot run anything, so README's logo has to be a
+file on disk. That made it a third copy of the mark, drawn by hand before
+brand.py existed — and when the dot became a drop, the README kept the dot for
+a week with every gate green, because no check reads docs/ and seams.py scans
+poolhound/*.py only.
+
+The files are still committed. They are now OUTPUT: this writes them, and
+bin/selftest compares what is on disk against what brand.py produces.
+"""
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from poolhound import brand                                       # noqa: E402
+
+
+def main(argv):
+    check_only = "--check" in argv[1:]
+    if check_only:
+        stale = [rel for rel, make in sorted(brand.FILES.items())
+                 if _read(rel) != make()]
+        for rel in stale:
+            print(f"  STALE  {rel} — run bin/brand")
+        if stale:
+            return 1
+        print(f"  {len(brand.FILES)} brand file(s) match brand.py")
+        return 0
+
+    changed = brand.write_files(ROOT)
+    for rel in changed:
+        print(f"  wrote {rel}")
+    if not changed:
+        print(f"  {len(brand.FILES)} brand file(s) already current")
+
+    # The raster is opt-in because it needs a browser, and because a PNG
+    # encoder is not stable across Chromium versions -- rewriting it on every
+    # run would put a meaningless binary diff in front of every commit. What
+    # keeps it honest is that it is GENERATED from the same mark(), and
+    # bin/selftest checks the committed file is a valid PNG of the right size.
+    if "--raster" in argv[1:]:
+        written, why = brand.write_rasters(ROOT)
+        for rel in written:
+            print(f"  wrote {rel}")
+        if why:
+            print(f"  skipped the raster: {why}")
+    return 0
+
+
+def _read(rel):
+    path = os.path.join(ROOT, *rel.split("/"))
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
