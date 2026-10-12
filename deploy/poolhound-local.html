@@ -14,7 +14,8 @@
   the page can be read, adapted and photographed — bin/screenshots drives it
   against a synthetic AqualinkD for the landing page's card. It needs the Pi's
   web server to proxy /poolapi/ to AqualinkD, and, for the activity list and
-  the door claim, /poolactivity and /poolclaim to the agent (deploy/README.md,
+  the door claim and the scenes, /poolactivity, /poolclaim and /poolscenes
+  to the agent (deploy/README.md,
   "Naming the door a panel change came through"). /resync is a household
   extra and answers nothing without its own small service.
 
@@ -147,6 +148,10 @@ button.danger:hover:not(:disabled){border-color:var(--bad);background:rgba(210,8
 .ro .v{font-size:1.5rem;font-weight:300;margin-top:.15rem;font-variant-numeric:tabular-nums}
 .ro .v small{font-size:.85rem;color:var(--muted)}
 
+#scenes{display:flex;flex-wrap:wrap;gap:.5rem;margin:.6rem 0 .2rem}
+#scenes button{min-height:2.6rem}
+#scenes-note{color:var(--faint);font-family:var(--mono);font-size:.7rem;margin:.3rem 0 0}
+#scenes-note.bad{color:var(--bad)}
 h2{font-family:var(--display);font-weight:400;font-size:1.35rem;margin:1.8rem 0 .2rem}
 .sub2{color:var(--faint);font-family:var(--mono);font-size:.7rem;
       letter-spacing:.1em;text-transform:uppercase;margin-bottom:.9rem}
@@ -223,6 +228,11 @@ footer{margin-top:2.4rem;padding:1.4rem 0 2.2rem;border-top:1px solid var(--line
   <h2>Circuits</h2>
   <div class="sub2">tap to switch · verified against the panel</div>
   <div class="grid" id="circuits"></div>
+
+  <h2>Scenes</h2>
+  <div class="sub2">several controls in one tap · made in the poolhound app · run here, one step at a time</div>
+  <div id="scenes"><span class="sub2">loading…</span></div>
+  <p id="scenes-note"></p>
 
   <div class="call">
     <span class="lbl">If you script against this API yourself</span>
@@ -702,6 +712,114 @@ footer{margin-top:2.4rem;padding:1.4rem 0 2.2rem;border-top:1px solid var(--line
       el.appendChild(w);
     });
   }
+
+
+  // Scenes, made in the poolhound app and handed to this page by its agent
+  // (/poolscenes -> the agent's /scenes, kept in memory on the Pi), so they
+  // run here even when the poolhound server cannot be reached. The steps
+  // arrive in the order they must run -- the pump first, a heater's
+  // temperature before the heater -- and are run that way, one at a time,
+  // with the same wake / claim / press / wait / verify every button here
+  // uses, because the panel drops the first command after a sleep. A scene
+  // STOPS at the first step that does not take: a heater is never started
+  // after its pump failed. "Then switch off after" is the poolhound server's
+  // to arrange; a scene run from this page does not switch itself off.
+  var scenesBusy = false;
+
+  function stepWords(st) {
+    var nm = (NAMES[st.device] || {}).name || st.label || st.device;
+    if (st.action === 'setpoint') return nm + ' to ' + st.value + '°F';
+    return nm + (Number(st.value) ? ' on' : ' off');
+  }
+
+  function runStep(st) {
+    var isTemp = st.action === 'setpoint';
+    var path = '/' + st.device + (isTemp ? '/setpoint/set' : '/set');
+    var wait = isTemp ? 20000 : (SLOW[st.device] ? SETTLE_SLOW : SETTLE);
+    function took() {
+      var d = state[st.device];
+      if (!d) return false;
+      return isTemp ? Number(d.spvalue) === Number(st.value)
+                    : d.state === (Number(st.value) ? 'on' : 'off');
+    }
+    function attempt(n) {
+      return fetchJSON(API + '/status').catch(function () { return null; })   // wake it
+        .then(function () { return new Promise(function (r) { setTimeout(r, 5000); }); })
+        .then(function () { return command(path, st.value); })
+        .catch(function () { return null; })
+        .then(function () { return new Promise(function (r) { setTimeout(r, wait); }); })
+        .then(read)
+        .then(function () {
+          if (took()) return true;
+          if (n < 3) { log('    attempt ' + n + ' did not take — retrying', 'warn'); return attempt(n + 1); }
+          return false;
+        });
+    }
+    return attempt(1);
+  }
+
+  function runScene(sc) {
+    if (scenesBusy) return;
+    var heats = sc.steps.some(function (s) { return s.action === 'heat' && Number(s.value); });
+    var words = sc.steps.map(stepWords);
+    if (!window.confirm((heats ? 'This lights a gas heater.\n\n' : '') + 'Run ' + sc.name + '?\n\n'
+        + words.join('\n') + '\n\nAbout ' + Math.round(sc.steps.length * 25) + ' s, one step at a time.'
+        + (sc.off_after_h ? '\n\nIt will NOT switch itself off after ' + sc.off_after_h
+           + ' h from this page — that happens only when it is run from the poolhound app.' : ''))) return;
+    scenesBusy = true; paintScenes(lastScenes);
+    log('scene ' + sc.name + ': ' + words.join(' → '));
+    var i = 0;
+    function next() {
+      if (i >= sc.steps.length) { log('scene ' + sc.name + ': done', 'ok'); return Promise.resolve(); }
+      var st = sc.steps[i++];
+      log('  → ' + stepWords(st));
+      return runStep(st).then(function (ok) {
+        if (ok) return next();
+        log('scene ' + sc.name + ' stopped: ' + stepWords(st) + ' did not take, so nothing after it was pressed', 'bad');
+      });
+    }
+    next().catch(function () {}).then(function () {
+      scenesBusy = false; paintScenes(lastScenes); loadActivity(); paint();
+    });
+  }
+
+  var lastScenes = null;
+  function paintScenes(j) {
+    var host = document.getElementById('scenes');
+    var note = document.getElementById('scenes-note');
+    host.textContent = '';
+    note.className = '';
+    if (!j) { note.textContent = ''; return; }
+    var list = j.scenes || [];
+    if (!list.length) {
+      var e = document.createElement('span');
+      e.className = 'sub2';
+      e.textContent = j.error ? 'no scenes yet — ' + j.error : 'no scenes yet — make them in the poolhound app';
+      host.appendChild(e);
+    }
+    list.forEach(function (sc) {
+      var b = document.createElement('button');
+      b.className = 'primary';
+      b.textContent = sc.name;
+      b.title = sc.steps.map(stepWords).join(' → ');
+      b.setAttribute('aria-label', 'Run the scene ' + sc.name);
+      b.disabled = scenesBusy;
+      b.addEventListener('click', function () { runScene(sc); });
+      host.appendChild(b);
+    });
+    note.textContent = scenesBusy ? 'running a scene — see the log below'
+      : (j.error && list.length ? 'from the last list the Pi fetched; the server could not be reached just now' : '');
+    if (j.error && list.length) note.className = 'bad';
+  }
+  function loadScenes() {
+    return fetchJSON('/poolscenes').then(function (j) { lastScenes = j; paintScenes(j); })
+      .catch(function () {
+        lastScenes = {scenes: [], error: 'poolhound’s agent is not answering'};
+        paintScenes(lastScenes);
+      });
+  }
+  loadScenes();
+  setInterval(function () { if (!scenesBusy) loadScenes(); }, 60000);
 
   loadActivity();
   setInterval(loadActivity, 20000);

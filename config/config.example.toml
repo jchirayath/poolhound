@@ -52,6 +52,21 @@ credentials = "~/.leslies"
 # leslies_every_hours   = 24
 # leslies_hour_utc      = 23
 
+[weather]
+# Daily sun, rain, air temperature and evaporation at the pool, from Open-Meteo
+# (no account, no key). The chemistry fit needs a measure of the sun that is
+# not also a measure of heat, and a record of rain and evaporation, and no pool
+# instrument supplies either. Optional: leave these out and nothing is sent.
+#
+# WHAT IS SENT: these two numbers ROUNDED TO 0.1 DEGREE before they leave —
+# about 11 km, coarser than a town and far coarser than a street — plus the
+# pool's timezone and the names of the measures. Nothing else. The Collection
+# tab prints the rounded pair it sends. Weather does not change across a street,
+# so the rounding costs the data nothing; Open-Meteo's own grid is coarser.
+#
+# latitude  = 37.4
+# longitude = -122.1
+
 [pool]
 # Used to convert a dose into an expected change. The WaterGuru API reports
 # most of this; these are the fallbacks if you do not use WaterGuru.
@@ -110,6 +125,11 @@ chemistry  = true
 pool_heat  = true      # gas: costs money, and warms the water
 spa_heat   = true
 spa        = false
+# A chemical running low on the shelf (see [stock] below), once per time it
+# runs low. "info", so the default email bar keeps it off email. Off by
+# default: where no notifier takes an info notice it would count as an alert
+# nobody could be sent.
+stock      = false
 
 [paths]
 data = "data"             # runtime data; never committed
@@ -130,6 +150,9 @@ site = "site"             # generated dashboard; never committed
 # and SAY SO beside every figure priced that way; set, they use yours. Acid is
 # per gallon at the strength set as acid_pct above.
 #
+# A purchase recorded on the Chemicals tab with what was paid fills any price
+# left unset here, and says which purchase it came from. A price set here wins.
+#
 # [prices]
 # acid_per_gal       = 9.75
 # chlorine_per_gal   = 7.50
@@ -141,6 +164,14 @@ site = "site"             # generated dashboard; never committed
 # cya_liquid_per_gal = 39.99
 # nophos_per_gal     = 50.46
 # salt_per_lb        = 0.20
+
+# ---------------------------------------------------------------------- stock
+# What is on the shelf: the last count, plus purchases since, minus doses
+# logged since. A chemical with fewer than this many weeks left at its rate of
+# use is "low" on the Chemicals tab and on Home.
+#
+# [stock]
+# low_weeks = 3
 
 # ----------------------------------------------------------------------- site
 # Facts about THIS deployment. Every one of these has a built-in fallback that
@@ -236,3 +267,89 @@ site = "site"             # generated dashboard; never committed
 # operators = ["partner@example.com"]
 # viewers   = ["guest@example.com"]
 # default   = "view"
+
+# ------------------------------------------------------------------- schedule
+# SWITCHING THINGS OFF AGAIN. The Pool control tab can schedule a command for
+# later, and turning something on can carry "then off after N hours". Both are
+# ordinary commands issued by this server at the time -- same checks, same
+# cooldowns, same audit -- and both are on by default with the values below.
+#
+# auto_off: which controls offer "then off after", and the hours the page
+# preselects. 0 removes one. A heater has no off switch, so "off" is: the spa
+# heater -> the spa switched off; the pool heater -> its setpoint to the bottom
+# of its range.
+#
+# max_on: the HOUSEHOLD LIMIT. Read from what the panel reports, so it applies
+# to a press at the wall panel or through AqualinkD as well as to one made in
+# poolhound. When a control has been reported on for longer than this without
+# a break, poolhound switches it off, once per run, and it cannot be cancelled
+# from the page. 0 turns it off -- a decision made here, deliberately, not on a
+# button.
+#
+# [schedule.auto_off]
+# Spa = 2
+# Spa_Heater = 2
+# Pool_Heater = 6
+#
+# [schedule.max_on]
+# Spa_Heater = 3
+
+# ------------------------------------------------------------------ anomaly
+# EQUIPMENT ANOMALIES: something wrong THIS hour that breaks equipment, is
+# unsafe or wastes gas, read off the panel's own samples by bin/watch every
+# thirty minutes and listed on Home under Anomalies. poolhound/anomaly.py has
+# every rule, its reason and where each default came from.
+#
+# Every rule is on. "serious" ones notify -- once when they start, once when
+# they end, and again each day one stays open; "info" ones are shown on Home
+# and notify only with notify = true (on a server with no desktop, an info
+# notice below the email bar reaches nobody and would count as undelivered).
+# Each table takes `enabled`, `notify`, and the thresholds shown, which are the
+# defaults. A key that is not understood is listed on Home, not ignored.
+#
+# Absolute limits, in hours of an unbroken run; 0 removes one. Independent of
+# what is usual, and they say whether [schedule.max_on] will act.
+# [anomaly.long_on]            # serious
+# spa_heat = 2
+# pool_heat = 12
+# spa = 4
+# [anomaly.left_on]            # info
+# pool_light = 8
+# spa_light = 8
+# sheer = 8
+# [anomaly.long_usual]         # info: Equipment health's "longer than usual"
+# enabled = true
+#
+# [anomaly.heat_no_flow]       # serious: a heater firing, the pump stopped
+# min_rpm = 0                  # >0 also counts a pump slower than this
+# samples = 2
+# [anomaly.heat_no_rise]       # serious: firing, and the water not warming
+# pool_minutes = 120
+# pool_rise = 0.5
+# spa_minutes = 30
+# spa_rise = 2
+# [anomaly.spa_too_hot]        # serious: 104 is the CPSC's ceiling
+# limit = 104
+# samples = 2
+# [anomaly.heat_past_set]      # serious: firing past setpoint + margin
+# margin = 2
+# samples = 2
+# [anomaly.freeze_risk]        # serious: air at freeze setpoint, pump stopped
+# default_set = 38             # used only when the panel does not report one
+# samples = 2
+# [anomaly.pump_power]         # serious: draw at one speed moved a quarter
+# change = 0.25
+# baseline_days = 7
+# samples = 2
+# [anomaly.cell_stress]        # info: producing in low salt or cold water
+# salt_min = 3000              # unset: the bottom of this pool's salt target
+# cold_f = 50
+# samples = 4
+# [anomaly.no_circulation]     # serious: the pump has not run
+# hours = 24
+# gap_hours = 2
+# [anomaly.sensor_stuck]       # info: the same reading for this long
+# air_hours = 36
+# water_hours = 96
+# [anomaly.sensor_range]       # info: a physically impossible reading
+# enabled = true

@@ -1057,7 +1057,11 @@ def t_a_source_that_never_ran_is_not_a_source_that_is_fine():
 
     check("never is in the set that needs a person",
           "never" in C.NEEDS_ATTENTION, True)
-    cards = C.summary([])                     # no runs at all, ever
+    # An optional source nobody has set up says "not set up" instead — weather,
+    # with no coordinates — and is the one card that is not broken by never
+    # having run. Excluded by its own state rather than by name, so a set-up
+    # weather source is held to "never" like the rest.
+    cards = [c for c in C.summary([]) if c["state"] != "off"]   # no runs at all, ever
     states = {c["state"] for c in cards}
     check("with no run log every card is 'never'", states, {"never"})
     broken = [c for c in cards if c["state"] in C.NEEDS_ATTENTION]

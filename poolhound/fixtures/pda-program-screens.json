@@ -1,0 +1,79 @@
+{
+ "source": "AqualinkD 3.1.0 PDA simulator, viewing only, on a PDA-PS6 Combo at 0x60; raw MSG_LONG packets",
+ "mapped": "2026-10-09",
+ "why": "The PDA PROGRAM path as the panel sends it: ten lines of sixteen characters, line 0 first. The first character of each entry is a marker, '>' for the highlighted line and ' ' otherwise; the rest is the panel's text exactly. One owner: help.py draws the Guide's map from it, and docs/JANDY-PROGRAMS.md is its long form.",
+ "screens": [
+  {
+   "id": "pm-home",
+   "x": 20,
+   "y": 40,
+   "title": "1  Home",
+   "lines": [
+    "      FRI  3:42PM",
+    " AIR             ",
+    "  68`     76`    ",
+    " ",
+    ">POOL MODE     ON",
+    " POOL HEATER  OFF",
+    " SPA MODE     OFF",
+    " SPA HEATER   OFF",
+    " MENU            ",
+    " EQUIPMENT ON/OFF"
+   ]
+  },
+  {
+   "id": "pm-menu",
+   "x": 500,
+   "y": 40,
+   "title": "2  Main menu",
+   "lines": [
+    "    MAIN MENU    ",
+    " ",
+    ">HELP           >",
+    " PROGRAM        >",
+    " SET TEMP       >",
+    " SET TIME       >",
+    " PDA OPTIONS    >",
+    " SYSTEM SETUP   >",
+    " ",
+    " "
+   ]
+  },
+  {
+   "id": "pm-devs",
+   "x": 20,
+   "y": 380,
+   "title": "3  Program: devices",
+   "lines": [
+    "     PROGRAM     ",
+    " ",
+    ">FILTER PUMP     ",
+    " SPA             ",
+    " VSP1 SPD PGM    ",
+    " POOL HEAT       ",
+    " SPA HEAT        ",
+    " SOLAR HEAT      ",
+    " POOL LIGHT      ",
+    " SHEER DSCNT     "
+   ]
+  },
+  {
+   "id": "pm-dev",
+   "x": 500,
+   "y": 380,
+   "title": "4  One device",
+   "lines": [
+    "   FILTER PUMP   ",
+    "    PGM 1 of 1   ",
+    " ",
+    " ON      10:00 AM",
+    " OFF      4:00 PM",
+    " ALL DAYS        ",
+    " ",
+    ">ADD      PROGRAM",
+    " DELETE   PROGRAM",
+    " CHANGE   PROGRAM"
+   ]
+  }
+ ]
+}

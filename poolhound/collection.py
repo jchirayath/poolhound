@@ -40,6 +40,8 @@ from .render import ago, data_table, is_future, when
 TOOLS = {
     "wg-collect": ("WaterGuru", "Pod readings and the mailed-in lab result."),
     "leslies":    ("Leslie's", "The in-store bench photometer result."),
+    "weather":    ("Weather", "Sun, rain, air temperature and evaporation at the "
+                              "pool, per ended day, from Open-Meteo."),
     "watch":      ("Watchdog", "Has a collector stopped, is the chemistry out, "
                                "did a heater come on."),
     "render":     ("Page", "Rebuilding the two published pages."),
@@ -262,6 +264,20 @@ def _pushed_card():
             "state": state, "text": text, "schedule": cad, "row": row}
 
 
+def _weather_off():
+    """Why the weather source is not set up, or None when it is.
+
+    AN OPTIONAL SOURCE NOBODY SET UP IS NOT A BROKEN ONE. Without coordinates
+    the collector sends nothing and records a skip, which _state would grade
+    "never" -- in NEEDS_ATTENTION, so a tab banner and a nav badge on every
+    install that has simply not opted in. The config is the authority for
+    whether it is set up; the run log is the authority for whether it worked.
+    """
+    from . import weather
+    loc, why = weather.location()
+    return None if loc else why
+
+
 def summary(runs):
     """One card per source. The scheduled ones first, then the pushed one.
 
@@ -287,12 +303,22 @@ def summary(runs):
     for tool, (label, what) in TOOLS.items():
         row = latest.get(tool)
         state, text = _state(row, sched.get(tool), latest_did.get(tool))
+        sends = None
+        if tool == "weather":
+            off = _weather_off()
+            if off:
+                state, text = "off", off
+            # WHAT LEAVES, PRINTED FROM THE THING THAT SENDS IT. The same
+            # principle the Ask AI tab follows: the location is shown exactly
+            # as rounded and sent, never described.
+            from . import weather
+            sends = weather.describe()
         out.append({"tool": tool, "label": label, "what": what,
                     "state": state, "text": text,
                     # Absent crontab and "this tool is not in it" are
                     # different answers; cadence() is the one place that knows.
                     "schedule": cadence(tool, sched),
-                    "row": row})
+                    "row": row, "sends": sends})
     out.append(_pushed_card())
     return out
 
@@ -301,9 +327,11 @@ def _pill(state, text):
     # The colour vocabulary the equipment cards already use, and never colour
     # alone: every pill ships its word.
     word = {"ok": "working", "late": "late", "failed": "failed",
-            "never": "never run", "skipped": "skipped"}[state]
+            "never": "never run", "skipped": "skipped",
+            "off": "not set up"}[state]
     cls = {"ok": "st-on", "late": "st-pending", "failed": "st-bad",
-           "never": "st-unknown", "skipped": "st-pending"}[state]
+           "never": "st-unknown", "skipped": "st-pending",
+           "off": "st-unknown"}[state]
     # `st`, not `stpill`. The base class that carries the pill's shape -- the
     # inline-flex, the status dot, the padding and the radius -- is `.st`, and
     # this file asked for a class that does not exist, so every pill on the tab
@@ -323,7 +351,8 @@ def panel(public=False):
     lede = ("Every attempt to fetch or publish, and what came of it. "
             "Each source is separate because they do not work the same way. "
             "The two labs are pulls, on somebody else's server, and are "
-            "rationed. The controller is a push: the Pi samples the panel and "
+            "rationed. Weather is a pull of public data, for a location "
+            "rounded before it is sent. The controller is a push:the Pi samples the panel and "
             "sends it here, so what can be judged from this end is whether it "
             "arrived, not whether we asked.")
     if broken:
@@ -340,6 +369,7 @@ def panel(public=False):
       <div class="srch"><b>{html.escape(c["label"])}</b>{_pill(c["state"], c["text"])}</div>
       <p class="sub">{html.escape(c["what"])}</p>
       <p class="sub"><b>Scheduled:</b> {html.escape(c["schedule"])}</p>
+      {_sends(c)}
       {_last_detail(c["row"], pushed=c["tool"] == PUSHED)}
     </div>''' for c in cards)
 
@@ -426,6 +456,17 @@ def _moved():
     from . import panels
     return (panels.reading_panel() + panels.corrections_panel() +
             panels.audit_panel())
+
+
+def _sends(card):
+    """The "exactly what is sent" line, for a source that sends anything of ours.
+
+    Only weather does: the labs send a login, which the Settings tab covers,
+    and the controller sends nothing outward from here at all.
+    """
+    if not card.get("sends") or card.get("state") == "off":
+        return ""
+    return f'<p class="sub"><b>Sends:</b> {html.escape(card["sends"])}</p>'
 
 
 def _last_detail(row, pushed=False):

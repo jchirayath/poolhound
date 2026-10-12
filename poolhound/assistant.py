@@ -200,6 +200,7 @@ def context(build=None):
     the first, which is the defect this product keeps finding.
     """
     from . import render
+    from . import chemicals as CH
 
     cfg = render.CFG
     out = []
@@ -243,6 +244,52 @@ def context(build=None):
           f"(from {e.get('source', 'unknown')}, {render.ago(e.get('measured'))}"
           f"{aim})")
 
+    # THE SATURATION INDEX, added as a field on purpose. It is the one answer
+    # here that depends on a measurement no lab sends -- the water temperature
+    # -- and a model handed only calcium, alkalinity and pH would compute it
+    # itself, at a temperature it would have to guess, and be wrong at the
+    # same confidence as when it is right. So it is sent already computed,
+    # with the temperature each figure is at and the oldest reading it rests
+    # on, and the labs' own figures beside it rather than merged into it.
+    # Fixed lines from render.current_saturation(); nothing here iterates.
+    a("")
+    a("SATURATION INDEX (Langelier, computed by poolhound at the water's "
+      "measured temperature; balanced is "
+      f"{_fmt(CH.LSI_BALANCED[0], 1)} to {_fmt(CH.LSI_BALANCED[1], 1)}):")
+    try:
+        sat = render.current_saturation()
+    except Exception:
+        sat = None
+    if not sat:
+        a("  not available")
+    elif sat["missing"]:
+        a(f"  not computable: it needs {' and '.join(sat['missing'])}, and none "
+          f"is on file. Do not assume a typical value.")
+    elif not sat["now"]:
+        a("  not computable: no water temperature with the pump running")
+    else:
+        def line(label, x):
+            r = (x or {}).get("result")
+            if r:
+                a(f"  {label}, {_fmt(x['temp_f'], 0)}F ({x['age']}): "
+                  f"{r['lsi']:+.2f} ({CH.lsi_word(r['lsi'])})")
+        line("pool now" if not sat["now"]["pump_off_now"]
+             else "pool when the pump last ran", sat["now"])
+        if sat["spa"]:
+            line(f"spa at its {sat['spa']['kind']}", sat["spa"])
+        if sat["coldest"]:
+            line(f"coldest water in the last {sat['coldest']['days']} days",
+                 sat["coldest"])
+        o = sat["oldest"]
+        a(f"  oldest reading it rests on: {o['name']} from {o['source']}, {o['age']}")
+        if not sat["tds_measured"]:
+            a(f"  TDS not measured; {_fmt(sat['tds'], 0)} ppm assumed")
+        if not sat["inputs"].get("cya"):
+            a("  no CYA reading; alkalinity uncorrected, which reads the index high")
+    for r in (sat or {}).get("reported", []):
+        a(f"  {r['source']} reported its own index {r['value']:+.2f} ({r['age']}), "
+          f"at a temperature it does not state; not averaged with the above")
+
     # The doses, and the CADENCE — which is the actual subject of "am I adding
     # this much acid too often". Given as the record plus the interval, not as
     # a verdict: the verdict is what is being asked for.
@@ -285,15 +332,53 @@ def context(build=None):
             gal, render.current_ta(),
             float((cfg.get("pool") or {}).get("acid_pct", 31.45)),
             (tg.get("cya") or (None,) * 3)[1], _dt.datetime.now(),
-            render.when, render.num,
-            prices={k: config.chemical_price(k, cfg)
-                    for k in config.PRICE_SETTINGS})
+            render.when, render.num, prices=render.household_prices(cfg))
     except Exception:
         est = None
     if est:
         a("")
         a("UPKEEP, ESTIMATED FROM THIS POOL'S RECORD (per week, per year):")
         out.extend(upkeep.context_lines(est))
+
+    # WHAT MOVES THIS POOL, as fitted. A fixed section of fixed terms -- every
+    # coefficient in fit.FC_TERMS and fit.PH_TERMS plus the acid, in that
+    # order, each one either a figure with its interval or the words NOT
+    # MEASURED and why -- so "what is costing me chlorine" is answered from
+    # this pool's own record, and an unmeasured term arrives as unmeasured
+    # rather than as a gap the model fills with a textbook number.
+    try:
+        from . import fit
+        res = fit.analyse(
+            render.rows("samples.csv"), render.rows("readings.csv"),
+            render.rows("manual.csv"), doses,
+            [(render.rows("lab.csv"), "WaterGuru lab"),
+             (render.rows("leslies.csv"), "Leslie's"),
+             (render.rows("manual.csv"), "By hand")],
+            render.weather_by_day(), gal,
+            float((cfg.get("pool") or {}).get("acid_pct", 31.45)))
+    except Exception:
+        res = None
+    a("")
+    a("WHAT MOVES THIS POOL, FITTED FROM ITS OWN RECORD (estimate, 95% range; "
+      "only figures marked measured or combined are established):")
+    out.extend(fit.context_lines(res) if res else ["  not available"])
+
+    # WHAT IS ON THE SHELF, because "do I need to buy acid before the weekend"
+    # is the question this figure exists to answer and the model cannot work it
+    # out from anything else here: it would have to subtract doses from
+    # purchases itself, which is the recomputing NOTE below forbids. One line
+    # per chemical with a stock record -- at most the ten in the catalogue --
+    # holding an amount, a rate and a date. Nothing about where it is kept or
+    # where it was bought; the purchase notes are deliberately not sent.
+    try:
+        from . import stock as _stock
+        shelf = render.stock_now(est)
+    except Exception:
+        shelf = None
+    if shelf:
+        a("")
+        a("ON HAND (last count + purchases since - doses logged since):")
+        out.extend(_stock.context_lines(shelf))
 
     a("")
     a("NOTE: these figures are computed by poolhound from its own record. "

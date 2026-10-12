@@ -20,6 +20,8 @@ section directly, which is what a reader looking for "privacy" actually uses.
 
 # The anchors the footer links to. Named here, once, and read by render.py, so
 # a renamed section cannot leave the footer pointing at nothing.
+from . import weather as _wx
+
 SAFETY_ID = "policies-safety"
 SUPPORT_ID = "policies-support"
 PRIVACY_ID = "policies-privacy"
@@ -97,7 +99,7 @@ def panel(public=True):
       'other liability arising from the software or its use. You use it, and act '
       'on anything it says, at your own risk.</p>')
     a('<p>It is not affiliated with or endorsed by Jandy, Zodiac, AqualinkD, '
-      'WaterGuru, Leslie’s or any AI provider. Their names are trademarks '
+      'WaterGuru, Leslie’s, Open-Meteo or any AI provider. Their names are trademarks '
       'of their owners and appear only to say what this works with.</p>')
     a('</section>')
 
@@ -154,6 +156,13 @@ def panel(public=True):
     a('<ul>'
       '<li><b>WaterGuru and Leslie’s</b>: this household’s own account '
       'credentials, to fetch its own test results.</li>'
+      # The precision is weather.py's, the module that does the rounding, so
+      # this sentence cannot promise a coarser location than is actually sent.
+      f'<li><b>Open-Meteo</b>, once a day if this install has turned weather '
+      f'on: the pool’s latitude and longitude <b>rounded to '
+      f'{_wx.ROUND_DEG:g}°</b> — about eleven kilometres — and its timezone, '
+      f'to fetch the day’s sun, rain and temperature. No account, no key, '
+      f'no address.</li>'
       '<li><b>The AI provider</b>, only when a signed-in person asks a question: '
       'the pool’s volume, current readings with their targets, and recent '
       'doses. Never an address, a name, an identity or a credential. Questions '

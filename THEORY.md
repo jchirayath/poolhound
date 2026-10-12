@@ -335,6 +335,48 @@ next lab result read 73, and 80 was the chlorine-pool aim. Prose that states a
 number is prose that goes stale silently. Current values belong on the dashboard,
 which derives them; this document is for the relationships.
 
+### The saturation index, at the temperature the water is actually at
+
+Whether water dissolves plaster or deposits scale is Langelier's index:
+pH minus the pH at which this water would be exactly saturated with calcium
+carbonate. The saturation pH is built from four terms — temperature, calcium,
+**carbonate** alkalinity and total dissolved solids — and
+`chemicals.saturation_index()` computes it in the continuous form the
+water-treatment references carry (Carrier, 1965):
+
+    pHs = (9.3 + A + B) − (C + D)
+    A = (log₁₀ TDS − 1) / 10        B = −13.12 log₁₀(°C + 273) + 34.55
+    C = log₁₀ CH − 0.4              D = log₁₀ carbonate alkalinity
+
+The pool trade's LSI = pH + TF + CF + AF − 12.1 is the same relation with each
+term rounded to 0.1 off a printed table; `bin/selftest` holds this function to
+the PHTA/CPO handbook's two worked examples (+0.2 balanced, −0.8 corrosive)
+within that rounding.
+
+**Carbonate, not total, alkalinity.** The TA test counts cyanurate too, and
+cyanurate buffers without holding calcium in solution. How much of the CYA the
+test counts depends on pH, so the correction is computed from cyanuric acid's
+pKa (6.88) rather than taken as a flat third — which reproduces Taylor
+Technologies' printed correction factors (0.22 at pH 7.0 to 0.35 at 7.8) row
+for row.
+
+**Why poolhound computes it rather than quoting the labs.** Both labs report an
+index, at a temperature neither of them states, on a sample carried indoors.
+The index moves about 0.1 per 10 °F, and this water spans thirty degrees across
+a year and forty more in the spa. So the index is computed three times — at the
+panel's current water temperature, at the spa's setpoint, and at the coldest the
+water has been in the last thirty days — and every one of those temperatures is
+read only while the pump is moving water past the probe, because with no flow it
+reads the pipe (`commands.drop_stale_flow_readings()`, applied again at read
+time since history is not rewritten). The labs' own figures are shown beside the
+computed one and never averaged with it.
+
+Calcium and alkalinity have no default: without them there is no index, and the
+page says which is missing. TDS does — 1000 ppm, raised to the measured salt on
+a salt pool, and said — because the term is gentle: 1000 against 4000 moves the
+index by 0.06. The oldest reading an index rests on is named, because a June
+calcium makes a June index whatever the pH says.
+
 ---
 
 ## After a change, the pool approaches a new equilibrium
@@ -366,16 +408,88 @@ instead. Same fit, same cell setting, a full 1.3 ppm apart on runtime alone.
 
 ## What the fit should recover
 
-| Coefficient | Meaning | Use |
-|---|---|---|
-| `k_prod` | ppm FC per SWG-% per pump-hour | set the dial from a target |
-| `k_uv` | FC lost per unit sun, at this CYA | predict summer vs winter demand |
-| `k_cya` | how much protection stabiliser buys | justify raising CYA to target |
-| `k_spill` | pH rise per pump-hour from spillover | the standing cost of circulating |
-| `k_sheer` | pH rise per sheer-descent hour | price the water feature |
-| `k_acid` | pH drop per fl oz at 31.45% | dose by calculation |
-| `k_cell` | pH rise per pump-hour of cell runtime | the production/pH trade |
-| `k_temp` | FC demand and pH rise per degree | what heating costs in chemistry |
+| Coefficient | Meaning | Use | Fitted |
+|---|---|---|---|
+| `k_prod` | ppm FC per SWG-% per pump-hour | set the dial from a target | `fit.py`, FC model |
+| `k_uv` | FC lost per unit sun, at this CYA | predict summer vs winter demand | `fit.py`, per MJ/m² of shortwave, at the record's mean CYA |
+| `k_cya` | how much protection stabiliser buys | justify raising CYA to target | `fit.py`, first order about the record's mean CYA; needs two different CYA results |
+| `k_spill` | pH rise per pump-hour from spillover | the standing cost of circulating | `fit.py`, pH model |
+| `k_sheer` | pH rise per sheer-descent hour | price the water feature | `fit.py`, pH model |
+| `k_acid` | pH drop per fl oz at 31.45% | dose by calculation | `chemicals.dose_response()`'s pairs, drift removed by the pH model |
+| `k_cell` | pH rise per pump-hour of cell runtime | the production/pH trade | `fit.py`; **combined with `k_spill`** until the dial varies |
+| `k_temp` | FC demand and pH rise per degree | what heating costs in chemistry | `fit.py`, both models, about the record's mean temperature |
+
+All of them are on Home under **What moves this pool**, private, each graded
+*measured*, *combined* or *not yet* — and the last two say what variation in
+the record would settle them. The fit adds three terms the table did not
+name: a standing FC demand apart from the sun (THEORY's "oxidant demand", the
+residual made explicit), and per-hour pH terms for spa sessions and heater
+runtime, which THEORY.md argues for above. The linearisation:
+
+```
+ΔFC  =  k_prod·Σ(SWG/100·pump h)  −  FC̄·(k_uv·sun + k_dem·days
+                                       + k_temp·days·(T−T̄) + k_cya·sun·(CYA−CYĀ))
+ΔpH  =  k_spill·pump h + k_cell·Σ(SWG/100·pump h) + k_sheer·sheer h
+        + k_spa·spa h + k_heat·heater h + k_temp·days·(T−T̄)
+```
+
+between consecutive readings from **one** instrument, where FC̄ is the mean of
+the two readings (the trapezoid rule — so `k_uv` is the loss against the
+morning level the pod reads, and on a simulated pool it reads about 10% low
+because chlorine is higher in the afternoon than either reading). Two terms
+that cannot be told apart — a condition index over 30, or two unresolved
+estimates trading one for the other — are merged into the earlier one and
+reported as one figure, with the ratio they ran at. Rain and evaporation are
+**not** used to move CYA between lab results: whether rain dilutes depends on
+whether the pool overflowed or was pumped down, and nothing records either.
+The page says how much rain has fallen since the last CYA instead.
+
+The fitted figures do not yet feed back into the dose arithmetic. Every dose
+on the page is still `chemicals.py`'s; wiring a measured coefficient into it
+is a separate decision with its own failure mode (a coefficient that drifts
+when the season turns), and it should be made on purpose.
+
+---
+
+## Equipment health — the same record, read for wear
+
+The coefficients above describe the water. Three more describe the machinery,
+and they are read the same way: as this pool against itself, never against a
+chart. `equipment.py` computes them; this is why each one is fittable and what
+it cannot see.
+
+**Filter loading — draw at a fixed speed.** A variable-speed pump held at one
+RPM sits on one pump curve. A filter loading with dirt raises the system head,
+the operating point moves to less flow at more head, and for the radial
+impellers pool pumps use shaft power rises with flow — so a dirtying filter
+shows up as the watts **falling**. (Constant-flow mode is the opposite: the
+pump speeds up and the watts climb.) Draw goes roughly as the cube of speed, so
+only one speed is compared; the first minutes after a start and any sample with
+the spa, sheer descent or solar valve open change the plumbing and are left
+out. The thresholds — watch at 5%, clean at 10% — are judgements standing in
+for the usual "8–10 psi over clean", and one full cycle from clean to cleaned
+is what would calibrate them. A **rise** at fixed speed is not a dirty filter
+and is reported as what it more likely is: an unmarked cleaning, a valve, air
+in the suction, or a bearing.
+
+**Cell yield — chlorine per full-output hour.** `P` from the free-chlorine fit
+above, divided by the cell-hours (SWG% × pump hours) the panel reports over the
+same three weeks. This is `k_prod` in the table, watched for a fall as the
+plates scale. It shares every limit the FC fit has, and adds two: a loss that
+does not scale with chlorine lands in `P` as if the cell made less, and a
+window with chlorine added by hand would credit the jug to the cell. Low salt
+and water under about 60 °F throttle a cell by design, so windows with either
+are shown and not counted. Expect this to be a **bound** for months.
+
+**Heater rate — degrees per hour of firing.** Pool and spa are never pooled: a
+few hundred gallons and many thousands differ by two orders of magnitude.
+Grouped by outdoor temperature, not by month, because heat lost to the air is
+what slows a winter run and a month means opposite things in two hemispheres.
+The outdoor figure is the weather record's daily mean air temperature where
+that day has one, and the panel's air sensor during the run where it does not;
+they are different quantities, so every run records which it used. The sun
+still warms a daytime run, which is what an outdoor feed with cloud
+cover — or night-time runs — would separate.
 
 ---
 
@@ -387,17 +501,30 @@ bounded by the sensor, not the sampling.
 **Sun and temperature move together.** Both rise in summer and their coefficients
 are hard to separate until the data spans varied weather — cloudy warm days and
 clear cool ones are the informative ones. Expect **two to three months** before
-coefficients stabilise.
+coefficients stabilise. `bin/weather` now records a sun measure that is not a
+heat measure — the day's shortwave energy (`sun_mj_m2`, MJ/m²) beside the air's
+high, low and mean — in `weather.csv`, one row per *ended* day, read by
+`render.weather_by_day()`. That is the input that makes the two separable; the
+cloudy warm days are in it whether or not anybody noticed them. It is the
+weather at a location rounded to 0.1°, not the pool deck's own sky, and a day
+marked `forecast` is the model's figure until the archive replaces it.
 
 **Lab values are sparse.** CYA, TA and salt update every few weeks. Between
 readings they are assumed constant, which is wrong in detail — CYA is diluted by
-rain and backwashing, TA drifts with acid.
+rain and backwashing, TA drifts with acid. Rain (`precip_in`) and evaporation
+(`et0_in`, reference evapotranspiration — a pool loses somewhat more than this
+crop-based figure) are recorded daily now, so dilution and concentration
+between lab results can be modelled rather than assumed away. Backwashing is
+still unrecorded.
 
 **Bather load is unmeasured** and lands in the residual.
 
 **The cell and spillover pH terms are collinear** unless SWG% is varied
 independently of pump hours. Left at a fixed dial, they can only be reported
-together as a combined per-pump-hour figure — see the aeration section.
+together as a combined per-pump-hour figure — see the aeration section. The
+fit does exactly that, and `checks_fit.py` holds it to it: a simulated pool
+with the dial fixed at 45% must come back with one spillover figure equal to
+`k_spill + 0.45·k_cell`, never two.
 
 **Dosing is not instantaneous.** Acid needs a full turnover to mix; a reading
 taken too soon after dosing measures a gradient, not the pool. Log the time,

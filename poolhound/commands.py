@@ -146,7 +146,176 @@ SETPOINTS = {
                              "be attributed afterwards."},
 }
 
-ACTIONS = ("set", "setpoint", "all_off", "resync")
+ACTIONS = ("set", "setpoint", "all_off", "resync", "program", "heat", "cron")
+
+# THE HEATERS' OWN SWITCH. A heater is two things on this panel, and the PDA's
+# home screen shows both: its temperature (a setpoint, above) and whether it is
+# enabled at all -- POOL HEATER / SPA HEATER, on or off. Until 2026-10-10 this
+# vocabulary had only the first, and assumed the spa heater simply follows spa
+# mode; 2,538 samples since September never once show a heater on, so that was
+# never observed, and the panel's separate switch says otherwise. `heat` is the
+# switch: 1 or 0, sent to AqualinkD's on/off route for the heater. It has the
+# heater's cooldown, kept apart from the temperature's (cooldown_key), so
+# "set the spa to 102, then heater on" is not refused as short-cycling.
+HEATERS = ("Pool_Heater", "Spa_Heater")
+
+# A CHANGE TO ONE OF THE PANEL'S OWN PROGRAMS: its ON and OFF times, in 24-hour
+# HHMM, as "1040-1555". The device is named as the panel's PROGRAM list names
+# it ("SOLAR HEAT"), which is not this vocabulary's device ids -- the programs
+# belong to the panel, and there is no switch to map them onto. So the agent
+# checks only the SHAPE here; whether that device has a program this code may
+# change is checked by the server against the Pi's last report
+# (programs.check_change) and again by AqualinkD, which refuses anything it
+# has not seen work. See docs/JANDY-PROGRAMS.md.
+PROGRAM_DEVICE = re.compile(r"[A-Z0-9][A-Z0-9 ]{0,15}")
+PROGRAM_COOLDOWN_S = 180      # a panel walk takes about a minute; one at a time
+
+
+def program_times(value):
+    """"1040-1555" -> (640, 955) minutes after midnight, or None."""
+    m = re.fullmatch(r"([01][0-9]|2[0-3])([0-5][0-9])-([01][0-9]|2[0-3])([0-5][0-9])",
+                     str(value or ""))
+    if not m:
+        return None
+    on = int(m.group(1)) * 60 + int(m.group(2))
+    off = int(m.group(3)) * 60 + int(m.group(4))
+    return None if on == off else (on, off)
+
+
+def clock_words(minutes):
+    """640 -> "10:40 AM", as the panel writes it."""
+    h, m = divmod(int(minutes) % 1440, 60)
+    return f"{h % 12 or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+# AQUALINKD'S OWN SCHEDULES, REPLACED AS A WHOLE. AqualinkD keeps them as cron
+# lines in /etc/cron.d/aqualinkd and has one way to change them: send the
+# complete list, and it rewrites the file. So a `cron` command carries every
+# entry the Pi should have afterwards, plus `expect` -- the fingerprint of the
+# list the page was editing -- and the agent refuses it if the Pi's list is no
+# longer that one, rather than overwrite somebody else's edit.
+#
+# THESE FIELDS BECOME A LINE CRON RUNS AS ROOT. AqualinkD writes them
+# unescaped into `root curl ... <url> -d value=<value>`, and copies each into
+# a 20-byte buffer (40 for the url) without checking the length. So nothing
+# typed is passed through: the time is two integers, the days one of a fixed
+# set of shapes, the url is BUILT here from a device this vocabulary knows,
+# and the value is 0 or 1.
+#
+# A HEATER MAY ONLY BE SWITCHED OFF here. A cron line fires with nothing
+# watching: no authority check, no confirmation, no switch-off afterwards.
+# Lighting a gas heater belongs to this server's scheduler, which has all
+# three. See README.md, "The panel's own programs".
+CRON_MAX = 32
+# Every switch but the salt cell's boost, whose id has a slash in it -- not a
+# url this code can read back -- and which runs for a fixed time by itself.
+CRON_DEVICES = tuple([d for d in SWITCHES if "/" not in d] + list(HEATERS))
+CRON_DAYS = ("*", "1-5", "0,6")             # every day, weekdays, weekends
+
+
+def _cron_days(v):
+    v = str(v if v is not None else "").strip()
+    if v in CRON_DAYS:
+        return v
+    if re.fullmatch(r"[0-6](,[0-6]){0,6}", v):
+        days = sorted(set(v.split(",")))
+        if len(days) == len(v.split(",")):
+            return ",".join(days)
+    return None
+
+
+def cron_entry(e):
+    """One schedule entry, rebuilt from scratch in the shape AqualinkD stores,
+    or Refused. `device` and `value` may be given in place of `url`."""
+    if not isinstance(e, dict):
+        raise Refused("each schedule must be an object")
+    dev = e.get("device")
+    if dev is None:
+        m = re.fullmatch(r"/api/([A-Za-z0-9_]{1,24})/set", str(e.get("url") or ""))
+        dev = m.group(1) if m else None
+    if dev not in CRON_DEVICES:
+        raise Refused(f"{dev!r} is not a switch AqualinkD's schedules may press")
+    if str(e.get("value")) not in ("0", "1"):
+        raise Refused("a schedule switches something on (1) or off (0)")
+    value = str(e.get("value"))
+    if dev in HEATERS and value == "1":
+        raise Refused("AqualinkD's schedules may switch a heater off, never on: "
+                      "use poolhound's own schedule, which checks before it "
+                      "lights a heater and switches it off afterwards")
+    try:
+        hour, minute = int(str(e.get("hour"))), int(str(e.get("min")))
+    except ValueError:
+        raise Refused("a schedule's time is an hour 0-23 and a minute 0-59")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise Refused("a schedule's time is an hour 0-23 and a minute 0-59")
+    days = _cron_days(e.get("dayw"))
+    if days is None:
+        raise Refused("a schedule's days are every day, weekdays, weekends, "
+                      "or a list of days 0 (Sunday) to 6")
+    if str(e.get("daym", "*")) != "*" or str(e.get("month", "*")) != "*":
+        raise Refused("a schedule runs on days of the week, every month")
+    enabled = e.get("enabled", True) in (True, 1, "1", "true")
+    return {"enabled": enabled, "min": str(minute), "hour": str(hour), "daym": "*",
+            "month": "*", "dayw": days, "url": f"/api/{dev}/set", "value": value}
+
+
+def cron_fingerprint(entries):
+    """A short fingerprint of a list of schedules, as read back from
+    AqualinkD, so two copies of the same list agree whatever produced them.
+    Order counts: it is the order AqualinkD keeps them in."""
+    import hashlib, json
+    rows = [[bool(s.get("enabled")) if not isinstance(s.get("enabled"), str)
+             else s.get("enabled") in ("1", "true"),
+             *(str(s.get(k, "")) for k in ("min", "hour", "daym", "month", "dayw",
+                                            "url", "value"))]
+            for s in entries]
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()[:16]
+
+# WHAT "OFF" MEANS FOR EACH DEVICE, for the scheduler's auto-off and its
+# safety net (schedule.py). A switch is off at 0, and so is a heater: its own
+# switch, `heat` 0 -- the panel's POOL HEATER / SPA HEATER, the thing that
+# actually stops the burner. (Until 2026-10-10 a heater had no switch here, so
+# "off" was the spa switched off, or the pool heater asked for its minimum --
+# both stand-ins for this, and the first rested on an assumption the samples
+# never showed. The temperature is left where the household put it.)
+#
+# Freeze protection and the cell output have no "off" on purpose: lowering
+# freeze protection automatically is the opposite of a safety measure, and the
+# cell output is not something that is "left on". SWG/Boost runs for a fixed
+# period and stops by itself.
+_HEATER_OFF = {d: {"action": "heat", "device": d, "value": 0} for d in HEATERS}
+_NO_OFF = {"SWG/Boost"}
+
+
+def off_command(device):
+    """The ordinary command that switches `device` off, or None if it has none.
+
+    A fresh dict each time, so a caller that stamps an id or a `by` onto it
+    cannot change what the next caller gets.
+    """
+    if device in SWITCHES and device not in _NO_OFF:
+        return {"action": "set", "device": device, "value": 0}
+    if device in _HEATER_OFF:
+        return dict(_HEATER_OFF[device])
+    return None
+
+
+def is_off(cmd):
+    """Does this command switch something OFF?
+
+    The scheduler treats the two directions differently, and the difference is
+    the whole safety argument: an ON delivered hours late lights a gas heater
+    nobody is there to use, while an OFF delivered late is still the right
+    thing to have happened. Asked of the command, not of the device, because
+    one device can be sent either.
+    """
+    a = (cmd or {}).get("action")
+    if a == "all_off":
+        return True
+    if a in ("set", "heat"):
+        return (cmd.get("value") in (0, "0", False))
+    # A temperature is never an off: a heater is stopped by its own switch,
+    # `heat` 0, and a setpoint change leaves it as it was.
+    return False
 
 # What the owner calls each circuit, when the panel cannot say.
 #
@@ -266,7 +435,40 @@ def validate(cmd, now=None):
     if action in ("all_off", "resync"):
         return out
 
+    if action == "cron":
+        v = cmd.get("value")
+        if not isinstance(v, dict) or not re.fullmatch(r"[0-9a-f]{16}", str(v.get("expect") or "")):
+            raise Refused("a schedules change carries the list it replaces (expect) "
+                          "and the new list (schedules)")
+        sch = v.get("schedules")
+        if not isinstance(sch, list) or len(sch) > CRON_MAX:
+            raise Refused(f"AqualinkD's schedules are a list of at most {CRON_MAX}")
+        rows = [cron_entry(e) for e in sch]
+        if len({cron_fingerprint([r]) for r in rows}) != len(rows):
+            raise Refused("the same schedule is in the list twice")
+        out["value"] = {"expect": v["expect"], "schedules": rows}
+        return out
+
     device = cmd.get("device")
+    if action == "heat":
+        if device not in HEATERS:
+            raise Refused(f"{device!r} is not a heater this agent will switch")
+        if cmd.get("value") not in (0, 1, "0", "1", True, False):
+            raise Refused("a heater is switched with 0 or 1")
+        out["device"] = device
+        out["value"] = 1 if cmd.get("value") in (1, "1", True) else 0
+        return out
+
+    if action == "program":
+        if not isinstance(device, str) or not PROGRAM_DEVICE.fullmatch(device):
+            raise Refused(f"{device!r} is not a device on the panel's PROGRAM list")
+        if program_times(cmd.get("value")) is None:
+            raise Refused("a program change takes ON-OFF as 24-hour HHMM-HHMM, "
+                          "two different times")
+        out["device"] = device
+        out["value"] = str(cmd.get("value"))
+        return out
+
     if action == "set":
         if device not in SWITCHES:
             raise Refused(f"{device!r} is not a switch this agent will operate")
@@ -295,7 +497,20 @@ def cooldown_for(cmd):
         return 30
     if cmd.get("action") == "resync":
         return 60
+    if cmd.get("action") == "program":
+        return PROGRAM_COOLDOWN_S
+    if cmd.get("action") == "heat":
+        return SETPOINTS[d]["cooldown_s"] if d in SETPOINTS else 300
     return (SWITCHES.get(d) or SETPOINTS.get(d) or {}).get("cooldown_s", 10)
+
+def cooldown_key(cmd):
+    """What a cooldown is counted against: the device, except that a heater's
+    TEMPERATURE and its ON/OFF are two clocks. Short-cycling is about the
+    burner starting and stopping, which is `heat`; a setpoint changed and then
+    the heater switched on a minute later is the ordinary way to start it."""
+    d = cmd.get("device")
+    return f"{d}:setpoint" if cmd.get("action") == "setpoint" and d in HEATERS else d
+
 
 def describe(cmd, cfg=None):
     """One line, for an audit entry and for the page. Must not be reversible into
@@ -310,9 +525,20 @@ def describe(cmd, cfg=None):
         return "turn everything off"
     if a == "resync":
         return "resync the panel"
+    if a == "cron":
+        # The audit keeps the count only (server.command); the list itself is
+        # read back off the Pi and reported with the schedules.
+        v = cmd.get("value")
+        n = len(v.get("schedules") or []) if isinstance(v, dict) else v
+        return (f"save AqualinkD's schedules ({n} in all)" if isinstance(n, int)
+                else "save AqualinkD's schedules")
     d = cmd.get("device")
+    if a == "program":
+        t = program_times(cmd.get("value"))
+        return (f"{d} program to on {clock_words(t[0])}, off {clock_words(t[1])}"
+                if t else f"{d} program change")
     label = label_for(d, cfg)
-    if a == "set":
+    if a in ("set", "heat"):
         return f"{label} {'on' if cmd.get('value') else 'off'}"
     if cmd.get("value") is None:
         # An action with no value -- the rest of them are named above, so this
@@ -384,7 +610,7 @@ def catalogue(cfg=None):
                           "cooldown_s": v["cooldown_s"], "why": v.get("why"),
                           "value_column": v.get("value_column")}
                       for k, v in SETPOINTS.items()},
-        "actions": list(ACTIONS), "max_age_s": MAX_AGE_S,
+        "actions": list(ACTIONS), "heaters": list(HEATERS), "max_age_s": MAX_AGE_S,
         "rate_limit": RATE_LIMIT, "rate_window_s": RATE_WINDOW_S,
     }
 

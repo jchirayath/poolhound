@@ -99,6 +99,25 @@ SEAMS = [
      r"remote pool management",
      {}),
 
+    # THE SATURATION INDEX. Home ranks it, Pool chemistry explains it and the
+    # assistant is sent it, and the labs report their own -- four readers of
+    # one relation, which is exactly the shape that grows a second copy the
+    # first time somebody wants "just the temperature factor" in a sentence.
+    # The patterns are Langelier's two temperature constants and the
+    # stabiliser's pKa, none of which has any business anywhere else.
+    ("the saturation index arithmetic", "chemicals.py",
+     r"13\.12|34\.55|CYA_PKA\s*=",
+     {}),
+
+    # CHLORINE MADE PER FULL-OUTPUT CELL-HOUR. Home's "What moves this pool"
+    # fits it as k_prod; Equipment health judges the cell by it, window by
+    # window, and did so by dividing trajectory()'s P by cell-hours -- a
+    # second estimator of the same coefficient on the same page. fit.py owns
+    # it now, and the division is what a second copy would look like.
+    ("chlorine made per full-output cell-hour", "fit.py",
+     r'\["production"\]\s*/\s*cell_h',
+     {}),
+
     ("the dose plausibility bound", "chemicals.py",
      r"MAX_BASE|plausible_amount\s*=",
      {}),
@@ -123,9 +142,12 @@ SEAMS = [
       "agent.py": "parses the panel's payload on the Pi",
       "leslies.py": "parses the vendor's payload",
       "waterguru.py": "parses the vendor's payload",
+      "weather.py": "parses Open-Meteo's payload; its stored rows are read "
+                    "back through render.weather_by_day()",
       "commands.py": "parses its own issued-at stamps",
       "corrections.py": "parses its own append-only log",
-      "watch.py": "parses its own state file"}),
+      "watch.py": "parses its own state file",
+      "schedule.py": "parses its own state file"}),
 
     # \b ON THE RIGHT, because the bare pattern also matches the -9999px that
     # parks the skip link offscreen. Found the moment _code_only stopped

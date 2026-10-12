@@ -957,6 +957,153 @@ def cell_ph_block(latest, TG):
             + ceil_txt + obs + caveat + record_note()
             + '</div>')
 
+LSI_PILL = {"aggressive": "low", "balanced": "ok", "scale-forming": "high",
+            "unknown": "unknown"}
+
+def _lsi_cell(res):
+    """An index and its word, never the colour alone."""
+    if not res:
+        return '<td class="n">—</td><td><span class="pill p-unknown">unknown</span></td>'
+    word = CH.lsi_word(res["lsi"])
+    return (f'<td class="n"><b>{res["lsi"]:+.2f}</b></td>'
+            f'<td><span class="pill p-{LSI_PILL[word]}">{word}</span></td>')
+
+# A reference pool for the public half of the saturation section: the PHTA/CPO
+# handbook's balanced worked example (pH 7.5, calcium 300, alkalinity 100),
+# with no stabiliser and the 1000 ppm TDS the trade's tables assume. It is
+# there to show what temperature alone does to one water, and it is labelled
+# as not being anybody's pool.
+REFERENCE_POOL = {"ph": 7.5, "ch": 300.0, "ta": 100.0, "cya": None, "tds": 1000.0}
+REFERENCE_TEMPS = (55.0, 84.0, 104.0)
+
+def saturation_reference():
+    """What the index is, how it is computed here, and what temperature does.
+
+    In BOTH builds. Every figure in it is about REFERENCE_POOL, which is a
+    handbook example and nobody's water -- the household's own index is
+    saturation_household(), and that never reaches the public page.
+    """
+    rp = REFERENCE_POOL
+    rows_ = []
+    for t in REFERENCE_TEMPS:
+        res = CH.saturation_index(rp["ph"], t, rp["ch"], rp["ta"], rp["cya"], rp["tds"])
+        rows_.append(f'<tr><td>{t:.0f}°F</td>{_lsi_cell(res)}</tr>')
+    cya_rows = "".join(
+        f'<tr><td>pH {p:.1f}</td><td class="n">{CH.cya_alkalinity(1.0, p):.2f}</td></tr>'
+        for p in (7.2, 7.5, 7.8))
+    return f'''<div class="card">
+    <p class="sub" style="margin:0 0 10px">The saturation index says whether water
+    is short of calcium carbonate — and will take it from plaster and grout — or
+    carrying more than it can hold, and will leave it as scale. Between
+    {CH.LSI_BALANCED[0]:+.1f} and {CH.LSI_BALANCED[1]:+.1f} it is balanced. It is
+    Langelier's index: pH minus the pH at which this water would be exactly
+    saturated, and that saturation pH is built from four terms — <b>temperature</b>,
+    <b>calcium</b>, <b>carbonate alkalinity</b> and <b>total dissolved solids</b>.</p>
+    <p class="sub" style="margin:0 0 10px"><b>Carbonate, not total, alkalinity.</b>
+    The alkalinity test also counts cyanuric acid, which buffers but cannot hold
+    calcium in solution. How much of it the test counts depends on pH, so the
+    correction is computed at the measured pH rather than as a flat third of the
+    CYA — per ppm of CYA, it is:</p>
+    <div class="scroll"><table style="max-width:320px">
+      <thead><tr><th>At</th><th>ppm of TA per ppm CYA</th></tr></thead>
+      <tbody>{cya_rows}</tbody></table></div>
+    <p class="sub" style="margin:14px 0 10px"><b>Temperature is the term that moves
+    on its own.</b> Warm water holds less calcium carbonate, so the same water reads
+    higher hot and lower cold. A handbook example pool — pH {rp["ph"]:.1f}, calcium
+    {rp["ch"]:.0f}, alkalinity {rp["ta"]:.0f}, no stabiliser; not this pool — at
+    three temperatures:</p>
+    <div class="scroll"><table style="max-width:420px">
+      <thead><tr><th>Water</th><th>Index</th><th>Reads as</th></tr></thead>
+      <tbody>{"".join(rows_)}</tbody></table></div>
+    <p class="sub" style="margin:14px 0 0">Which is why one number from a lab
+    counter is not the answer: the plaster cares what the index is on the coldest
+    night, and the heater exchanger cares what it is at the spa's setpoint.</p>
+  </div>'''
+
+
+def saturation_household(sat):
+    """THIS pool's index -- private build only, marked so the build can refuse it.
+
+    render.HOUSEHOLD_LSI_MARK is the marker render.build() asserts is absent
+    from the public page. The figures here are this household's water at this
+    household's temperatures; the argument for publishing the chemistry
+    reference -- that it is useful to somebody else's pool -- does not reach
+    them, the same reasoning that moved Home behind the sign-in.
+    """
+    if sat is None:
+        return ""
+    # The marker is render's, not retyped: a card that spelled it differently
+    # would sail past the very assertion it exists to trip.
+    from .render import HOUSEHOLD_LSI_MARK
+    head = f'<div class="card" {HOUSEHOLD_LSI_MARK}>'
+    if sat["missing"]:
+        miss = sat["missing"]
+        return (head + '<p class="empty">No saturation index for this pool: it needs '
+                f'{" and ".join(miss)}, and '
+                f'{"there is none" if len(miss) == 1 else "none of those is"} on file. '
+                'It cannot be computed around a typical value — that would be an '
+                'answer about some other water. Record one on Settings, or wait for '
+                'the next lab result.</p></div>')
+    if not sat["now"]:
+        return (head + '<p class="empty">Every chemistry reading the index needs is on '
+                'file, but the panel has not reported a water temperature with the '
+                'pump running — and a temperature read with no water moving is the '
+                'pipe’s, not the pool’s. It appears after the next run.</p></div>')
+
+    def where(x, label):
+        return f'<td>{label}</td><td>{x["temp_f"]:.0f}°F<span class="rel">{esc(x["age"])}</span></td>'
+
+    rows_ = []
+    n = sat["now"]
+    rows_.append('<tr>' + where(n, "The pool, now" if not n["pump_off_now"] else
+                                "The pool, when the pump last ran")
+                 + _lsi_cell(n["result"]) + '</tr>')
+    if sat["spa"]:
+        s = sat["spa"]
+        rows_.append('<tr>' + where(s, "The spa, at its setpoint" if s["kind"] == "setpoint"
+                                    else "The spa, last measured")
+                     + _lsi_cell(s["result"]) + '</tr>')
+    if sat["coldest"]:
+        c = sat["coldest"]
+        rows_.append('<tr>' + where(c, f"Coldest in {c['days']} days")
+                     + _lsi_cell(c["result"]) + '</tr>')
+    for r in sat["reported"]:
+        rows_.append(f'<tr><td>{esc(r["source"])}, as reported</td>'
+                     f'<td>temperature not reported<span class="rel">{esc(r["age"])}'
+                     f'</span></td>' + _lsi_cell({"lsi": r["value"]}) + '</tr>')
+
+    ins = sat["inputs"]
+    rests = " · ".join(f'{render_name} {esc(ins[k]["source"])} {esc(ins[k]["age"])}'
+                       for k, render_name in (("ph", "pH"), ("ch", "calcium"),
+                                              ("ta", "alkalinity"), ("cya", "CYA"),
+                                              ("tds", "TDS"))
+                       if ins.get(k))
+    o = sat["oldest"]
+    res = n["result"]
+    t = res["terms"]
+    pump = (' <b>The pump is off right now</b>, so the first row is the water as '
+            'it was when it last ran; a probe with no water moving past it reads '
+            'the pipe.' if n["pump_off_now"] else "")
+    labs = ("" if not sat["reported"] else
+            ' <b>The labs’ own figures are beside it, not averaged into it.</b> '
+            'A lab computes its index at a temperature it does not report, on a '
+            'sample carried indoors; where the two differ, temperature is the first '
+            'explanation to rule out, before either instrument.')
+    return f'''{head}
+    <div class="scroll"><table>
+      <thead><tr><th>Where</th><th>Water</th><th>Index</th><th>Reads as</th></tr></thead>
+      <tbody>{"".join(rows_)}</tbody></table></div>
+    <p class="sub" style="margin:14px 0 0">Computed from {rests}. The oldest of
+    those is {esc(o["name"])}, {esc(o["age"])}, and the index is no fresher than
+    that.{pump}{labs}</p>
+    <p class="sub" style="margin:10px 0 0">The terms, now: temperature
+    {t["temperature"]:.2f}, calcium {t["calcium"]:.2f}, carbonate alkalinity
+    {t["alkalinity"]:.2f} ({res["carbonate_alk"]:.0f} of the {ins["ta"]["value"]:.0f}
+    ppm measured; {res["cya_alk"]:.0f} is cyanurate), dissolved solids
+    {t["tds"]:.2f}. {sat["tds_note"]} {sat["cya_note"]}</p>
+  </div>'''
+
+
 def record_note():
     """What the stored readings actually support, as opposed to what would be
     satisfying to conclude. Written from the files rather than as prose, so it
@@ -1090,6 +1237,10 @@ def panel(public=False):
         return hocl[ks[-1]]
 
     ta = num(latest.get("ta"))
+    # This pool's computed index, on the authenticated build only. Not computed
+    # at all for the public one -- see saturation_household().
+    from .render import current_saturation
+    SAT = None if public else current_saturation()
     # AN EMPTY STATE, NOT AN EMPTY SECTION. With no pH or no calcium this left
     # `tension` as "", so the page rendered the "Where the advice conflicts"
     # heading, a lede promising "this is the one that matters here", and then
@@ -1148,7 +1299,29 @@ def panel(public=False):
         si_move = ph - 7.4
         si_drop = abs(si_move)
         si_now = num(latest.get("saturation_index"))
-        if si_now is None:
+        s_res = ((SAT or {}).get("now") or {}).get("result")
+        if s_res:
+            # COMPUTED AT THE WATER'S TEMPERATURE, where this build may say so.
+            # The lab's figure was the only one this card had, and it is an
+            # index at a temperature nobody reported -- so the projection it
+            # anchored was a projection for water that may be fifteen degrees
+            # off this pool's. Recomputed at 7.4 rather than subtracted, because
+            # the cyanurate share of the alkalinity moves with pH as well.
+            ins = SAT["inputs"]
+            at74 = CH.saturation_index(7.4, s_res["temp_f"], ins["ch"]["value"],
+                                       ins["ta"]["value"],
+                                       ins["cya"]["value"] if ins.get("cya") else None,
+                                       SAT["tds"])
+            proj = at74["lsi"] if at74 else s_res["lsi"] - si_move
+            si_clause = (f" Computed from this pool's readings at the water's "
+                         f"{s_res['temp_f']:.0f}°F the index is "
+                         f"<b>{s_res['lsi']:+.2f}</b>, so pH 7.4 at today's calcium of "
+                         f"{ch:.0f} ppm would put the water near <b>{proj:+.2f}</b>"
+                         + (" — aggressive enough to pull calcium out of plaster and "
+                            "grout rather than deposit it." if proj < CH.LSI_BALANCED[0]
+                            else ", which the plaster can live with.")
+                         + " See the saturation section for the cold and the spa.")
+        elif si_now is None:
             si_clause = (" No saturation index has been reported, so where pH 7.4 "
                          "would leave the water cannot be projected.")
         else:
@@ -1248,6 +1421,7 @@ def panel(public=False):
                             "test result and they become specific to this ") +
                      "water.")),
         cards="".join(card(f) for f in F), matrix=matrix(), tension=tension,
+        saturation=saturation_household(SAT) + saturation_reference(),
         cell_ph=cell_ph_block(latest, TG),
         dose_response=dose_response_block(latest),
         src_line=html.escape(src_line or "no lab tests on file"),
@@ -1358,6 +1532,7 @@ moving.</p>
   <a href="#ph">pH</a><a href="#free_cl">Free chlorine</a><a href="#ta">Alkalinity</a>
   <a href="#cya">Cyanuric acid</a><a href="#ch">Calcium</a><a href="#salt">Salt</a>
   <a href="#matrix">Interaction map</a><a href="#doses">Dose table</a><a href="#tension">The tension</a>
+  <a href="#saturation">Saturation index</a>
 </div>
 
 <section>@@cards@@</section>
@@ -1383,6 +1558,13 @@ moving.</p>
   <p class="sub">Correct rules can still contradict each other. This is the one that
   matters here.</p>
   @@tension@@
+</section>
+
+<section id="saturation">
+  <h2>Saturation index, at the water's own temperature</h2>
+  <p class="sub">Whether the water is dissolving the plaster or scaling the heater
+  depends on how warm it is, and the same water does both across a year.</p>
+  @@saturation@@
 </section>
 
 <section id="matrix">

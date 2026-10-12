@@ -185,6 +185,8 @@
 			# gone: "/api/pool-shape/*" would have swept /compute back in.
 			path /api/pool-shape
 			path /api/notify-test /api/refresh /api/lab-correction
+			# Marks a filter or cell cleaned: a write, and it names who.
+			path /api/maintenance
 			# Asking the assistant sends this pool's readings to a provider
 			# and spends money doing it. Gated like every other route that
 			# acts rather than reads.
@@ -196,6 +198,13 @@
 			# /api/rows pages through the same history /api/export hands out
 			# whole. Gated for the same reason.
 			path /api/rows
+			# Schedules: creating and cancelling one is a deferred press of
+			# the controls, and the list says what the house will do next.
+			path /api/schedule /api/schedule/delete /api/schedules
+			# What the panel and AqualinkD will run, and when: the house's routine.
+			path /api/panel-schedules
+			# Scenes: one tap that presses several controls, and the list of them.
+			path /api/scene /api/scene/delete /api/scenes
 			# The whole pool history, as files. Read-only, but it is the most
 			# sensitive read there is — every measurement, every dose, every
 			# change and who made it. The wildcard is wanted here, unlike on

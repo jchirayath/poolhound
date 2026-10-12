@@ -44,6 +44,11 @@ from .render import rows, collector_health, ago, num, best_lab, targets, when, n
 # Sources worth waking someone for. Leslie's is deliberately absent: it only
 # updates when a sample is physically carried into a store, so its silence is
 # never a fault and alerting on it would train the alert to be ignored.
+# Weather is absent for a different reason with the same answer: nothing is
+# lost while it is quiet, because the next run that works asks the archive for
+# every day still missing, so its silence is a delay and never a gap. The
+# Collection card grades it late after two missed days, which is the place a
+# delay belongs; a 3 a.m. email about yesterday's sunshine is not.
 ALERT_ON = {"sample", "waterguru"}
 
 # Equipment worth being told about the moment it starts. The gas heaters are on
@@ -849,6 +854,45 @@ def _run(cfg, now, quiet, force):
     if newest_sample_ts and not undeliverable_event:
         st["last_sample_ts"] = newest_sample_ts.isoformat()
 
+    # ---------------------------------------------------------- filter
+    # ONE message per dirty filter, at info. A loading filter costs turnover
+    # and chlorine over weeks, not tonight, so it never pages anybody -- but
+    # the threshold crossing is a clear, dated event, and Home is somewhere a
+    # person has to go and look. Keyed to the cleaning it is measured from, so
+    # marking the filter cleaned is what re-arms it, and recorded only on a
+    # send that happened, for the reason every branch above gives.
+    if notify_cfg.get("filter", True):
+        from . import equipment as _eq
+        try:
+            f = _eq.filter_loading(
+                samples, _eq.done(rows(_eq.FILE), "filter", when), now, when, num)
+        except Exception as e:                       # noqa: BLE001
+            f = {"grade": "insufficient"}
+            if not quiet:
+                print(f"  filter check could not run: {type(e).__name__}: {e}")
+        epoch = (f.get("cleaned") or f.get("since") or now).isoformat()
+        if (f.get("grade") == "measured" and f.get("status") == "clean"
+                and st.get("filter_alerted") != epoch):
+            ok = notify(
+                title="The filter is due a clean",
+                subtitle=f"{abs(f['drift']) * 100:.0f}% less draw at {f['rpm']:.0f} RPM",
+                message=(f"At its usual speed the pump draws {f['current']:.0f} W "
+                         f"against {f['baseline']:.0f} W after the last cleaning. "
+                         f"A loading filter moves less water, and less water "
+                         f"through the cell is less chlorine. Mark it cleaned on "
+                         f"Home under Equipment health once it is done."),
+                # "#home", not the section's id: site_url() picks the private
+                # build from the TAB an anchor names, and a section id is not
+                # one, so it would have linked to the public landing page.
+                url=site_url(cfg, "#home"), cfg=cfg, severity="info")
+            raised += 1
+            sent += 1 if ok else 0
+            undelivered += 0 if ok else 1
+            if ok:
+                st["filter_alerted"] = epoch
+            if not quiet:
+                print(f"  {'NOTIFIED ' if ok else 'COULD NOT NOTIFY'} filter due a clean")
+
     # ---------------------------------------------------------- chemistry
     if notify_cfg.get("chemistry", True):
         readings = rows("readings.csv")
@@ -927,6 +971,59 @@ def _run(cfg, now, quiet, force):
                 if not quiet:
                     print(f"  {'RECOVERED' if ok else 'COULD NOT SAY RECOVERED'} {key}")
 
+    # ---------------------------------------------------------- schedules
+    r2, s2, u2 = _watch_schedule(cfg, now, st, quiet, force)
+    raised += r2
+    sent += s2
+    undelivered += u2
+
+    # ---------------------------------------------------------- anomalies
+    r3, s3, u3 = _watch_anomalies(cfg, now, st, quiet, force, samples=samples)
+    raised += r3
+    sent += s3
+    undelivered += u3
+
+    # ---------------------------------------------------------- the shelf
+    # A jug running low is worth one notice, once, and no reminder: nothing is
+    # wrong with the water, and Home already carries it as "keep an eye on".
+    # "info", so email holds it to its own bar -- the default "serious" bar
+    # keeps it off the phone unless somebody lowered it on purpose.
+    #
+    # OFF UNLESS ASKED FOR. On the server there is no desktop, so an info
+    # notice below the email bar reaches nobody, and an alert nobody could be
+    # sent is counted undelivered -- which turns this run red over a shopping
+    # list. Somebody who sets notify.stock = true has said where it should go.
+    if notify_cfg.get("stock", False):
+        from . import stock as _stock
+        from .render import stock_now
+        shelf_state = st.setdefault("stock", {})
+        try:
+            short = {e["chem"]: e for e in _stock.needs_buying(stock_now())}
+        except Exception as e:
+            short = {}
+            if not quiet:
+                print(f"  stock: could not work it out ({type(e).__name__}: {e})")
+        for chem, e in short.items():
+            rec = shelf_state.setdefault(chem, {"told": False})
+            if rec["told"]:
+                continue
+            title, detail = _stock.action_text(e)
+            ok = notify(title=title, message=detail,
+                        url=site_url(cfg, "#chemicals"), cfg=cfg, severity="info")
+            raised += 1
+            if ok:
+                rec["told"] = True
+                sent += 1
+            else:
+                undelivered += 1
+            if not quiet:
+                print(f"  {'NOTIFIED ' if ok else 'COULD NOT NOTIFY'} {title}")
+        # Re-armed when the shelf is stocked again, silently: "you bought
+        # acid" is not news to the person who bought it.
+        for chem in list(shelf_state):
+            if chem not in short:
+                shelf_state.pop(chem)
+
     st["last_run"] = now.isoformat()
     save_state(cfg, st)
 
@@ -969,6 +1066,168 @@ def _run(cfg, now, quiet, force):
     tally["detail"] = (f"{raised} alert(s) raised, all delivered" if raised
                        else "all clear")
     return 0, tally
+
+def _watch_schedule(cfg, now, st, quiet, force):
+    """The scheduler, from OUTSIDE the process that runs it.
+
+    Two things only a different process can see. The thread stamps alive_at
+    into schedules.json every few minutes; if that goes stale, the thing that
+    would have switched the spa heater off is not running, and it cannot say
+    so itself. And an alert the scheduler could not deliver -- no relay, a
+    refused login -- is retried here on the watchdog's cadence, because the
+    scheduler only tries once and a heater that did not switch off is the one
+    message that must not be lost to a transient SMTP error.
+
+    Returns (raised, sent, undelivered) for the run's tally.
+    """
+    from . import schedule
+    raised = sent = undelivered = 0
+    utc = schedule.utcnow()
+    rec = st.setdefault("scheduler", {"bad": False, "last_notified": None})
+    data = config.data_dir(cfg)
+    alive = schedule.alive_at(data=data, now=utc)
+    stale = alive is not None and (utc - alive).total_seconds() > schedule.ALIVE_STALE_S
+    if stale:
+        due = force or not rec.get("bad")
+        if rec.get("bad") and rec.get("last_notified") and not force:
+            try:
+                due = (now - dt.datetime.fromisoformat(rec["last_notified"])) > REMIND_EVERY
+            except ValueError:
+                due = True
+        rec["bad"] = True
+        if due:
+            ok = notify(title="The scheduler has stopped",
+                        subtitle=f"Last alive {ago(alive.astimezone().isoformat())}",
+                        message="Nothing scheduled will run, and no automatic off — "
+                                "including the household limit on the spa heater — "
+                                "will happen until it is running again. The server "
+                                "log says why; restarting poolhound starts it.",
+                        url=site_url(cfg, "#control"), urgent=True,
+                        cfg=cfg, severity="serious")
+            raised += 1
+            if ok:
+                rec["last_notified"] = now.isoformat()
+                sent += 1
+            else:
+                undelivered += 1
+            if not quiet:
+                print(f"  {'NOTIFIED ' if ok else 'COULD NOT NOTIFY'} scheduler stopped")
+    elif rec.get("bad"):
+        rec.update({"bad": False, "last_notified": None})
+        if not quiet:
+            print("  scheduler is running again")
+
+    late = schedule.unalerted(data=data, now=utc)
+    if late:
+        ids = schedule.send_alerts(late, cfg)
+        raised += len(late)
+        sent += len(ids)
+        undelivered += len(late) - len(ids)
+        if ids:
+            schedule.mark_alerted(ids, data=data, now=utc)
+        if not quiet:
+            print(f"  scheduler alerts: {len(ids)} of {len(late)} delivered on retry")
+    return raised, sent, undelivered
+
+
+def anomaly_inputs(cfg, samples=None, now=None):
+    """What anomaly.detect() needs beyond the samples, read through the same
+    loaders the page uses -- so the alert and Home cannot disagree about the
+    salt floor, the cleanings or what the household limit did."""
+    from . import equipment as _eq, schedule as _sch
+    les = rows("leslies.csv")
+    LAB = best_lab((newest(rows("lab.csv")), "WaterGuru"), (newest(les), "Leslie's"))
+    TG = targets(LAB, (cfg.get("pool") or {}).get("sanitiser"),
+                 newest(les).get("sanitizer", ""))
+    try:
+        net = _sch.net_lookup(data=config.data_dir(cfg))
+    except Exception:                                # noqa: BLE001
+        net = None          # no schedules file is "the net did nothing"
+    return {"salt_low": (TG.get("salt") or (None,))[0],
+            "cleans": _eq.done(rows(_eq.FILE), "filter", when), "net": net}
+
+
+def _watch_anomalies(cfg, now, st, quiet, force, samples=None, notify_fn=None,
+                     inputs=None):
+    """Equipment anomalies: say each once when it starts and once when it ends.
+
+    The detecting is anomaly.py's and so is deciding what is due; this only
+    sends, and records a send that HAPPENED -- an undelivered alert stays
+    untold and is offered again next run, the rule every branch above learned.
+    Returns (raised, sent, undelivered).
+    """
+    from . import anomaly as A
+    send = notify_fn or notify
+    raised = sent = undelivered = 0
+    samples = rows("samples.csv") if samples is None else samples
+    try:
+        occs = A.detect(samples, now, when, num, cfg=cfg,
+                        **(anomaly_inputs(cfg, samples, now) if inputs is None
+                           else inputs))
+    except Exception as e:                           # noqa: BLE001
+        # A detector that raises must not take the collector and chemistry
+        # alarms down with it -- but it must not be silent either.
+        if not quiet:
+            print(f"  anomalies could not be checked: {type(e).__name__}: {e}")
+        return 0, 0, 0
+    first = "anomaly" not in st
+    state = st.setdefault("anomaly", {})
+    for kind, o in A.plan(occs, state, now, first_run=first and not force):
+        sev = o.get("severity") or "serious"
+        if kind == "recover":
+            title, msg = A.recovery_text(o)
+            ok = send(title=title, message=msg, url=site_url(cfg, "#home"),
+                      cfg=cfg, severity=sev)
+        else:
+            spec = A.RULES[o["rule"]]
+            ok = send(title=o["title"],
+                      subtitle=("Still open, since " if kind == "remind" else "Since ")
+                               + f"{o['start']:%-d %b %H:%M}",
+                      message=f"{o['detail']}\n\n{spec['why']}",
+                      facts=o.get("facts") or (), url=site_url(cfg, "#home"),
+                      urgent=bool(o.get("urgent")), cfg=cfg, severity=sev)
+        raised += 1
+        key = o.get("key") or next((k for k, r in state.items() if r is o), None)
+        if ok:
+            sent += 1
+            if kind == "recover":
+                # Kept, closed, until it leaves the window: dropping it would
+                # make the same ended occurrence look new on the next run.
+                if key in state:
+                    state[key]["open"] = False
+            else:
+                state[key] = A.record(o, told=now.isoformat(timespec="seconds"))
+        else:
+            undelivered += 1
+            if kind == "alert":
+                state.setdefault(key, A.record(o, told=None))
+        if not quiet:
+            print(f"  {'NOTIFIED ' if ok else 'COULD NOT NOTIFY'} "
+                  f"[{kind}] {o.get('title')}")
+    # What was seen and needs no telling: the first run's adopted history, an
+    # info rule nobody asked to hear, a run the household limit dealt with.
+    # Recorded so a later run does not take it for new, and kept open/closed
+    # truthfully so a recovery is offered only for something that was told.
+    for o in occs:
+        rec = state.get(o["key"])
+        if rec is None:
+            if o.get("notify") and not o.get("handled") and not (first and not o["open"]):
+                continue                        # due, and its send failed above
+            rec = state[o["key"]] = A.record(o, told=None)
+            rec["adopted"] = True
+        # A told occurrence that has ended stays "open" here until its
+        # recovery is DELIVERED -- marking it closed first would mean nobody
+        # is ever told it ended.
+        if rec.get("told") and rec.get("open") and not o["open"]:
+            continue
+        rec["open"] = bool(o["open"])
+    # Forget what has fallen out of the window and is not open.
+    horizon = (now - A.LOOKBACK - dt.timedelta(days=1)).isoformat()
+    for k in [k for k, r in state.items()
+              if not r.get("open") and str(r.get("start") or "") < horizon]:
+        state.pop(k)
+    return raised, sent, undelivered
+
 
 if __name__ == "__main__":
     sys.exit(main())

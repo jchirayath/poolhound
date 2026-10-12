@@ -1251,6 +1251,89 @@ def _register_catalogue():
     ])
 
 
+def _register_weather():
+    """Breakers for the weather collector: each is the defect its case names.
+
+    Every one swaps a module attribute and hands back the swap's undo, so a
+    proof leaves the module exactly as it found it.
+    """
+    import datetime as _dt
+    from . import checks_weather as W, collection, weather
+
+    def _swap(obj, name, value):
+        real = getattr(obj, name)
+        setattr(obj, name, value)
+        return lambda: setattr(obj, name, real)
+
+    def _store_today_and_tomorrow():
+        """Two days late on the cutoff: today's half-day and a forecast in."""
+        real = weather.parse
+        return _swap(weather, "parse",
+                     lambda payload, source, fetched, lat, lon, today:
+                     real(payload, source, fetched, lat, lon,
+                          today + _dt.timedelta(days=2)))
+
+    def _trust_whatever_unit_arrives():
+        return _swap(weather, "DAILY",
+                     {k: (c, None, s) for k, (c, _u, s) in weather.DAILY.items()})
+
+    def _send_the_house():
+        """Four places: a coordinate that names a garden."""
+        return _swap(weather, "ROUND_PLACES", 4)
+
+    def _round_finer_than_the_docs_promise():
+        return _swap(weather, "ROUND_DEG", 0.01)
+
+    def _let_the_forecast_outrank_the_archive():
+        return _swap(weather, "RANK", {"forecast": 2, "archive": 1})
+
+    def _take_the_hosts_date():
+        """The date on a UTC host, which at 07:30Z is the pool's tomorrow."""
+        return _swap(weather, "today_local",
+                     lambda now=None: (now or _dt.datetime.now(_dt.timezone.utc))
+                     .astimezone(_dt.timezone.utc).date())
+
+    def _forget_the_history():
+        """Ask the archive for the settling window only, never the backfill."""
+        real = weather.archive_window
+        return _swap(weather, "archive_window",
+                     lambda existing, start, today, settle=weather.SETTLE_DAYS:
+                     real(existing, today - _dt.timedelta(days=settle), today, settle))
+
+    def _keep_weather_from_before_the_pool():
+        return _swap(weather, "history_start", lambda data: None)
+
+    def _grade_not_set_up_as_never_run():
+        return _swap(collection, "_weather_off", lambda: None)
+
+    PROVES.extend([
+        (W.t_a_saved_response_parses_into_ended_days_only, _store_today_and_tomorrow,
+         "today's half-day and tomorrow's forecast stored as days"),
+        (W.t_a_unit_that_is_not_the_one_asked_for_is_refused,
+         _trust_whatever_unit_arrives,
+         "a Celsius figure stored under a Fahrenheit column"),
+        (W.t_only_the_rounded_location_can_leave, _send_the_house,
+         "a coordinate precise enough to name the house"),
+        (W.t_the_documents_state_the_rounding_the_code_applies,
+         _round_finer_than_the_docs_promise,
+         "a privacy promise coarser than the rounding applied"),
+        (W.t_the_archive_supersedes_and_the_forecast_fills_a_blank,
+         _let_the_forecast_outrank_the_archive,
+         "a forecast standing in for the archive's observation"),
+        (W.t_the_day_is_the_pools_day, _take_the_hosts_date,
+         "the host's date taken for the pool's"),
+        (W.t_the_archive_is_asked_for_what_is_missing_and_what_may_be_revised,
+         _forget_the_history,
+         "a backfill that never asks for the history"),
+        (W.t_a_run_from_saved_files_writes_the_pools_days_once,
+         _keep_weather_from_before_the_pool,
+         "weather stored for days before the pool existed"),
+        (W.t_an_optional_source_nobody_set_up_is_not_broken,
+         _grade_not_set_up_as_never_run,
+         "an install that never opted in graded as broken"),
+    ])
+
+
 def _register_assistant():
     """Breakers for the assistant: what it sends, and who may ask."""
     from . import checks_assistant as A, assistant, access, render
@@ -1999,6 +2082,7 @@ _register_photo()
 _register_charts()
 _register_assistant()
 _register_catalogue()
+_register_weather()
 
 
 # THE DETECTORS THAT DO NOT YET DECLARE A BREAKER, named.
@@ -2237,6 +2321,37 @@ def _register_deploy_timezone():
         (G.t_the_deployment_pins_the_pools_timezone,
          _move_the_container_to_another_timezone,
          "a container pinned to a zone the pool is not in"))
+
+
+def _grade_a_stale_server_green():
+    """Demote "behind origin/main" from a failure to a warning.
+
+    The honest break: this is --check as it was on 2026-09-28, printing a line
+    about the drift — or not — and exiting 0 over a server three commits behind.
+    """
+    return _break_source_file(
+        "deploy/rev-freshness.sh",
+        'behind*)  fail "BEHIND — $WHAT ($short) is ${r#behind } commit(s) behind origin/main',
+        'behind*)  warn "BEHIND — $WHAT ($short) is ${r#behind } commit(s) behind origin/main')
+
+
+def _hand_the_revision_to_git_unvalidated():
+    """Accept anything as a hash, so a string read off the server reaches git."""
+    return _break_source_file("deploy/rev-freshness.sh",
+                              "re_hex='^([0-9a-f]{7,40})(-dirty)?$'",
+                              "re_hex='^(.+)()$'")
+
+
+def _register_deploy_freshness():
+    from . import checks_gates as G
+    PROVES.extend([
+        (G.t_a_deployed_revision_is_graded_against_main,
+         _grade_a_stale_server_green,
+         "a server behind origin/main graded as current"),
+        (G.t_a_deployed_revision_is_graded_against_main,
+         _hand_the_revision_to_git_unvalidated,
+         "a REVISION off the server handed to git unvalidated"),
+    ])
 
 
 def _pin_the_demo_pool_ahead_of_the_clock():
@@ -2645,11 +2760,466 @@ def _register_upkeep():
     ])
 
 
+# -------------------------------------------------------------------- stock
+#
+# Each breaker is the plausible wrong version of one line of stock.py: a
+# shelf figure that drifts is a jug that runs out on a Saturday, and one that
+# goes negative is a page telling somebody they own minus a gallon of acid.
+def _stock(needle, replacement):
+    return lambda: _break_live_code("poolhound/stock.py", "poolhound.stock",
+                                    needle, replacement)
+
+
+def _forget_stock_is_history():
+    """Drop stock.csv from the history list -- the nightly tarball then leaves
+    out the one record of what was bought, and seed_config() would call a
+    directory holding only it an empty one."""
+    from . import config
+    real = config.HISTORY_FILES
+    config.HISTORY_FILES = tuple(f for f in real if f != "stock.csv")
+    def undo():
+        config.HISTORY_FILES = real
+    return undo
+
+
+def _register_stock():
+    from . import checks_stock as K
+    PROVES.extend([
+        (K.t_on_hand_is_the_count_plus_purchases_minus_doses,
+         _stock("used_after = lambda t: t > t0", "used_after = lambda t: t >= t0"),
+         "a dose stamped the minute of the count taken off it twice"),
+        (K.t_without_a_count_the_first_purchase_is_the_baseline,
+         _stock("used_after = lambda t: t >= t0", "used_after = lambda t: True"),
+         "a dose from before anything was recorded charged to the shelf"),
+        (K.t_units_convert_and_a_solid_is_never_a_volume,
+         _stock('ok, why = CH.plausible_stock(chem, amount, unit, zero_ok=kind == "stocktake")',
+                'ok, why = True, ""'),
+         "a gallon of salt accepted as stock"),
+        (K.t_a_negative_stock_asks_for_a_count,
+         _stock('if h["base"] < -1e-6:\n            e["state"] = "overdrawn"',
+                'if False:\n            e["state"] = "overdrawn"'),
+         "a record showing more used than bought read as an empty shelf"),
+        (K.t_without_a_rate_it_says_so_and_falls_back_to_the_doses,
+         _stock("amounts = [_base(d, num) for _, d in ds[:-1]]",
+                "amounts = [_base(d, num) for _, d in ds]"),
+         "the newest dose charged to an interval that has not happened"),
+        (K.t_a_bound_gives_at_least_and_is_never_low,
+         _stock('("low" if r["kind"] != "bounded" and e["weeks"] < low_weeks',
+                '("low" if e["weeks"] < low_weeks'),
+         "a ceiling on the rate read as a shelf running low"),
+        (K.t_weaker_acid_on_the_shelf_goes_faster,
+         _stock("per_day *= acid_pct / stock_pct", "per_day *= 1.0"),
+         "half-strength acid assumed to last as long as full"),
+        (K.t_a_purchase_price_fills_a_gap_and_settings_wins,
+         _stock("        if own:\n            out[chem] = own\n            continue",
+                "        if False:\n            out[chem] = own\n            continue"),
+         "a receipt overriding the price somebody typed in Settings"),
+        (K.t_low_stock_is_the_last_thing_on_home,
+         _stock('HOME_PRI = "watch"', 'HOME_PRI = "do"'),
+         "a shopping list lighting Home's badge"),
+        (K.t_stock_is_history_and_is_backed_up, _forget_stock_is_history,
+         "stock.csv left out of the history the backup takes"),
+        (K.t_the_routes_write_edit_and_remove_one_row,
+         lambda: _break_live_code(
+             "poolhound/server.py", "poolhound.server",
+             "[row if r is target else r for r in rows])\n"
+             "    audit.record(\"stock.edit\"",
+             "rows + [row])\n"
+             "    audit.record(\"stock.edit\""),
+         "an edit appended as a second row instead of made in place"),
+        (K.t_bin_chem_records_stock_and_refuses_a_solid_by_volume,
+         lambda: _break_source_file(
+             "poolhound/chem.py",
+             "    if why:\n        usage(why)\n    row.update({\"by\": access.CONSOLE",
+             "    if False:\n        usage(why)\n    row.update({\"by\": access.CONSOLE"),
+         "bin/chem writing whatever the validator refused"),
+    ])
+
+
+# ---------------------------------------------------------- saturation index
+#
+# Each breaker is the plausible wrong version of one line: the unit slip, the
+# flat rule of thumb, the guessed default, the probe read with no water moving
+# past it, and the household figure computed for the page anonymous visitors
+# get. Every one of them would still print a confident index.
+def _register_saturation():
+    from . import checks_saturation as S
+
+    def chem(needle, replacement):
+        return lambda: _break_live_code("poolhound/chemicals.py",
+                                        "poolhound.chemicals", needle, replacement)
+
+    def rend(needle, replacement):
+        return lambda: _break_live_code("poolhound/render.py",
+                                        "poolhound.render", needle, replacement)
+
+    PROVES.extend([
+        (S.t_the_index_matches_the_handbooks_worked_examples,
+         chem("b = -13.12 * _math.log10(temp_c + 273.0) + 34.55",
+              "b = -13.12 * _math.log10(temp_f + 273.0) + 34.55"),
+         "a Fahrenheit reading put through the formula as Celsius"),
+        (S.t_the_stabiliser_correction_is_taylors_table,
+         chem("return cya * CYA_TO_CACO3 / (1.0 + 10.0 ** (CYA_PKA - ph))",
+              "return cya / 3.0"),
+         "the flat third-of-the-CYA rule of thumb"),
+        (S.t_a_missing_reading_is_named_not_guessed,
+         rend("missing = [w for k, w in SAT_REQUIRED if ins[k] is None]",
+              "missing = []"),
+         "a missing calcium reading passed over in silence"),
+        (S.t_a_temperature_without_flow_is_not_the_waters,
+         rend("r = _c.drop_stale_flow_readings(dict(s))", "r = dict(s)"),
+         "the pipe's temperature read as the water's with the pump off"),
+        (S.t_the_oldest_reading_bounds_the_index,
+         rend("k, e = min(used, key=", "k, e = max(used, key="),
+         "the freshest input reported as the one that bounds the index"),
+        (S.t_home_ranks_the_index_where_it_changes_the_advice,
+         rend("if ca_card is None and s_now is not None and s_now < LO:",
+              "if False:"),
+         "aggressive water with calcium in band left off Home"),
+        (S.t_the_public_build_carries_no_household_index,
+         lambda: _break_live_code(
+             "poolhound/chemistry.py", "poolhound.chemistry",
+             "SAT = None if public else current_saturation()",
+             "SAT = current_saturation()"),
+         "this household's index computed for the public page"),
+        (S.t_the_assistant_is_sent_the_index_as_a_fixed_field,
+         lambda: _break_live_code(
+             "poolhound/assistant.py", "poolhound.assistant",
+             '    a("SATURATION INDEX (Langelier',
+             '    _ = ("SATURATION INDEX (Langelier'),
+         "the index left out of what the model is told"),
+    ])
+
+
+# ------------------------------------------------------------ the coefficient fit
+#
+# Each breaker is the plausible wrong version of one line of fit.py, and every
+# one of them still prints a confident table. That is the whole danger of a
+# fit: the broken one looks exactly like the working one.
+def _register_fit():
+    from . import checks_fit as F, fit
+
+    def code(needle, replacement, rel="poolhound/fit.py", mod="poolhound.fit"):
+        return lambda: _break_live_code(rel, mod, needle, replacement)
+
+    def _sun_from_midnight():
+        """Spread the sun from midnight: the night before a reading gets some."""
+        real = fit.SUN_FROM_H
+        fit.SUN_FROM_H = 0.0
+        return lambda: setattr(fit, "SUN_FROM_H", real)
+
+    def _never_merge():
+        """Fit two collinear terms separately and print whatever splits out."""
+        real = fit.COND_MAX, fit.CORR_MAX
+        fit.COND_MAX, fit.CORR_MAX = float("inf"), 2.0
+
+        def undo():
+            fit.COND_MAX, fit.CORR_MAX = real
+        return undo
+
+    PROVES.extend([
+        (F.t_daylight_is_split_where_the_sun_is, _sun_from_midnight,
+         "sun credited to the night"),
+        (F.t_the_fit_recovers_the_coefficients_it_was_planted_with,
+         code('v = {"prod": lambda: r["swg_h"],',
+              'v = {"prod": lambda: r["pump_h"],'),
+         "production fitted per pump hour, ignoring the dial"),
+        (F.t_the_fit_recovers_the_coefficients_it_was_planted_with,
+         code("y=(v1 - v0) - poured, poured=poured))",
+              "y=(v1 - v0), poured=poured))"),
+         "a jug of chlorine credited to the cell"),
+        (F.t_the_acid_response_is_recovered,
+         code('got = o["ph_after"] - o["ph_before"] - drift',
+              'got = o["ph_after"] - o["ph_before"]'),
+         "the day's own pH rise left inside the acid's response"),
+        (F.t_a_fixed_dial_reports_cell_and_spillover_together, _never_merge,
+         "two inseparable terms printed as two figures"),
+        (F.t_a_coefficient_not_clear_of_zero_is_not_measured,
+         code('        clear = lo > 0 or hi < 0\n'
+              '        right = (t["sign"] == 0 or (t["sign"] > 0 and lo > 0)\n'
+              '                 or (t["sign"] < 0 and hi < 0))',
+              '        clear = right = True'),
+         "an interval across zero printed as a measurement"),
+        (F.t_too_little_record_says_how_much_more,
+         code("    if n < MIN_DAYS:", "    if n < 0:"),
+         "a fit drawn from ten days"),
+        (F.t_an_outage_is_left_out_not_read_as_a_pump_that_was_off,
+         code('if x["cover"] < COVER_MIN or', 'if x["cover"] < 0 or'),
+         "an agent outage read as a pump that was off"),
+        (F.t_a_stretch_with_acid_in_it_is_not_in_the_ph_fit,
+         code('            if measure == "ph":', '            if False:'),
+         "acid subtracted as a prediction THEORY.md says is wrong"),
+        (F.t_the_assistant_is_sent_the_fit_as_a_fixed_section,
+         code('out.extend(fit.context_lines(res) if res else ["  not available"])',
+              'out.extend(["  not available"])',
+              "poolhound/assistant.py", "poolhound.assistant"),
+         "the fit left out of what the model is told"),
+        (F.t_the_public_build_carries_no_household_fit,
+         code("            FIT_HTML = _fit.block(FIT)", '            FIT_HTML = ""',
+              "poolhound/render.py", "poolhound.render"),
+         "the fit missing from the build that should carry it"),
+    ])
+
+
+_register_fit()
+_register_saturation()
 _register_upkeep()
+_register_stock()
 _register_seam_visibility()
 _register_heredocs()
 _register_refill()
 _register_agent_watchdog()
 _register_deploy_timezone()
+_register_deploy_freshness()
 _register_demo_clock()
 _register_switchlog()
+
+
+def _patch(obj, name, value):
+    """Replace one attribute for the length of a proof, and put it back."""
+    real = getattr(obj, name)
+    setattr(obj, name, value)
+    return lambda: setattr(obj, name, real)
+
+
+def _sched_live(needle, replacement):
+    return lambda: _break_live_code("poolhound/schedule.py", "poolhound.schedule",
+                                    needle, replacement)
+
+
+def _register_schedule():
+    """Breakers for the scheduler: each one is a way a deferred command can
+    light a heater for nobody, or leave one burning, while every case passes."""
+    from . import checks_schedule as K, schedule as S, commands as C
+    PROVES.extend([
+        (K.t_off_means_an_ordinary_command,
+         lambda: _patch(C, "_HEATER_OFF", {**C._HEATER_OFF, "Spa_Heater": {
+             "action": "set", "device": "Spa_Heater", "value": 0}}),
+         "a heater 'off' the agent would refuse"),
+        (K.t_spring_forward_runs_once_and_late_by_the_gap,
+         _sched_live("tzinfo=zone or tz(), fold=0)", "tzinfo=zone or tz(), fold=1)"),
+         "a time that does not exist resolved on the new offset"),
+        (K.t_fall_back_runs_once_not_twice,
+         _sched_live("tzinfo=zone or tz(), fold=0)", "tzinfo=zone or tz(), fold=1)"),
+         "the second of two 01:30s chosen"),
+        (K.t_an_on_missed_while_down_is_never_run_late,
+         lambda: _patch(S, "GRACE_S", 10 ** 9),
+         "an ON run hours late"),
+        (K.t_a_scheduled_off_missed_is_serious,
+         _sched_live('sev = SEVERE if C.is_off(cmd) else "info"', 'sev = "info"'),
+         "a missed OFF graded as ordinary"),
+        (K.t_a_schedule_is_withdrawn_when_its_author_loses_operate,
+         _sched_live('ok, need, held = access.may(s.get("by"), "/api/schedule", cfg)',
+                     'ok, need, held = True, "", ""'),
+         "a schedule firing on the authority of somebody since demoted"),
+        (K.t_inside_the_grace_window_it_runs_and_says_how_late,
+         lambda: _patch(S, "GRACE_S", 0),
+         "a few minutes late treated as missed"),
+        (K.t_off_after_is_arranged_replaced_and_retired,
+         _sched_live('or (on and o.get("device") == cmd["device"])', "or False"),
+         "a second ON leaving the first deadline standing"),
+        (K.t_an_auto_off_fires_as_auto_off_and_stands_down_if_already_off,
+         lambda: _patch(S, "panel_agrees", lambda *a, **k: None),
+         "an off sent to something the panel already reports off"),
+        (K.t_the_max_on_net_catches_a_press_poolhound_never_saw,
+         lambda: _patch(S, "max_on_hours", lambda cfg=None: {}),
+         "a household limit that never acts"),
+        (K.t_no_agent_means_missed_and_an_alert_not_silence,
+         lambda: _patch(S, "send_alerts", lambda rows, cfg, notify=None: []),
+         "an undelivered off nobody is told about"),
+        (K.t_schedules_survive_a_restart,
+         lambda: _patch(S, "_save", lambda data, st: None),
+         "a schedule kept only in memory"),
+        (K.t_a_stamp_from_the_future_is_not_believed,
+         _sched_live("if d is None or d > horizon:", "if d is None:"),
+         "an auto-off a backwards clock pushed into next year"),
+        (K.t_a_command_goes_one_way_whoever_sends_it,
+         lambda: _break_source_claim("schedule", "server.command(",
+                                     "server.issue_control("),
+         "a scheduler with a command path of its own"),
+    ])
+
+
+_register_schedule()
+
+
+def _prog_live(needle, replacement):
+    return lambda: _break_live_code("poolhound/programs.py", "poolhound.programs",
+                                    needle, replacement)
+
+
+def _register_programs():
+    """Breakers for the panel-programs report: each one is a way the Control
+    tab could show a tidy, wrong account of what the pool does by itself."""
+    from . import checks_programs as K, programs as P
+    real_snapshot = P.snapshot
+    PROVES.extend([
+        (K.t_a_programs_answer_keeps_devices_with_none,
+         _prog_live("        if of is None or pgm is None:\n",
+                    "        if not of or pgm is None:\n"),
+         "a device with no program dropped, as though the panel had not listed it"),
+        (K.t_a_stock_aqualinkd_still_reports_its_schedules,
+         lambda: _patch(P, "snapshot", lambda pr, pe, sr, se, now=None: real_snapshot(
+             pr, pe, sr if pr is not None else None, se or pe, now)),
+         "a stock AqualinkD's 404 taking the cron schedules down with it"),
+        (K.t_a_cron_line_is_described_or_refused,
+         _prog_live('_URL = re.compile(r"^/api/[A-Za-z0-9_]{1,32}/set$")',
+                    '_URL = re.compile(r"^/api/.*")'),
+         "a cron line carrying a shell command passed through as a schedule"),
+        (K.t_a_pushed_snapshot_is_rebuilt_not_trusted,
+         lambda: _patch(P, "validate", lambda body: (body, None)
+                        if isinstance(body, dict) and body.get("version") == 1
+                        else (None, "refused")),
+         "a pushed snapshot stored as it arrived"),
+        (K.t_the_snapshot_round_trips_through_the_data_directory,
+         _prog_live('"stale": now - got > STALE_S', '"stale": False'),
+         "a Pi that stopped reporting shown as current"),
+        (K.t_the_reporter_refreshes_late_and_pushes_anyway,
+         lambda: _break_live_code(
+             "poolhound/agent.py", "poolhound.agent",
+             "due = (now - started >= first_refresh if last_refresh is None",
+             "due = (True if last_refresh is None"),
+         "a panel walk started the moment the agent starts, before anything is pushed"),
+    ])
+    from . import commands as C, agent as A
+    PROVES.extend([
+        (K.t_a_program_change_is_shaped_by_the_vocabulary,
+         lambda: _patch(C, "program_times", lambda value: (0, 1)),
+         "any string accepted as a program's times"),
+        (K.t_the_server_refuses_what_aqualinkd_would,
+         _prog_live('    if have[0]["of"] > 1:\n', '    if False:\n'),
+         "a device with several programs offered for a change nobody has mapped"),
+        (K.t_the_agent_acks_at_once_and_follows_the_panel,
+         lambda: _break_live_code(
+             "poolhound/agent.py", "poolhound.agent",
+             '    if not 200 <= status < 300:\n        return {"ok": False, "error": f"AqualinkD refused it',
+             '    if False:\n        return {"ok": False, "error": f"AqualinkD refused it'),
+         "AqualinkD's refusal reported to the page as a change under way"),
+        (K.t_a_change_is_followed_to_the_panels_answer,
+         lambda: _patch(A, "PROGRAM_FOLLOW_S", 0),
+         "a change reported before the panel has answered"),
+    ])
+    PROVES.append(
+        (K.t_equipment_scheduled_in_both_places_is_called_out,
+         _prog_live('        if p and s.get("enabled"):', '        if False:'),
+         "equipment switched by both schedules shown with no warning"))
+
+
+_register_programs()
+
+
+def _register_heaters():
+    """Breakers for the heater fixes: each puts back a way the heaters looked
+    controllable from this side and were not, or were too controllable."""
+    from . import checks_heaters as K, commands as C, agent as A
+    PROVES.extend([
+        (K.t_a_heater_is_switched_by_heat_and_nothing_else_is,
+         lambda: _patch(C, "HEATERS", C.HEATERS + ("Spa",)),
+         "the spa accepted as a heater"),
+        (K.t_a_temperature_goes_to_aqualinkds_setpoint_route,
+         lambda: _patch(A, "SETPOINT_ROUTE", {}),
+         "a heater temperature sent to the on/off route, which refuses it"),
+        (K.t_a_heaters_temperature_and_switch_keep_separate_cooldowns,
+         lambda: _patch(C, "cooldown_key", lambda cmd: cmd.get("device")),
+         "setting the temperature blocking the heater from being switched on"),
+        (K.t_a_heaters_automatic_off_is_confirmed_by_the_panel,
+         lambda: _break_live_code("poolhound/schedule.py", "poolhound.schedule",
+                                  'if cmd.get("action") in ("set", "heat"):',
+                                  'if cmd.get("action") in ("set",):'),
+         "a heater's automatic off that can never be confirmed, and so never ends"),
+    ])
+
+
+_register_heaters()
+
+
+def _scene_live(needle, replacement):
+    return lambda: _break_live_code("poolhound/scenes.py", "poolhound.scenes", needle, replacement)
+
+
+def _register_scenes():
+    """Breakers for scenes: each is a press made wrongly on somebody's behalf."""
+    from . import checks_scenes as K
+    PROVES.extend([
+        (K.t_a_scene_runs_in_the_safe_order_whatever_order_it_was_saved_in,
+         _scene_live("    steps.sort(key=order_key)\n", "    pass\n"),
+         "a scene run in the order it was typed, heater before pump"),
+        (K.t_a_scene_is_refused_when_it_is_saved_not_when_it_runs,
+         _scene_live("        if key in seen:\n", "        if False:\n"),
+         "the same control saved twice in one scene"),
+        (K.t_then_off_after_leaves_the_pump_to_the_panel,
+         _scene_live(' and st["device"] != PUMP', ''),
+         "a spa session's end switching the filter pump off"),
+        (K.t_a_scene_stops_at_the_first_step_refused,
+         lambda: _break_live_code("poolhound/server.py", "poolhound.server",
+                                  "        if why:\n            audit.record(\"scene\"",
+                                  "        if False:\n            audit.record(\"scene\""),
+         "a scene that carries on to the heater after its pump was refused"),
+        (K.t_a_scene_can_be_scheduled_and_is_named_by_its_name,
+         lambda: _break_live_code("poolhound/schedule.py", "poolhound.schedule",
+                                  'return f"scene {sc[\'name\']}" if sc else "a scene that has since been deleted"',
+                                  'return C.describe(cmd)'),
+         "a scheduled scene listed as a bare id"),
+        (K.t_the_pi_keeps_the_last_scenes_it_saw_when_the_server_is_away,
+         lambda: _break_live_code("poolhound/agent.py", "poolhound.agent",
+                                  "        with self._lock:\n            self.error = why\n",
+                                  "        with self._lock:\n            self.error = why\n            self.scenes = []\n"),
+         "the Pi's scenes emptied by one failed fetch"),
+    ])
+
+
+_register_scenes()
+
+
+def _register_cron():
+    """Breakers for saving AqualinkD's schedules: a file cron runs as root."""
+    from . import checks_cron as K
+
+    def live(path, mod, needle, replacement):
+        return lambda: _break_live_code(path, mod, needle, replacement)
+    PROVES.extend([
+        (K.t_a_schedule_is_rebuilt_from_known_parts_never_passed_through,
+         live("poolhound/commands.py", "poolhound.commands",
+              '    if str(e.get("value")) not in ("0", "1"):\n',
+              '    if False:\n'),
+         "a typed value carried into a line cron runs as root"),
+        (K.t_a_cron_line_may_switch_a_heater_off_but_never_on,
+         live("poolhound/commands.py", "poolhound.commands",
+              '    if dev in HEATERS and value == "1":\n', '    if False:\n'),
+         "a cron line that lights a gas heater with nobody watching"),
+        (K.t_a_save_is_refused_when_the_list_changed_since_the_page_read_it,
+         live("poolhound/agent.py", "poolhound.agent",
+              '    if C.cron_fingerprint(have) != cmd["value"]["expect"]:\n',
+              '    if False:\n'),
+         "somebody's edit in AqualinkD wiped by a save from an older page"),
+        (K.t_a_save_sends_the_rebuilt_list_and_checks_what_landed,
+         live("poolhound/agent.py", "poolhound.agent",
+              '    if C.cron_fingerprint(now_have) != C.cron_fingerprint(want):\n',
+              '    if False:\n'),
+         "a save reported done that AqualinkD did not keep"),
+        (K.t_a_list_it_cannot_show_in_full_is_never_rewritten,
+         live("poolhound/programs.py", "poolhound.programs",
+              "max(0, len(allof) - MAX_SCHEDULES)", "0"),
+         "schedules past the cap deleted by a save that never showed them"),
+        (K.t_the_server_refuses_a_stale_save_before_it_is_queued,
+         live("poolhound/server.py", "poolhound.server",
+              '        why = _prog.check_cron(data.get("value"), cfg)\n',
+              '        why = None\n'),
+         "a stale save queued for the Pi instead of refused at the form"),
+    ])
+
+
+_register_cron()
+
+
+def _register_agent_stream_auth():
+    from . import checks_gates as G
+    PROVES.append(
+        (G.t_agent_ok_is_never_read_as_a_boolean,
+         lambda: _break_source_file("poolhound/server.py",
+                                    "        ok, unavailable = self.agent_ok()\n        if not ok:\n",
+                                    "        ok, unavailable = True, False\n        if not self.agent_ok():\n"),
+         "the agent's command stream open to anybody, as it was"))
+
+
+_register_agent_stream_auth()

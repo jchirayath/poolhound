@@ -136,6 +136,7 @@ because retaking them was a from-scratch job every time.</sub>
 |---|---|
 | **A dashboard that says what to do next** | derived from your readings and your targets, not from a generic band |
 | **Free-chlorine targets that scale with your CYA** | 7.5% of cyanuric acid, because a fixed number is wrong at both ends |
+| **What moves this pool, measured** | the cell's output, the sun's toll, the pH push of each hour of pump, sheer and spa, and what an ounce of acid does — fitted from your own days, each with its interval, and "not yet, here is what would settle it" where the record cannot say |
 | **Dose arithmetic that learned from your pool** | measured acid response here ran 1.4–1.9× the textbook figure, and the model is alkalinity-aware because of it |
 | **A volume calculator anyone can use** | trace a photograph or pick a stock design; pool and spa separately, with a total |
 | **Remote control that does not expose the controller** | the panel has no authentication of its own, so it is never reachable — the house connects outward instead |
@@ -837,6 +838,34 @@ bin/wg-collect --from-file data/raw/wg-YYYYMMDD-HHMM.json
 bin/leslies --from-file ...   # or --dry-run
 ```
 
+**Weather is optional and needs no account.** Put the pool's coordinates under
+`[weather]` in `config.toml` and `bin/weather` fetches, once a day from cron,
+each ended day's sun (shortwave energy), sunshine hours, UV index, cloud, air
+high/low/mean, rain and reference evaporation from
+[Open-Meteo](https://open-meteo.com/) (CC BY 4.0). It sends the coordinates
+**rounded to 0.1°** — about 11 km — and the timezone, nothing else, and the
+Collection tab prints the pair it sent. The first run backfills the whole span
+of the pool's history from the archive; each later run asks for any day still
+missing and re-asks the last ten, whose archive figures are preliminary.
+
+`weather.csv` is keyed on the pool's calendar date (`config.DEPLOY_TZ`), one
+row per day, with a `source` column: `archive` (reanalysis) outranks `forecast`
+(the forecast model's record of a day just ended, which arrives first). A
+field the winner lacks — the archive has no UV index — is taken from the loser
+and named in `carried`, e.g. `uv_max:forecast`. Today is never stored, and
+neither is any forecast of a day to come. The raw responses are saved, wrapped
+with the parameters that were sent, so the parser is developed offline:
+
+```bash
+bin/weather --dry-run                               # fetch and print, write nothing
+bin/weather --from-file data/raw/weather-archive-YYYYMMDD-HHMM.json \
+                        data/raw/weather-forecast-YYYYMMDD-HHMM.json
+```
+
+It is in the nightly backup and deliberately **not** in `config.HISTORY_FILES`:
+a collector that backfills into an empty directory would otherwise disarm the
+guard against seeding over an unmounted share.
+
 ### 8. poolhound local, optional
 
 **poolhound local** is a page the Pi serves on the house network: friendly
@@ -1019,12 +1048,13 @@ it. Concretely:
 
   | Check | Enforced |
   |---|---|
-  | Shape and a well-formed id | `set`, `setpoint`, `all_off`, `resync` — nothing else |
+  | Shape and a well-formed id | `set`, `setpoint`, `heat`, `all_off`, `resync`, `program`, `cron` — nothing else. A `cron` command's every field is rebuilt from known parts (see *AqualinkD's own schedules*) |
   | Known device | 8 switches and 4 setpoints, by name. `Extra_Aux` — the solar valve — is deliberately absent, so it cannot be commanded at all |
   | Age | 300 s, so a captured command cannot be replayed later |
   | Replay | ids already executed are refused |
   | Rate | 12 commands a minute |
-  | Per-device cooldown | 120 s on the filter pump, 300 s on the heaters — a compromised server cannot short-cycle a gas heater or a pump motor |
+  | Per-device cooldown | 120 s on the filter pump, 300 s on the heaters — a compromised server cannot short-cycle a gas heater or a pump motor. A heater's on/off (`heat`) and its temperature have separate clocks, so setting the temperature and then switching it on is not refused. 180 s between two changes to one panel program |
+  | A program change | the device as the panel's PROGRAM list writes it, and two different 24-hour times. The server has already checked the device holds exactly one program; AqualinkD checks again |
 
 ### The honest part: what happens if the server *is* compromised
 
@@ -1082,7 +1112,9 @@ server holds neither, and rebuilding it loses nothing. See
 | WaterGuru — pod + mail-in lab | daily 14:00 | `readings.csv`, `lab.csv` | the server — `/etc/cron.d/poolhound` |
 | Leslie's — bench photometer | daily 14:05 | `leslies.csv` | the server — `/etc/cron.d/poolhound` |
 | You — chemical additions | when you dose | `chemicals.csv` | the Chemicals tab, or `bin/chem` |
+| You — purchases and stocktakes | when you buy or count | `stock.csv` | the Chemicals tab, or `bin/chem bought` / `bin/chem stocktake` |
 | You — corrections to a bad reading | rarely | `corrections.csv` | the Settings tab |
+| You — a filter or salt cell cleaned | when you clean one | `maintenance.csv` | Home, under Equipment health |
 | *(watchdog)* | every 30 min | email | the server — `/etc/cron.d/poolhound` |
 
 The controller sampler is the one that is not a cron job and not on the server, and
@@ -1264,9 +1296,9 @@ on **Poolhound info**, which is what the public address is for.
 | Tab | What it is | Public |
 |---|---|:--:|
 | **Pool control** | switch the circuits and set the heaters, through the agent | no |
-| **Home** | **what to do next**, current state, what is running right now, trends, lab history | no |
+| **Home** | **what to do next**, current state, what is running right now, trends, lab history, power, and equipment health | no |
 | **Pool chemistry** | the causal reference — what raises and lowers each factor | yes |
-| **Chemicals** | log a dose, with the effect estimated as you type; what has been added and what it cost, by month, for any period; and what upkeep takes, by week and by year, worked out from this pool's own record | no |
+| **Chemicals** | log a dose, with the effect estimated as you type; what is on the shelf and how long it lasts; what has been added and what it cost, by month, for any period; and what upkeep takes, by week and by year, worked out from this pool's own record | no |
 | **Collection** | every attempt to fetch anything, whether it worked, and whether an alarm was delivered | no |
 | **Settings** | pool volume, credentials, notifications, chemical prices, and where the data comes from | no |
 | **Ask AI** | a question answered against this pool's own record — tuned to its volume, targets and doses rather than pool chemistry in general | no |
@@ -1437,12 +1469,58 @@ minutes. If the agent stopped or the Pi was unreachable, the gap stays a gap
 instead of being counted as hours of pump time — which is what kept the
 71-hour ordering-cycle outage from reading as three days of continuous pumping.
 
+**What moves this pool.** The regression the day strip was built for, run.
+`fit.py` takes every stretch between two consecutive readings from one
+instrument, integrates what the panel and the weather did across it — pump
+hours, dial × pump hours, sheer, spa and heater hours, water temperature with
+flow, the day's sun split by daylight, the stabiliser the labs had last
+reported — and fits THEORY.md's two models: free chlorine as production minus
+a loss proportional to FC, pH as a sum of per-hour pushes. Logged chlorine is
+subtracted through `chemicals.effects()`; a stretch holding an acid dose is
+left out, and the acid's own response is the dose table's pairing with the
+measured drift taken out. Every coefficient comes back **measured** (its 95%
+interval — the wider of OLS and a bootstrap over days — clear of zero on the
+side physics expects), **combined** (it cannot be separated from a named
+partner on this record, and the figure is the two together, at the ratio they
+ran), or **not yet**, with what would settle it: "about 40 more days with the
+sheer descent running", "a few weeks at a different dial setting". With the
+dial left alone, the cell and the spillover are one figure, exactly as THEORY.md
+says they must be. Ask AI is sent the same table as a fixed section.
+`checks_fit.py` holds the fit to a simulated pool whose coefficients are
+planted, and the demo pool's chemistry is now that simulation rather than a
+pair of sine waves.
+
 Each tile names the instrument behind it and how old the reading is: an accurate
 number from three weeks ago is still three weeks old. The trend charts overlay
 Leslie's readings on the pod's, distinguished by **mark shape** rather than hue —
 a hollow diamond against a filled circle — because colour is already carrying
 equipment identity elsewhere on the page and reusing the spa orange to mean
 "Leslie's" would make one hue mean two things.
+
+**Equipment health.** Three slow failures are written in columns the panel
+already reports every fifteen minutes, and each is read as a drift in a figure
+that should hold still: the pump's draw at its usual speed (a loading filter
+makes it *fall* — at a fixed RPM the pump moves less water against more head,
+and a radial impeller draws less power at less flow), the chlorine the cell
+makes per full-output hour, and the heater's degrees per hour, kept apart for
+the pool and the spa and grouped by outdoor temperature (the weather record's
+daily mean where it has that day, the panel's air sensor otherwise, and each
+row says which). Like is compared with
+like — one speed, settled for ten minutes, with the spa, sheer descent and
+solar valve all shut — and every figure says whether it is **measured**,
+**bounded** or **not enough data yet**, on how many samples and over what
+window. Low salt and cold water are named rather than blamed on the cell. The
+cell's yield in each window is `fit.cell_rate()` — the same k_prod estimator
+as **What moves this pool**, run on that window — so the two cannot disagree
+about what the cell makes; a window the fit cannot measure is counted, not
+filled in from a cruder model. A
+filter or cell cleaning is marked on the section itself and goes into
+`maintenance.csv`, which restarts that part's baseline; a filter past the
+threshold puts "Clean the filter" into What to do next and sends one
+info-level alert. The cheap half rides along: anything that stayed on far
+longer than its own usual, and a pump schedule that moved without a poolhound
+command. All of it is `equipment.py`; the physics and the thresholds, and
+which of them are judgements, are in its docstring and in THEORY.md.
 
 ### The Pool chemistry tab — the causal reference
 
@@ -1453,6 +1531,17 @@ chart. Plus an interaction map of every driver against every factor, a dose
 table, and the conflict this pool is actually in — chlorine effectiveness wants
 pH low, the saturation index at this calcium level wants it high, and the
 resolution is more calcium rather than a different pH.
+
+And the **saturation index, computed** rather than quoted: at the water's
+current temperature, at the spa's setpoint, and at the coldest the water has
+been this month, with the oldest reading it rests on named and the labs' own
+figures beside it (THEORY.md has the arithmetic). The tab is public; the
+household's computed index is not — the public build carries the explanation
+and a handbook example pool, and refuses to write a page carrying the private
+card's marker. Home ranks an aggressive index beside low calcium, because both
+are damage that does not reverse; a pH-down card says when its dose would tip
+the water aggressive; and the spa scaling or winter water turning aggressive are
+watch items. The assistant is sent the computed index as a fixed field.
 
 Those figures are textbook starting estimates. Replacing them with this pool's
 measured response is the entire point of the data collection.
@@ -1995,9 +2084,151 @@ the panel's own logic and has no business being switched remotely.
 `all_off` turns the circuits off and the **filter pump last**, so nothing is
 left running without circulation.
 
+### The panel's own programs
+
+The Jandy panel keeps its own on/off programs, and they are the schedules that
+still run when the Pi, AqualinkD or this server are down. Stock AqualinkD
+cannot read them; `deploy/aqualinkd` patches it to, through the handheld's
+PDA menus, and `docs/JANDY-PROGRAMS.md` has every screen line by line.
+
+**Reading** them: the agent asks AqualinkD to walk the menus once a day (a walk
+holds the panel's menus for about a minute) and reports what it read, with
+AqualinkD's own cron schedules, every 30 minutes. Pool control shows both
+under *Programmed on the panel, and in AqualinkD*: a card per programmed
+device, its window drawn on a 24-hour bar with the time now marked, and
+"on now, off at 4:00 PM, in 2 h" written beside it so the bar is never the only
+way to read it. Devices with no program are one line.
+
+**Changing** one: *Change times* on the card opens the editor in place. The
+bar previews the new window as it is typed, the duration is worked out, and
+Save stays off until something has changed. Progress (sent, updating the
+panel, saved or not) is shown on the card, and a refusal stays in the
+editor with its reason. Underneath it is a `program` command, through
+`/api/control` like any button — `operate`, validated, rate-limited, audited
+and checked by the Pi's Guard. The server first refuses anything AqualinkD
+would refuse a minute later, against the Pi's last report: a device with no
+program (adding one is unmapped), with several (moving between them is
+unseen), or a change while another runs. The agent hands it to AqualinkD as an
+HTTP PUT and acknowledges **accepted**, not done, so the command stream is not
+held for the minute the panel's editor takes. AqualinkD steps each time with
+Up and Down, reading back the line the panel redraws after every press, saves,
+and reads the device's screen back; a thread on the agent follows it to the end
+and pushes a fresh report at once. The row on the page changes only when the
+panel's own answer does.
+
+Only the ON and OFF times of a device that holds one program can be changed.
+Adding or deleting a program, and its days, are changed at the panel.
+
+**AqualinkD's own schedules are added, changed, paused and deleted from the
+same section.** Each is a row (*Pool light on at 7:00 PM, every day*) with
+Edit, Pause and Delete; *Add an AqualinkD schedule* opens the editor: a switch,
+on or off, a time, and every day, weekdays, weekends or chosen days. The
+editor says in words what it will do, and warns, before saving and again in
+the confirmation, when the panel already programs that equipment.
+
+AqualinkD keeps them as lines in `/etc/cron.d/aqualinkd` and can only replace
+the whole file, so every change sends the complete new list as one `cron`
+command, with `expect`, the fingerprint of the list the page showed. Because
+those lines run as root, and AqualinkD copies each field into a fixed 20-byte
+buffer unchecked:
+
+- **Nothing typed is passed through.** `commands.cron_entry()` rebuilds each
+  entry: hour and minute as integers, days as `*`, `1-5`, `0,6` or a list of
+  0–6, the url built from a device in `CRON_DEVICES`, the value 0 or 1. The
+  agent builds what it sends from that, never from the command's strings.
+- **A heater may be switched off, never on.** A cron line fires with nobody
+  watching: no authority check, no confirmation, no switch-off afterwards.
+  Lighting a heater belongs to poolhound's own schedule, which has all three.
+- **A save never wipes somebody else's edit.** The server refuses one whose
+  `expect` is not the Pi's last report; the agent re-reads AqualinkD and
+  refuses unless the list there is still that one, then pushes a fresh report
+  so the page shows the Pi's list within seconds.
+- **Nothing the page cannot show is deleted with a save.** A list with an
+  entry this code does not recognise, or one it would not write (a heater
+  lit, a cron expression), is shown but not editable here; change it in
+  AqualinkD's own page.
+- **Saved means read back.** The agent reads the list again after AqualinkD
+  answers and reports ok only if the Pi now holds exactly what was sent.
+
+The audit keeps the count (`cron=2`); the list itself arrives with the
+report. Each save is one small write to the Pi's card, of AqualinkD's own file.
+
+**The page says they are different, and recommends the panel's.** The two
+kinds do not know about each other, so equipment scheduled in both is switched
+on two timetables, and one undoes the other. Pool control explains the
+difference, recommends keeping the regular hours in the panel, and shows a
+warning naming any equipment scheduled in both places. The agent sends
+AqualinkD's own device names (`Extra_Aux` is `SOLAR HEAT`) so that the match is
+made on the panel's spelling; `programs.overlaps()` is the one place it is
+decided.
+
+### Scenes: several controls in one tap
+
+"Filter, sheer descent and pool light." "Spa session: pump, spa, heater to
+102, and off again in two hours." A scene is a named list of ordinary
+commands -- a switch on or off, a heater on or off, a heater's temperature --
+and running one is `/api/control` with `action: "scene"`. `server.command()`
+expands it and issues each step through itself, so every step is validated,
+rate-limited, audited as whoever ran it and checked by the Pi's Guard; the
+agent never sees a scene. `scenes.py` decides the order, whatever order it was
+saved in: heaters off, other things off, the pump off last; then the pump on
+first, other things on, temperatures, heaters on last. A scene **stops at the
+first step refused**, so a heater is never started after its pump was
+refused. "Then switch off after" arranges an automatic off for everything the
+scene turned on **except the filter pump**, whose hours belong to the panel's
+program. A scene can be scheduled like any command, and is then fired through
+the same `server.command()`, with the ON grace and the authority asked again at
+every firing.
+
+### Schedules, and switching off what was left on
+
+"Spa ready at seven" is a **deferred command**, and it is built as exactly
+that. `schedule.py` keeps the schedule in `$POOLHOUND_DATA/schedules.json` —
+on the share, under its own lock, because it has to survive a
+`--force-recreate` the way the in-memory queue deliberately does not — and a
+thread in `bin/serve` looks at the clock every twenty seconds. At the due time
+it calls `server.command()`, the same function a button press reaches, with
+`by` set to `schedule` or `auto-off`. So a scheduled command is validated,
+rate-limited, audited and refused by the Pi's Guard exactly as a press is;
+there is no second way into the panel, and the Pi stores nothing.
+
+The two directions are not treated alike. An **ON** runs only within fifteen
+minutes of its time; later than that — the server was down all evening — it is
+recorded as missed and never run, because a heater lit hours late is lit for
+nobody. An **OFF** that cannot be delivered (no agent, a cooldown, a panel that
+never reports it off) is retried until the panel agrees, and the first failure
+raises a **serious** alert. Times are wall-clock times in `config.DEPLOY_TZ`:
+a time that does not exist on the spring-forward night runs once, an hour
+later on the clock; a time that happens twice in the autumn runs once, at the
+first.
+
+Turning the spa or a heater on can carry **"then off after N hours"**
+(`[schedule.auto_off]`). "Off" is an ordinary command the agent already
+accepts — `commands.off_command()` — and for a heater it is the heater's own
+switch, `heat` 0 (the panel's POOL HEATER / SPA HEATER), with the temperature
+left where it was. Until 2026-10-10 a heater had no switch here, so "off" was
+the spa switched off or the pool heater asked for its minimum; the first rested
+on "the spa heater follows spa mode", which no sample ever showed.
+
+**Heater temperatures did not reach the panel before 2026-10-10.** The agent
+sent them to AqualinkD's on/off route, which answers anything but 0 or 1 with
+`400 Invalid value`. They now go to its `/setpoint/set` route
+(`agent.SETPOINT_ROUTE`), and the Control tab's heater cards have On/Off
+beside the temperature. And there is a **household limit**
+that does not depend on anybody choosing it: `[schedule.max_on]`, the spa
+heater at three hours by default, read from what the panel *reports* — so it
+covers a press at the wall panel or through AqualinkD that this server never
+saw. It acts once per run, and it is not cancellable from the page.
+
+Nothing inside a process can report the process's absence, so the thread's
+liveness is said three ways: `/api/health` carries it from the process that
+owns it, the Pool control tab draws that live, and the tick stamps `alive_at`
+into the file, which `bin/watch` — a different process, on cron — alerts on
+when it goes stale.
+
 ### What is not lost when this breaks
 
-The schedule lives in the panel, not here. If the agent is down, the site is
+The panel's own schedule lives in the panel, not here. If the agent is down, the site is
 down, or the internet is out, the pool keeps running its own schedule and the
 page says so plainly. What is unavailable is the remote control, not the pool.
 
@@ -2134,7 +2365,7 @@ reading.
 
 ### Being told when something happens
 
-The same watchdog also raises a notification for two other classes of event.
+The same watchdog also raises a notification for three other classes of event.
 
 **A heater coming on.** Gas heating is the most expensive thing this pool can do,
 and a heater running when nobody asked it to shows up on a bill rather than on a
@@ -2160,6 +2391,37 @@ someone should be reserved for cases where waiting until tomorrow costs somethin
 An alarm that fires for ordinary drift is an alarm that gets dismissed unread,
 which is why these thresholds are set by consequence rather than by distance from
 target. Recovery is announced too, and a standing alarm repeats once a day.
+
+**Equipment anomalies** — something wrong this hour that breaks equipment, is
+unsafe, or burns gas for nothing. `anomaly.py` reads them off the same samples,
+each rule a small named function with its severity, its reason and an
+`[anomaly.<rule>]` table that can move its threshold or switch it off:
+
+| Rule | Severity | Why it will not wait |
+|---|---|---|
+| A heater or the spa on past an absolute limit (spa heater 2 h, pool heater 12 h, spa 4 h) | serious | gas and pump hours; independent of what is usual, because a household that always forgets the spa makes forgetting the usual |
+| A light or the sheer descent left on (8 h) | info | cheap, but nobody meant it |
+| On longer than it usually is | info | Equipment health's own judgement, said once |
+| A heater reported firing with the pump stopped | serious | a heat exchanger with no water through it overheats in minutes |
+| A heater firing and the water not warming | serious | failed ignition, no gas, or scale — gas or a lockout for nothing |
+| The spa above 104 °F | serious | the CPSC's ceiling for a hot tub |
+| A heater firing above its setpoint | serious | a thermostat that is not stopping it |
+| Freezing air and the pump stopped | serious | still water splits pipes; freeze protection did not run |
+| The pump's draw at one speed moving a quarter within a day | serious | air in the suction or a lost prime (falls); a bearing or debris (rises) |
+| The salt cell asked to produce in low salt or cold water | info | wears the plate coating; the panel reports the output asked for, not given |
+| The pump has not run for a day | serious | no filtration, no chlorine made |
+| A sensor stuck at one value, or reporting the impossible | info | the sampler is wrong, not the pool |
+
+Each is said once when it starts and once when it ends, at the same severity —
+the person emailed that the spa was at 106 is the person who needs to hear it
+came down — and a serious one still open is repeated daily. Info rules show on
+Home and notify only when asked. A long run the household limit
+(`[schedule.max_on]`) has already switched off is not alerted twice: the
+scheduler's message is the message. One with no limit set says that this notice
+is the only safeguard. Open serious anomalies lead Home's "What to do next";
+the Anomalies section above Equipment health lists what is open and the last
+week of what ended. Fifteen-minute sampling bounds all of it, and the module's
+docstring lists the ideas the data could not support and why.
 
 ### Logins are kept encrypted
 
@@ -2293,6 +2555,34 @@ Units are checked against the chemical's **phase**, not against a global list.
 Time is recorded because it matters: acid needs a full turnover to mix, so a late
 addition belongs to the next day's reading.
 
+### What is on the shelf
+
+```bash
+bin/chem bought acid 2 gal --paid 19.49   # a purchase, and what the receipt says
+bin/chem stocktake acid 2.5 gal           # a count of what is actually there
+bin/chem stocktake shock 0 lb             # "none left" is a count too
+bin/chem --stock                          # on hand, and how long it lasts
+```
+
+**On hand is the last count, plus purchases since, minus doses logged since.**
+Purchases minus doses alone drifts for ever — a dose nobody logged is a jug that
+never empties on paper — so a stocktake is the reset. With no count yet, the
+first purchase is the baseline and doses before it are not charged to it. A
+figure that comes out negative is never printed: the Chemicals tab says the
+record shows more used than bought and asks for a count.
+
+How long it lasts divides by the upkeep rate below the table, which says whether
+it is measured, derived or only a ceiling — a ceiling on use gives a floor on
+time, said as "at least", and is never called low — and falls back to the
+logged doses for a chemical upkeep does not estimate. Under `[stock] low_weeks`
+(3) it is a "keep an eye on" item at the bottom of Home, and, with
+`notify.stock = true`, one info-level notice. A price paid fills any price
+Settings leaves unset, and says which purchase it came from.
+
+Rows live in `stock.csv`, not in `chemicals.csv`: every reader of that file
+takes a row as something poured into the pool. Like a dose, a purchase or a
+count is our own record and is corrected in place on the Chemicals tab.
+
 ## Two cadences in one response, kept apart
 
 The WaterGuru API returns both, and conflating them would fabricate a time series:
@@ -2357,13 +2647,24 @@ writing needs `bin/serve`* — Host, Origin, and the per-process token from
 | `/api/health` | GET | — | Version, who you are, your level, whether the agent is connected, and the write token. A public visitor is issued no token, so the page renders read-only by itself. |
 | `/api/commands` | GET | `view` | The command log: what was switched, by whom, and whether the panel has agreed yet. |
 | `/api/rows` | GET | `view` | One data table as JSON, for the filter-and-sort controls that would otherwise need the whole page re-rendered. |
-| `/api/control` | POST | `operate` | One command for the queue, validated against `commands.py`. The agent validates it again. |
+| `/api/control` | POST | `operate` | One command for the queue, validated against `commands.py`. The agent validates it again. May carry `off_after_h` to switch it off again later. `program` changes one of the panel's own programs, checked first against the Pi's last report. `cron` replaces AqualinkD's schedules with the list it carries, refused unless the list it replaces (`expect`) is the one the Pi last reported. |
+| `/api/schedules` | GET | `view` | What is scheduled, what is waiting to be switched off, what ran and what was missed, and whether the scheduler thread is alive. |
+| `/api/scenes` | GET | `view` | Every scene — several controls in one tap — in words, in the order it runs, with what "then off after" switches off, and the templates the form offers. |
+| `/api/scene` | POST | `operate` | Save a scene: a name, up to ten steps (a switch on or off, a heater on or off, a heater's temperature) and an optional off-after. Validated step by step against `commands.py` now; run in a fixed safe order whatever order it was saved in. Running one is `/api/control` with `action: "scene"`. |
+| `/api/scene/delete` | POST | `operate` | Delete a scene. A schedule that runs it then does nothing, and says so. |
+| `/api/panel-schedules` | GET | `view` | The panel's own programs and AqualinkD's cron schedules, as the Pi last reported them, each described in words. Read-only: neither is edited here. See `docs/JANDY-PROGRAMS.md`. |
+| `/api/schedule` | POST | `operate` | Add a schedule: one command, once or daily/weekdays/weekends at a time in the pool's zone. Validated now, issued later through `/api/control`'s own path. |
+| `/api/schedule/delete` | POST | `operate` | Cancel a schedule or a pending auto-off. The household max-on cannot be cancelled here. |
 | `/api/chemical` | POST | `operate` | Log a dose. |
 | `/api/chemical/edit` | POST | `operate` | Correct a logged dose **in place** — it is our record of something we did, and nothing should put a wrong amount back. |
 | `/api/chemical/delete` | POST | `operate` | Remove a dose that never happened. |
+| `/api/chemical/stock` | POST | `operate` | Record a purchase (with what was paid, optionally) or a stocktake. Lands in `stock.csv`. |
+| `/api/chemical/stock/edit` | POST | `operate` | Correct a purchase or a stocktake **in place**, by its id — our own record, like a dose. |
+| `/api/chemical/stock/delete` | POST | `operate` | Remove a purchase or a stocktake that never happened. |
 | `/api/reading` | POST | `operate` | A test you ran yourself: strip, drop kit or pool shop. Lands in `manual.csv`. |
 | `/api/lab-correction` | POST | `operate` | Drop or override one lab reading. Appends to `corrections.csv`; never edits the lab's own file. |
 | `/api/pool-shape` | POST | `operate` | **Saves** the traced outline and the volume it implies. |
+| `/api/maintenance` | POST | `operate` | Mark the filter or the salt cell cleaned. Appends to `maintenance.csv`, and restarts the baseline Equipment health judges that part against. |
 | `/api/refresh` | POST | `operate` | Run a collector now. |
 | `/api/ask` | POST | `operate` | Put a question to the model, with the context `assistant.context()` builds. `operate` rather than `view` because it spends money and sends this pool's readings to a third party. |
 | `/api/settings` | POST | `admin` | Write `config.toml`. Audited with the values, not just the key names. |
@@ -2386,7 +2687,7 @@ and both carry their own rate limit:
 `/api/pool-shape` with no suffix **saves** and stays gated. The Caddy matcher
 for the public pair has no trailing wildcard for exactly that reason.
 
-Three more belong to the agent and authenticate with a bearer token instead of
+Six more belong to the agent and authenticate with a bearer token instead of
 the session token, because a daemon has no page to load one from. They are the
 whole of the protocol, and `docs/AGENT-PROTOCOL.md` is the reference:
 
@@ -2395,6 +2696,9 @@ whole of the protocol, and `docs/AGENT-PROTOCOL.md` is the reference:
 | `/api/agent/commands` | GET | The long-lived outbound stream the Pi holds open. Commands travel back down it. |
 | `/api/agent/sample` | POST | One controller sample. A stored sample re-renders both builds. |
 | `/api/agent/ack` | POST | What the agent did with a command, and what the panel said. |
+| `/api/agent/note` | POST | Which circuits changed and, when a door claimed it, which door: the story beside a sample, kept out of `samples.csv`. |
+| `/api/agent/scenes` | GET | The household's scenes in the order they run, which the agent keeps in memory and hands to poolhound local at `/scenes`, so a scene runs at the pool with the server unreachable. |
+| `/api/agent/schedules` | POST | Both kinds of equipment schedule as the Pi read them — the panel's own programs and AqualinkD's cron schedules — every 30 minutes, and at once when a program change finishes, carrying the panel's own answer to it. A snapshot, replaced whole, in `panel_schedules.json`. |
 
 
 ## Data
@@ -2411,8 +2715,14 @@ data/leslies.csv    occasional     Leslie's lab: the same, plus total chlorine
 data/manual.csv     manual         a test you ran yourself: strip, drop kit,
                                    pool shop. A fourth stream, never merged
 data/chemicals.csv  manual         chemical, amount, unit, pct, note
+data/stock.csv      manual         a purchase (with what was paid) or a count of
+                                   what is on the shelf. Its own file, because
+                                   every reader of chemicals.csv takes a row as
+                                   something poured into the pool
 data/corrections.csv on a mistake  drops and field overrides, append-only.
                                    Applied at load; the lab file is untouched
+data/maintenance.csv on a cleaning filter or salt cell cleaned, append-only;
+                                   restarts that part's Equipment health baseline
 data/audit.csv      every write    who changed what, and to what value
 data/wg_targets.csv on change      WaterGuru's own targets for this pool
 data/pool_shape.json on save       the traced pool and spa outline — the only
@@ -2516,6 +2826,7 @@ never becomes fictional pump hours.
 bin/                    thin entry points; all logic is in the package
   wg-collect            pull WaterGuru; spends one of the two calls a day
   leslies               pull Leslie's; returns the whole history, safe to re-run
+  weather               pull daily weather from Open-Meteo; ended days only
   chem                  log a dose, and print the whole chemical catalogue
   render                regenerate BOTH builds
   serve                 the UI with saving enabled
@@ -2537,9 +2848,12 @@ poolhound/
   waterguru.py          Cognito SRP -> temporary creds -> SigV4 Lambda call
   collect_wg.py         splits the daily pod readings from the lab results
   leslies.py            the login + XHR chain, and the results-table parser
+  weather.py            Open-Meteo: the rounded location it sends, the
+                        archive-over-forecast rule, and weather.csv's columns
   cadence.py            THE pull schedule: how often each lab is fetched, the
                         vendor floor, and whether a tick is due yet
-  chemicals.py          THE catalogue: chemicals, units, phases, dose maths
+  chemicals.py          THE catalogue: chemicals, units, phases, dose maths,
+                        and the saturation index arithmetic
   chem.py               the command-line dose log
   pool_shape.py         THE volume arithmetic: outlines, slices, ledge, spa
   templates.py          stock pool shapes, as unit outlines
@@ -2549,6 +2863,14 @@ poolhound/
   collection.py         Collection — every fetch, and whether alerts landed
   chemistry.py          the Pool chemistry tab
   upkeep.py             what keeping it balanced takes, by week and by year
+  fit.py                what moves this pool: THEORY.md's coefficients,
+                        fitted, each graded measured / combined / not yet
+  equipment.py          equipment health: filter, salt cell, heater, and
+                        the record of cleanings that resets them
+  anomaly.py            equipment anomalies happening NOW: a heater with no
+                        flow, a spa too hot, a freeze with the pump stopped;
+                        each rule named, graded and set in [anomaly]
+  stock.py              what is on the shelf, and how long it lasts
   help.py               the Guide tab: what each tab does, then the wiring
   policies.py           Safety & privacy: the disclaimer, no support, privacy
   panels.py             the Pool control, Chemicals, Settings and volume tabs
@@ -2556,6 +2878,14 @@ poolhound/
   icons.py              inline SVG icons; nothing is fetched from a CDN
   commands.py           THE command vocabulary, shared by server and agent
   queue_.py             the command queue and the SSE fan-out
+  schedule.py           commands that wait for a time, the auto-off, and
+                        the household max-on net; a thread in bin/serve
+  schedule_ui.py        the schedule section of Pool control, and its script
+  programs.py           the panel's own programs and AqualinkD's schedules:
+                        their shape, shared by the agent and the server
+  programs_ui.py        Pool control's section showing both, and its script
+  scenes.py             scenes: several controls in one tap, their safe order
+  scenes_ui.py          Pool control's Scenes section and its editor
   agent.py              runs on the Pi: pushes samples on a heartbeat AND
                         the moment the panel changes, executes commands
   server.py             the write API and the two agent endpoints
@@ -2586,14 +2916,29 @@ poolhound/
   checks_charts.py      the charts, and the non-colour fallbacks
   checks_chrome.py      the masthead, nav, theme and mark
   checks_collection.py  the Collection tab and the run log behind it
+  checks_fit.py         a simulated pool with planted coefficients: the fit
+                        must recover them, and report a fixed dial combined
   checks_gates.py       routes, roles, Caddy, and the two builds' boundary
   checks_lowsev.py      the long tail, each one a defect that shipped
   checks_mail.py        the alert email: both renderings, and no palette
   checks_photo.py       the tracer, EXIF, HEIC and what is stripped
   checks_render_data.py the loaders, against data shaped to break them
+  checks_saturation.py  the saturation index against the handbook, and the
+                        household figure kept off the public page
   checks_switchlog.py   who switched what, and the ways that goes wrong
+  checks_schedule.py    daylight saving, missed runs, auto-off, the net
+  checks_programs.py    the panel-programs snapshot: shape, refusal, words
+  checks_heaters.py     a heater's own switch, and a temperature that arrives
+  checks_scenes.py      scenes: their order, refusals, the pump, stopping short
+  checks_cron.py        saving AqualinkD's schedules: rebuilt fields, stale pages, read-back
   checks_upkeep.py      the acid balance, the salt trend, what follows
+  checks_equipment.py   the filter, cell and heater estimators, and refusal
+  checks_anomaly.py     each anomaly rule fires on its fault and not on an
+                        ordinary pool; said once, and once when it ends
+  checks_stock.py       on hand across counts, purchases and doses
   checks_vault.py       the credential store, and its isolation
+  checks_weather.py     what weather sends, which day is a day, which source
+                        wins — against the synthetic responses in fixtures/
 
 config/
   config.example.toml   the template that ships
@@ -2701,6 +3046,9 @@ before its coefficients mean anything, and **every day not collecting is a day
 that cannot be recovered** — which is why the collectors were running before any
 of this was designed.
 
-Once there is data, the fit should answer concrete questions: what SWG dial and
-pump schedule hold FC at target, what an hour of sheer descent costs in pH, and
-how much acid actually moves this pool by 0.1. See [THEORY.md](THEORY.md).
+The fit now exists (Home → What moves this pool) and answers what the record
+can: what an hour of sheer descent costs in pH, how much acid actually moves
+this pool by 0.1, how much chlorine the cell makes and the sun takes. What it
+does not yet do is feed those figures back into the dose arithmetic or set the
+SWG dial from a target — that is the next decision, and a deliberate one. See
+[THEORY.md](THEORY.md).

@@ -81,6 +81,15 @@ STACK=@@STACK@@
 # Leslie's: in-store bench photometer results, scraped as a browser would.
 5 * * * * root $STACK/poolhound/collect.sh leslies >> $POOLHOUND_LOG 2>&1
 
+# Weather at the pool, from Open-Meteo: sun, rain, air temperature and
+# evaporation for the days that have ENDED. Daily and fixed, because there is
+# nothing to choose -- the data is one row per day and today is not a day until
+# it is over -- so it is a schedule here rather than a setting in cadence.py.
+# 10:20 UTC is 03:20 PDT and 02:20 PST: after the pool's midnight in either
+# half of the year, so yesterday is complete when it is asked for. A pool with
+# no [weather] coordinates in config.toml exits 0 having sent nothing.
+20 10 * * * root $STACK/poolhound/collect.sh weather >> $POOLHOUND_LOG 2>&1
+
 # Health and notifications: has a collector stopped, is the chemistry badly out,
 # did a heater come on.
 */30 * * * * root $STACK/poolhound/collect.sh watch --quiet >> $POOLHOUND_LOG 2>&1

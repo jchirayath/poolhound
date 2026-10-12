@@ -57,6 +57,17 @@ CONSOLE = "local"
 ANONYMOUS = "anonymous"
 NOT_A_PERSON = (CONSOLE, ANONYMOUS)
 
+# THE TWO ANSWERS THAT ARE A MACHINE ACTING ON A PERSON'S EARLIER DECISION.
+# schedule.py issues commands through the same path a button press takes, and
+# the audit's `by` column has to say it was not a person pressing anything at
+# that moment -- "alice@example.com started the spa heater at 19:00" is false
+# when alice scheduled it at noon. The schedule's own record keeps who created
+# it. Named here because this is where the other non-people are named, and a
+# row's `by` is read against all of them.
+SCHEDULER = "schedule"
+AUTO_OFF = "auto-off"
+MACHINES = (SCHEDULER, AUTO_OFF)
+
 LEVELS = ("view", "operate", "admin")
 _RANK = {name: i for i, name in enumerate(LEVELS)}
 
@@ -68,15 +79,34 @@ NEEDS = {
     "/api/chemical":         "operate",
     "/api/chemical/edit":    "operate",
     "/api/chemical/delete":  "operate",
+    # What was bought and what is on the shelf: the same household record as
+    # a dose, and the same person who logs one should be able to say they
+    # bought the acid they poured.
+    "/api/chemical/stock":        "operate",
+    "/api/chemical/stock/edit":   "operate",
+    "/api/chemical/stock/delete": "operate",
     "/api/reading":          "operate",
     "/api/lab-correction":   "operate",
     "/api/pool-shape":       "operate",
     "/api/refresh":          "operate",
+    # "The filter was cleaned" restarts the baseline the Equipment health
+    # section judges the pump against -- a change to what a figure is
+    # computed from, like a lab correction, so it sits with that.
+    "/api/maintenance":      "operate",
     # Asking the assistant spends somebody's money at a provider and sends this
     # pool's readings out of the house. `view` is the floor for reading the
     # private tabs; this does more than read, so it sits with the others that
     # act.
     "/api/ask":              "operate",
+    # A schedule is a deferred press of the same buttons, so it costs what a
+    # press costs. Cancelling one is the same level: anybody who could have
+    # pressed the button may decide it should not be pressed after all.
+    "/api/schedule":         "operate",
+    "/api/schedule/delete":  "operate",
+    # A scene is presses made together: saving one decides what a single tap
+    # will do, so it costs what a press costs.
+    "/api/scene":            "operate",
+    "/api/scene/delete":     "operate",
 
     # Read routes that are not the whole history. The command log names who
     # started the spa heater, which anybody who can see the control tab can
@@ -86,6 +116,14 @@ NEEDS = {
     # the same floor: anybody who may read the private tabs may page through
     # them.
     "/api/rows":             "view",
+    # What is due, what ran and what was missed. Anybody who can see the
+    # controls can see what is going to happen to them -- the threat model's
+    # answer to "somebody with operate schedules the heater for 03:00" is that
+    # everybody else can see it on the list.
+    "/api/schedules":        "view",
+    "/api/scenes":           "view",
+    # The panel's own programs and AqualinkD's schedules, as the Pi read them.
+    "/api/panel-schedules":  "view",
 
     "/api/settings":         "admin",
     "/api/credential":       "admin",
@@ -123,11 +161,24 @@ ROLE_UI = {
     "/api/chemical":         "#chem-form button, #chem-form input, #chem-form select",
     "/api/chemical/edit":    "#chem-form button, #chem-form input, #chem-form select",
     "/api/chemical/delete":  "[data-del]",
+    "/api/chemical/stock":        "#stock-form button, #stock-form input, #stock-form select",
+    "/api/chemical/stock/edit":   "#stock-form button, #stock-form input, #stock-form select",
+    "/api/chemical/stock/delete": "[data-stock-del]",
     "/api/reading":          "#reading-form button, #reading-form input, #reading-form select",
     "/api/lab-correction":   "#set-corrections button, #set-corrections input, #set-corrections select",
     "/api/pool-shape":       "#shape-save, #design-save",
     "/api/refresh":          ".refresh-wrap button",
+    "/api/maintenance":      "#maint-form button, #maint-form input, #maint-form select",
     "/api/ask":              "#ask-form button, #ask-form input, #ask-form textarea",
+    "/api/schedule":         "#sched-form button, #sched-form input, #sched-form select",
+    # The Cancel buttons are drawn by the page script from /api/schedules, so
+    # there is nothing in the rendered markup for a selector to find -- and the
+    # check that every selector here matches the page is right to refuse one
+    # that cannot. The script dims each button it draws from the same RANK
+    # the role check uses; the server refuses regardless.
+    "/api/schedule/delete":  "",
+    "/api/scene":            "",
+    "/api/scene/delete":     "",
     "/api/settings":         "#settings-form button, #settings-form input, #settings-form select",
     "/api/notify-test":      "#notify-form button, #notify-form input, #notify-form select",
     "/api/credential":       ".cred button, .cred input, .cred select",
@@ -136,6 +187,9 @@ ROLE_UI = {
     # dim -- a `view` reader is meant to see the command log and page the tables.
     "/api/commands":         "",
     "/api/rows":             "",
+    "/api/schedules":        "",
+    "/api/scenes":           "",
+    "/api/panel-schedules":  "",
     # The download links are anchors, and an anchor has no .disabled -- setting
     # it is a silent no-op, which is how a view-only reader kept a working
     # "download the whole history" link. They are hidden instead, by the page
@@ -228,6 +282,11 @@ def role(who, cfg=None):
     # call this "local" too, which handed the console's privileges to anybody a
     # proxy forwarded without an identity header.
     if who == "anonymous":
+        return "view"
+    # A machine name arriving as an IDENTITY is somebody spelling one, not the
+    # scheduler -- which never comes in through the front door. Never more
+    # than view, whatever a policy's default says.
+    if who in MACHINES:
         return "view"
     if not who:
         a = _cfg_section(cfg)

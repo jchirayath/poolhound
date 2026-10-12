@@ -275,6 +275,43 @@ def plausible_amount(chem, amount, unit):
                        f"Check the decimal point.")
     return True, ""
 
+# THE LARGEST AMOUNT THAT IS STOCK, which is not the largest that is a dose.
+# A season's acid is a case of four jugs or two; a pallet of salt is forty
+# bags. MAX_BASE refuses 25 gal of acid as a dose, correctly, and would refuse
+# it as a purchase too -- so a household that buys by the case could not
+# record what it bought. Same purpose as MAX_BASE: catch a decimal-point slip,
+# in base units, not second-guess a big order.
+MAX_STOCK_BASE = {"liquid": 128.0 * 128,   # 128 US gallons, in fl oz
+                  "solid":  2000.0}        # a ton
+
+def plausible_stock(chem, amount, unit, zero_ok=False):
+    """(ok, why) for an amount bought or counted. The one place that decides.
+
+    The unit rule is the dose rule -- "a gallon of salt" is refused here for
+    the reason to_base() gives -- and `zero_ok` is for a stocktake, where
+    "I have none left" is a real count and the most useful one there is.
+    """
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return False, "amount has to be a number"
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        return False, "amount has to be a number"
+    if amount < 0 or (amount == 0 and not zero_ok):
+        return False, ("an amount cannot be negative" if amount < 0 else
+                       "a purchase has to be more than zero")
+    base = to_base(chem, amount, unit)
+    if base is None:
+        return False, (f"{unit!r} is not a unit for a {CHEMICALS[chem]['phase']} "
+                       f"— use one of: {', '.join(sorted(units_for(chem)))}")
+    cap = MAX_STOCK_BASE[CHEMICALS[chem]["phase"]]
+    if base > cap:
+        human = cap / units_for(chem)[unit]
+        return False, (f"{amount:g} {unit} of {CHEMICALS[chem]['label']} is more "
+                       f"than this will record as stock — about {human:g} {unit} "
+                       f"at most. Check the decimal point.")
+    return True, ""
+
 def effects(chem, amount, unit, pct, gallons, ta=90.0):
     """Effect of a dose. Alkalinity is passed where it matters — only acid and
     soda ash care, and only because pH response depends on how buffered the
@@ -542,3 +579,128 @@ def dose_response(chem_rows, readings, when_fn, num_fn, window_h=36):
             "fc_after": num_fn(a.get("free_cl")),
         })
     return obs
+
+
+# ======================================================== SATURATION INDEX
+# Whether this water will take calcium out of the plaster or leave it on the
+# heater, computed from this pool's own readings at the temperature the water
+# is ACTUALLY at.
+#
+# WHY HERE AND NOT IN chemistry.py. chemistry.py is a RENDERER: it imports
+# render at module scope and loads the config the moment it is imported. Home's
+# actions(), the assistant's context and bin/selftest all need this answer, and
+# they could only reach a function living there through that import -- a cycle
+# with render, and a config load as a side effect of asking for arithmetic.
+# This module is pure (it imports `re` and nothing of ours), every consumer
+# already imports it, and its docstring is the promise "the maths lives here so
+# nothing writes a second copy". The saturation index is the same kind of fact
+# as a dose coefficient: a published relation, applied to measurements, that
+# two tabs must not be able to compute two ways. seams.py holds it here.
+#
+# WHY IT NEEDS COMPUTING AT ALL. The labs report an index -- Leslie's does, and
+# WaterGuru's lab does -- but at a temperature neither of them tells us, on a
+# sample carried indoors. The index moves about 0.1 for every 10 degrees F, and
+# this pool's water ranges thirty degrees across a year and forty more in the
+# spa. A plaster finish does not care what the index was on a counter in a
+# store; it cares what it is at 2 a.m. in February, and the heater exchanger
+# cares what it is at 102.
+
+import math as _math
+
+# The band the product already uses for the lab-reported index -- the glossary
+# says "below about -0.3 it takes calcium out of plaster and grout; above +0.3
+# it leaves scale" -- so a computed index and a reported one are read against
+# the same line.
+LSI_BALANCED = (-0.3, 0.3)
+
+# What TDS is taken to be when no lab has reported it. 1000 ppm is the figure
+# the pool trade's tables are written around (the PHTA/CPO handbook's 12.1
+# constant is the under-1000 case). A SALT pool is never under it, so the
+# caller raises the floor to the measured salt -- dissolved salt IS dissolved
+# solids -- and says so. The term is gentle: 1000 against 4000 ppm moves the
+# index by 0.06.
+TDS_ASSUMED = 1000.0
+
+# CYANURIC ACID IS COUNTED BY THE ALKALINITY TEST, AND IT IS NOT CARBONATE.
+#
+# A total-alkalinity titration counts every base the acid reacts with, and at
+# pool pH most of the stabiliser is the cyanurate ion. It buffers, but it
+# cannot hold calcium carbonate in solution, so the saturation index wants the
+# CARBONATE share only. The flat "subtract a third of the CYA" rule is the
+# pH 7.5 case frozen; the real share depends on pH, because pH decides how much
+# of the cyanuric acid has given up its proton.
+#
+# Computed from the chemistry rather than read off a table: cyanuric acid's
+# first dissociation, pKa 6.88, and one equivalent per molecule (CaCO3
+# equivalent weight 50 over cyanuric acid's 129.07 g/mol). That reproduces the
+# correction table Taylor Technologies prints for its alkalinity test --
+# 0.22 at pH 7.0, 0.26 at 7.2, 0.30 at 7.4, 0.33 at 7.6, 0.35 at 7.8 -- to
+# within 0.005 at every row, which bin/selftest asserts.
+CYA_PKA = 6.88
+CYA_TO_CACO3 = 50.0 / 129.07
+
+
+def cya_alkalinity(cya, ph):
+    """How much of a total-alkalinity reading is cyanurate, in ppm as CaCO3."""
+    if not cya or ph is None:
+        return 0.0
+    return cya * CYA_TO_CACO3 / (1.0 + 10.0 ** (CYA_PKA - ph))
+
+
+def saturation_index(ph, temp_f, ch, ta, cya=None, tds=None):
+    """The Langelier saturation index, and the four terms it is built from.
+
+    LSI = pH - pHs, with pHs = (9.3 + A + B) - (C + D), where
+        A = (log10 TDS - 1) / 10                     total dissolved solids
+        B = -13.12 log10(T degC + 273) + 34.55       temperature
+        C = log10(calcium hardness as CaCO3) - 0.4   calcium
+        D = log10(carbonate alkalinity as CaCO3)     alkalinity
+    This is Langelier's index in the computational form the water-treatment
+    references carry (Carrier, Handbook of Air Conditioning System Design,
+    1965, reproduced since by most corrosion and boiler-water texts). It is
+    continuous in every input, which the pool trade's printed factor tables
+    are not: the PHTA/CPO handbook's LSI = pH + TF + CF + AF - 12.1 is the same
+    relation with each term rounded to 0.1 and TDS folded into the constant,
+    and bin/selftest holds this function to that handbook's worked examples
+    within the rounding its tables carry.
+
+    Temperature in degrees FAHRENHEIT, because the panel reports Fahrenheit and
+    the heater setpoints in commands.SETPOINTS are Fahrenheit. Alkalinity is
+    the TOTAL reading; the cyanurate share is taken out here, at this pH.
+
+    Returns None when an input the index cannot be computed without is absent
+    -- pH, temperature, calcium or alkalinity. There is no typical value for
+    any of those that would make the answer about this water. CYA and TDS
+    absent are handled, and the CALLER must say so: CYA as zero (which reads
+    the index HIGH, the less alarming direction), TDS as TDS_ASSUMED.
+    """
+    if None in (ph, temp_f, ch, ta) or ch <= 0 or ta <= 0:
+        return None
+    cya_alk = cya_alkalinity(cya, ph)
+    carb = ta - cya_alk
+    if carb <= 0:
+        # More stabiliser than the alkalinity reading can account for. Not an
+        # index; a reading to re-take.
+        return None
+    tds_used = tds if (tds and tds > 0) else TDS_ASSUMED
+    temp_c = (temp_f - 32.0) * 5.0 / 9.0
+    a = (_math.log10(tds_used) - 1.0) / 10.0
+    b = -13.12 * _math.log10(temp_c + 273.0) + 34.55
+    c = _math.log10(ch) - 0.4
+    d = _math.log10(carb)
+    phs = (9.3 + a + b) - (c + d)
+    return {"lsi": ph - phs, "phs": phs, "temp_f": temp_f,
+            "carbonate_alk": carb, "cya_alk": cya_alk, "tds": tds_used,
+            "terms": {"tds": a, "temperature": b, "calcium": c,
+                      "alkalinity": d}}
+
+
+def lsi_word(lsi):
+    """What an index means for the plaster, in the page's vocabulary."""
+    if lsi is None:
+        return "unknown"
+    if lsi < LSI_BALANCED[0]:
+        return "aggressive"
+    if lsi > LSI_BALANCED[1]:
+        return "scale-forming"
+    return "balanced"

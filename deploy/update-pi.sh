@@ -86,7 +86,18 @@ if (( CHECK )); then
     warn "  run ./deploy/update-pi.sh to ship it"
     fails=$((fails+1))
   else
-    ok "the Pi is running the current code ($pi_rev)"
+    ok "the Pi is running this checkout's code ($pi_rev)"
+  fi
+  # AND IS THIS CHECKOUT CURRENT? The comparison above is with whatever is
+  # checked out HERE, so a Pi deployed from a feature branch, from a dirty
+  # tree, or from a clone that has not been pulled matched it and read
+  # "current". The server's --check learned the same thing on 2026-09-28, and
+  # it is one helper so the two grade the same drift the same way — including
+  # treating pi_rev, which is read off another machine, as untrusted input it
+  # validates before git sees it. Skipped when there is no REVISION: that is
+  # already a failure above, and counting it twice says nothing new.
+  if [[ -n "$pi_rev" ]]; then
+    "$SRC/deploy/rev-freshness.sh" --what "the Pi" "$pi_rev" || fails=$((fails+1))
   fi
 
   # THE SAME SECRET AT BOTH ENDS, compared without revealing it. The

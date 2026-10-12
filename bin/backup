@@ -46,8 +46,16 @@ from poolhound import config, locking, runlog     # noqa: E402
 # Everything whose loss would be permanent. Derived from config.HISTORY_FILES
 # — the same list seed_config() uses to decide whether a directory holds a pool
 # — plus the records that are about what we DID rather than what we measured.
+#
+# weather.csv is here although Open-Meteo would serve most of it again: the UV
+# index on an archive day is CARRIED from the forecast model, which only
+# answers for the last 92 days, so that column is not re-fetchable once it ages
+# out — and a fitted coefficient should be reproducible from the exact inputs
+# it was fitted to, provenance column included. A year of it is ~40 KB. It is
+# deliberately NOT in config.HISTORY_FILES; weather.py says why.
 EXTRA = ("corrections.csv", "audit.csv", "runs.csv", "wg_targets.csv",
-         "pool_shape.json", "config.toml")
+         "pool_shape.json", "config.toml", "weather.csv",
+         "maintenance.csv")
 
 KEEP_DAYS = 30
 

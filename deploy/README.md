@@ -96,6 +96,28 @@ would be a script that contains them.
 
 If the share is empty it says so and refuses to call the run a success.
 
+**`--check` answers "is it current" as well as "is it working".** It used to
+compare the image's REVISION only with the pages that image rendered, and an
+old image agrees with its own pages perfectly: on 2026-09-28 the server was
+three commits behind after four days of failed builds, with every line green.
+It now hands the same REVISION to `deploy/rev-freshness.sh`, which fetches
+`origin main` (read-only: it moves `origin/main` in this clone and nothing
+else) and grades it:
+
+| the deployed revision is | against `origin/main` | against local `main` |
+|---|---|---|
+| the tip | ✓ | ✓ |
+| behind | **fails**, naming N and listing the missing subjects (ten, then "… and K more not shown") | **fails** — merged here, not shipped |
+| ahead | warns UNPUSHED — the server runs what origin has never seen | warns — this checkout needs a pull |
+| on neither (an unmerged branch) | **fails**, NOT ON MAIN, listing what only the server has | **fails** |
+| `-dirty` | **fails**, separately: code no commit records | |
+| unrecognised, or a hash this clone lacks | **fails** — cannot tell | |
+
+A fetch that fails is a failure too; the comparison then runs against the
+`origin/main` last fetched and says so. Local `main` ahead of `origin/main` is
+always a warning, "PUSH HAS DRIFTED", whatever is deployed. `update-pi.sh
+--check` runs the same comparison for the Pi's REVISION.
+
 ## Operating it
 
 ```bash
@@ -165,7 +187,9 @@ A quiet healer is the healthy state: it logs one line at warning level when it
 had to start the agent, and nothing at all otherwise.
 
 `--check` compares the Pi's `REVISION` against the local git rev and exits
-non-zero on a mismatch. It used to print `agent.py`'s mtime, which `rsync -a`
+non-zero on a mismatch — and then against `origin/main` and local `main`
+through `rev-freshness.sh`, because a Pi deployed from a feature branch or an
+unpulled clone matched the checkout it was deployed from and read current. It used to print `agent.py`'s mtime, which `rsync -a`
 copies from the source checkout — so it reported when the repo was cloned, not
 what was deployed, and could not detect the three-week drift this script exists
 to prevent. The first run after that was fixed found the agent 34 commits
@@ -216,8 +240,10 @@ actually holds. The same applies to anything else that writes: `bin/chem`,
 | `poolhound-agent-ensure.service` | the healer: one shot, starts the agent if it is not running, and says so at warning level only when it had to |
 | `poolhound-agent-ensure.timer` | runs the healer 2 min after boot and every 5 min. Covers what `Restart=always` cannot — a start job systemd deleted, or a service stopped by hand and forgotten. **To stop the agent deliberately, stop this timer too** (`systemctl stop poolhound-agent-ensure.timer poolhound-agent`) or `systemctl mask poolhound-agent`; otherwise it comes back within 5 min |
 | `update-pi.sh` | ships the agent to the Pi, and `--check` compares its REVISION |
+| `rev-freshness.sh` | the one comparison both `--check`s use for "is it CURRENT": a deployed REVISION against `origin/main` (fetched) and local `main`. Behind, not on main, dirty, or unanswerable fails; unpushed only warns. Validates the REVISION before git sees it, because it was read off another machine |
 | `poolhound-local.html` | **poolhound local**: a copy of the optional page on the author's Pi — friendly circuit names, verified switching, and the agent's activity list — with the hostname removed. Nothing installs it; it is a reference, and `bin/screenshots` photographs it against a synthetic AqualinkD. See "Naming the door a panel change came through" |
 | `pull-backup.sh` | run on a WORKSTATION: brings the newest server tarball off the VM, verifies it opens and holds `samples.csv`, prunes to 30 days. Read-only on the server, and it writes no CSV anywhere — it is not a collector, which is the distinction `refuse_off_deployment()` is about. `--check` grades what is already local and exits non-zero when it has gone stale |
+| `aqualinkd` | the AqualinkD patch that reads the panel's OWN programs (`GET /api/programs`), `build.sh` that builds and tests it, and `install-pi.sh` with `--check` and `--rollback`. Its README says why it is inside AqualinkD rather than beside it |
 | `launchd` | `com.poolhound.backup-pull.plist`: the daily 04:10 schedule for the above, on a Mac. launchd rather than cron because macOS sleeps and cron does not fire while it is asleep — a backup that silently does not happen on the nights it matters |
 | `server.env.example` | the template for `server.env`: resource group, VM, vault, share |
 | `server.env` | yours; gitignored. Names, not secrets — the secrets stay in Key Vault. It is also the ONLY place this deployment's hostnames and stack path are written down |
@@ -499,6 +525,25 @@ The page reaches it through the same kind of hop as the claim:
 ```
 handle /poolactivity {
     rewrite * /activity
+    reverse_proxy 127.0.0.1:8791
+}
+```
+
+### Scenes at the pool
+
+The page's Scenes buttons come from the same agent. It fetches the
+household's scenes from `/api/agent/scenes` every ten minutes and keeps them
+**in memory only**, so a scene can be run at the pool with the server
+unreachable, from the last list the Pi saw (the page says so when it is).
+The page runs a scene itself, one step at a time, with the same wake, claim,
+press, wait and verify as every button on it, and stops at the first step that
+does not take. "Then switch off after" is the server's to arrange, so a scene
+run from this page does not switch itself off, and its confirmation says so;
+the household max-on still applies, because it reads the panel.
+
+```
+handle /poolscenes {
+    rewrite * /scenes
     reverse_proxy 127.0.0.1:8791
 }
 ```

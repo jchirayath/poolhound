@@ -185,6 +185,7 @@ def _pi_payloads(data):
 
 def _pi_page(browser, data, out):
     import json
+    from poolhound import scenes as _scenes
     devices, status, activity = _pi_payloads(data)
     with open(os.path.join(ROOT, "deploy", "poolhound-local.html"), encoding="utf-8") as f:
         page_html = f.read()
@@ -192,7 +193,13 @@ def _pi_page(browser, data, out):
                "/poolapi/api/devices": ("application/json",
                                         json.dumps({"devices": devices})),
                "/poolapi/api/status": ("application/json", json.dumps(status)),
-               "/poolactivity": ("application/json", json.dumps(activity))}
+               "/poolactivity": ("application/json", json.dumps(activity)),
+               # The scenes block, from the same starting points the app offers,
+               # in the order they run -- pictures of scenes nobody has saved.
+               "/poolscenes": ("application/json", json.dumps({"scenes": [
+                   {"id": f"demo{i}", "name": t["name"], "off_after_h": t["off_after_h"],
+                    "steps": sorted(t["steps"], key=_scenes.order_key)}
+                   for i, t in enumerate(_scenes.templates()[2:])], "error": None}))}
 
     def answer(route):
         from urllib.parse import urlsplit

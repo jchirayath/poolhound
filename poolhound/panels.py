@@ -30,9 +30,15 @@ from . import vault
 from . import access
 from . import commands as CMD
 from . import switchlog
+# The scheduler's markup and script live with the scheduler; this tab only
+# places them. See schedule_ui.py for why they are not written out here.
+from . import schedule_ui as _SUI
+from . import programs_ui as _PUI
+from . import scenes_ui as _SCUI
 from .queue_ import QUEUE
 from . import templates as TPL
 from .render import (rows, num, when, ago, best_lab, targets, newest,
+                     household_prices,
                      data_table, DAILY_MEASURES, MEASURE_NAMES, MATTERS)
 from .icons import icon
 
@@ -85,7 +91,7 @@ def _unattributed(row):
             'which should not happen">missing</span>')
 
 
-def chemicals_panel(upkeep_est=None):
+def chemicals_panel(upkeep_est=None, stock_rows=None):
     log = rows("chemicals.csv")
 
     # THE CHEMISTRY AND WHAT IT SAYS ON THE BAG. Listing only the chemistry is
@@ -217,6 +223,7 @@ regression would be fitting noise.</p>
     needs the write API running.</p>
   </div>
 </section>
+{_stock_section(stock_rows)}
 {_ledger_section(log)}
 {_upkeep_section(upkeep_est)}'''
 
@@ -245,8 +252,7 @@ def _ledger_section(log):
     section says so rather than showing an empty table.
     """
     from . import upkeep
-    L = upkeep.ledger(log, {k: config.chemical_price(k, CFG)
-                            for k in config.PRICE_SETTINGS}, when, num)
+    L = upkeep.ledger(log, household_prices(CFG), when, num)
     # Inside a script element "</" ends it, whatever the type says.
     data = json.dumps(L, separators=(",", ":")).replace("</", "<\\/")
     return f'''
@@ -278,6 +284,127 @@ def _ledger_section(log):
     scripts are off.</p></noscript>
   </div>
   <script type="application/json" id="dose-ledger">{data}</script>
+</section>'''
+
+
+# How many purchase and stocktake rows the section renders. Named for the
+# reason DOSE_SHOW is: the number in the markup and the sentence admitting the
+# truncation cannot drift apart.
+STOCK_SHOW = 40
+
+
+def _stock_row(r):
+    """One purchase or stocktake, with its own edit and delete buttons.
+
+    Every field the form needs rides on the Edit button, as on a dose, so
+    loading a row back needs no second lookup.
+    """
+    from . import stock
+    f = lambda k: esc(r.get(k))
+    return (
+        f'<tr><td>{esc((r.get("ts") or "")[:16].replace("T", " "))}</td>'
+        f'<td>{esc(stock.KINDS.get(r.get("kind", ""), r.get("kind", "")))}</td>'
+        f'<td>{esc(CH.SHORT_NAMES.get(r.get("chemical", ""), r.get("chemical", "")))}</td>'
+        f'<td class="n">{f("amount")} {f("unit")}</td>'
+        f'<td class="n">{f("pct")}%</td>'
+        f'<td class="n">{"$" + f("paid") if r.get("paid") else "—"}</td>'
+        f'<td>{f("note")}</td>'
+        f'<td class="by">{f("by") or _unattributed(r)}</td>'
+        f'<td class="rm">'
+        f'<button type="button" class="x stock-edit" data-id="{f("id")}" '
+        f'data-ts="{f("ts")}" data-kind="{f("kind")}" data-chemical="{f("chemical")}" '
+        f'data-amount="{f("amount")}" data-unit="{f("unit")}" data-pct="{f("pct")}" '
+        f'data-paid="{f("paid")}" data-note="{f("note")}" '
+        f'aria-label="Edit this entry" title="Edit">&#9998;</button>'
+        f'<button type="button" class="x" data-stock-del="{f("id")}" '
+        f'aria-label="Delete this entry" title="Delete">&times;</button></td></tr>')
+
+
+def _stock_section(summary):
+    """What is on the shelf: the figure, then the form and the record behind it.
+
+    Absent, not empty, when nothing was computed -- the public build cuts this
+    tab. An install with no purchases and no count gets the sentence saying how
+    to start, from stock.block(), rather than an empty table.
+    """
+    if summary is None:
+        return ""
+    from . import stock
+    log = rows(stock.FILE)
+    opts = "".join(f'<option value="{k}">{esc(CH.shelf_label(k))}</option>'
+                   for k in CH.CHEMICALS)
+    body = "".join(_stock_row(r) for r in reversed(log[-STOCK_SHOW:]))
+    truth = (f'showing the most recent <b>{STOCK_SHOW}</b> of {len(log):,} '
+             f'&middot; <a class="dt-get" href="/api/export/{stock.FILE}" download>'
+             f'&darr; every row as CSV</a>' if len(log) > STOCK_SHOW else
+             f'{len(log):,} entr{"y" if len(log) == 1 else "ies"} recorded'
+             if log else "")
+    if not body:
+        body = ('<tr><td colspan="9" class="empty">Nothing recorded yet.</td></tr>')
+    now = dt.datetime.now().strftime("%Y-%m-%dT%H:%M")
+    return f'''
+<section id="stock">
+  <h2>What is on the shelf</h2>
+  <p class="sub">On hand is the last count, plus what was bought since, minus the
+  doses logged since. Doses get forgotten, so a figure built only from purchases
+  drifts for ever; a count is what pulls it back. How long each lasts is the
+  rate of use from the upkeep figures below, or from your logged doses where
+  there is none, and it says which.</p>
+  <div class="card">
+    {stock.block(summary, config.stock_low_weeks(CFG))}
+  </div>
+  <div class="card">
+    <h3 class="fh" style="margin:0 0 6px;padding-top:0;border-top:0">Record a purchase or a count</h3>
+    <form id="stock-form" class="form">
+      <div class="frow">
+        <label class="f f-sm"><span>What</span>
+          <select name="kind" id="stock-kind">
+            <option value="purchase">Bought</option>
+            <option value="stocktake">Counted what is on the shelf</option>
+          </select></label>
+        <label class="f"><span>Chemical</span>
+          <select name="chemical" id="stock-chem">{opts}</select></label>
+        <label class="f f-sm"><span>Amount</span>
+          <input type="number" name="amount" id="stock-amount" step="any" min="0" required></label>
+        <label class="f f-sm"><span>Unit</span>
+          <select name="unit" id="stock-unit"></select></label>
+      </div>
+      <div class="frow">
+        <label class="f f-sm"><span>Strength <i>%</i></span>
+          <input type="number" name="pct" id="stock-pct" step="any" min="0" max="100"></label>
+        <label class="f f-sm" id="stock-paid-f"><span>Paid <i>optional, $ total</i></span>
+          <input type="number" name="paid" id="stock-paid" step="0.01" min="0"></label>
+        <label class="f"><span>When</span>
+          <input type="datetime-local" name="ts" id="stock-ts" value="{now}"></label>
+        <label class="f f-wide"><span>Note <i>optional</i></span>
+          <input type="text" name="note" placeholder="e.g. two jugs at Leslie's"></label>
+      </div>
+      <p class="sub" id="stock-help">A price paid becomes this household's price
+      for that chemical wherever Settings has none, so the upkeep and by-month
+      costs use what you actually paid.</p>
+      <div class="factions">
+        <button type="submit" class="btn primary">Record it</button>
+        <span class="fmsg" id="stock-msg" aria-live="polite"></span>
+      </div>
+      <div class="offline-note">
+        <p>The write API is not running, so this form cannot save. From a
+        terminal on the server:</p>
+        <pre>bin/chem bought acid 2 gal --paid 19.49
+bin/chem stocktake acid 2.5 gal</pre>
+      </div>
+    </form>
+  </div>
+  <div class="card"><div class="scroll"><table id="stock-log">
+    <caption class="sr">Purchases and counts recorded</caption>
+    <thead><tr><th>When</th><th>What</th><th>Chemical</th><th>Amount</th>
+    <th>Strength</th><th>Paid</th><th>Note</th><th>Recorded by</th>
+    <th><span class="sr">Edit or remove</span></th></tr></thead>
+    <tbody>{body}</tbody></table></div>
+    {f'<p class="sub" style="margin:10px 0 0">{truth}</p>' if truth else ''}
+    <p class="sub" style="margin:12px 0 0">These are our own record, like the
+    doses, so a wrong one is corrected in place with its Edit button rather
+    than added over. Editing and removing need the write API running.</p>
+  </div>
 </section>'''
 
 
@@ -762,6 +889,7 @@ def control_panel():
           <button type="button" class="btn ctl-off" data-v="0"
                   aria-label="Turn the {lbl} off">Off</button>
         </div>
+        {_SUI.after_select(dev, idn=f'ctl-a-{_slug(dev)}')}
         {f'<p class="ctl-why">{esc(why)}</p>' if why else ''}
         <p class="ctl-cool">{spec["cooldown_s"]}s cooldown</p>
       </div>'''
@@ -814,6 +942,12 @@ def control_panel():
                minutes, on the most expensive thing the pool can do. Empty and
                hidden until the page has something to say. -->
           <span class="st sp-wait" hidden></span></div>
+        {f"""<div class="ctl-b ctl-heat">
+          <button type="button" class="btn ctl-heat-on" data-v="1"
+                  aria-label="Switch the {lbl} on">On</button>
+          <button type="button" class="btn ctl-heat-off" data-v="0"
+                  aria-label="Switch the {lbl} off">Off</button>
+        </div>""" if dev in CMD.HEATERS else ""}
         <div class="ctl-b">
           <input type="number" class="ctl-val" min="{spec["min"]}" max="{spec["max"]}"
                  value="{esc(cur) if cur != "" else ""}"
@@ -822,6 +956,7 @@ def control_panel():
           <button type="button" class="btn ctl-setpoint"
                   aria-label="Set the {lbl}">Set</button>
         </div>
+        {_SUI.after_select(dev, idn=f'ctl-a-{_slug(dev)}')}
         {f'<p class="ctl-why">{esc(spec.get("why"))}</p>' if spec.get("why") else ''}
         <p class="ctl-cool">{spec["cooldown_s"]}s cooldown &middot; {spec["min"]}–{spec["max"]}</p>
       </div>'''
@@ -948,6 +1083,10 @@ def control_panel():
     </div>
   </div>
 </section>
+
+{_SCUI.section()}
+{_SUI.section()}
+{_PUI.section()}
 
 <section id="ctl-log">
   <h2>What has been switched</h2>

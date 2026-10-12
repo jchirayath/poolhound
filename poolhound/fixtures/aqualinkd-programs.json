@@ -1,0 +1,93 @@
+{
+ "source": "aqualinkd /api/programs (patched v3.1.0)",
+ "fetched": "2026-10-09T16:07:00-0700",
+ "response": {
+  "type": "programs",
+  "state": "ok",
+  "read_at": 1791588420,
+  "started_at": 1791588360,
+  "error": "",
+  "programs": [
+   {
+    "device": "FILTER PUMP",
+    "pgm": 1,
+    "of": 1,
+    "on": "10:00 AM",
+    "off": "4:00 PM",
+    "days": "ALL DAYS"
+   },
+   {
+    "device": "SPA",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "POOL HEAT",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "SPA HEAT",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "SOLAR HEAT",
+    "pgm": 1,
+    "of": 1,
+    "on": "10:40 AM",
+    "off": "3:55 PM",
+    "days": "ALL DAYS"
+   },
+   {
+    "device": "POOL LIGHT",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "SHEER DSCNT",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "SPA LIGHT",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "AUX4",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   },
+   {
+    "device": "AUX5",
+    "pgm": 0,
+    "of": 0,
+    "on": "",
+    "off": "",
+    "days": ""
+   }
+  ]
+ }
+}

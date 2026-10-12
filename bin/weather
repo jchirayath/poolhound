@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Entry point — see poolhound/weather.py"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from poolhound import cadence, config, runlog, weather
+
+# Collection runs on the web server. See config.refuse_off_deployment().
+#
+# --dry-run IS LET THROUGH, because it writes nothing and the refusal's own
+# message prescribes it: "To see what it would have done, without writing or
+# spending a call: bin/<tool> --dry-run". bin/leslies and bin/wg-collect refuse
+# before they read their arguments, so that advice cannot be followed there.
+# Here a dry run asks Open-Meteo (no key, no quota worth the name) and prints;
+# it touches no CSV, no raw/ directory and no run log.
+_DRY = "--dry-run" in sys.argv[1:]
+if not _DRY:
+    config.refuse_off_deployment("weather")
+
+# Not a rationed pull, so cadence.py does not gate it -- see SOURCES there for
+# why weather is the crontab's, like watch and render. Asked anyway, so a tool
+# added to SOURCES later is gated here without anyone remembering this file.
+_by = runlog.started_by()
+_go, _why = cadence.tick_gate("weather", _by)
+if not _go:
+    print(f"  not due — {_why}")
+    sys.exit(0)
+
+if _DRY:
+    sys.exit(weather.collect(sys.argv[1:])[0])
+
+# ON THE RECORD WHICHEVER WAY IT ENDS, like the other collectors. `added` is
+# what the run actually changed in weather.csv: new days plus revised ones,
+# because a day the archive corrected is as much a write as a day it added.
+with runlog.Run("weather", by=_by) as _r:
+    rc, s = weather.collect(sys.argv[1:])
+    if not s.get("configured"):
+        # Not a failure and not a collection: an optional source nobody has
+        # set up. Recorded as a skip with its reason, and the Collection card
+        # reads the config to say "not set up" rather than "never run".
+        _r.outcome, _r.added, _r.detail = "skipped", 0, s.get("detail", "")
+    else:
+        _r.added = s["added"] + s["revised"]
+        _r.outcome = "ok" if rc == 0 else "failed"
+        _r.detail = (f"Weather: {s['added']} new day(s), {s['revised']} revised"
+                     if _r.added else
+                     "nothing new — every day returned is already on file")
+
+if s.get("configured") and _r.added:
+    try:
+        from poolhound import render
+        render.build()
+    except Exception as e:
+        print(f"  (render skipped: {e})", file=sys.stderr)
+
+sys.exit(rc)

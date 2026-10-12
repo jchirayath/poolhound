@@ -29,8 +29,9 @@ documents are:
 Since 2026-09-12 the system of record is **the server**, not a workstation.
 
 **Nothing operational runs on a workstation, and the code now enforces it.**
-`bin/wg-collect`, `bin/leslies`, `bin/watch`, `bin/chem` and `bin/backup` call
-`config.refuse_off_deployment()` before they do anything and exit with an
+`bin/wg-collect`, `bin/leslies`, `bin/weather`, `bin/watch`, `bin/chem` and
+`bin/backup` call `config.refuse_off_deployment()` before they do anything
+(`bin/weather` after letting `--dry-run` through, since it writes nothing) and exit with an
 explanation when `POOLHOUND_DATA` is unset — which is the marker the image sets
 and a checkout does not, and which `save_settings` already treats as the
 difference between a durable deployment and a scratch directory. The override
@@ -64,7 +65,7 @@ containing none of the pool. `pull-backup.sh` refuses a tarball with no
 | the passwords | **Azure Key Vault**, read by the VM's managed identity | no *application* credential on the server; the share's 0600 mount key is the one exception |
 | the controller sampler | **the Pi**, `poolhound-agent.service` | reads the panel, pushes OUT to the server |
 | **poolhound local**, optional | **the Pi**, behind its own web server | a page on the house network that drives AqualinkD directly; installed by nothing here, copy in `deploy/poolhound-local.html`. The **poolhound server** is the first row |
-| the other collectors | the server, `/etc/cron.d/poolhound` | WaterGuru, Leslie's, the watchdog |
+| the other collectors | the server, `/etc/cron.d/poolhound` | WaterGuru, Leslie's, Open-Meteo weather, the watchdog |
 | the recovery point | the server's **local disk**, `/var/lib/poolhound/backups` | `bin/backup` at 02:40 UTC: a dated tarball of the history, deliberately NOT on the share |
 | the copy that survives the VM | **a workstation**, `~/Backups/poolhound` (0700) | `deploy/pull-backup.sh` on a 04:10 LaunchAgent: pulls the newest tarball, verifies it opens AND holds `samples.csv`, 30 days kept |
 | the gates | GitHub Actions, `.github/workflows/gates.yml` | on every push and PR, so they no longer run only where somebody remembered |
@@ -83,10 +84,11 @@ bin/contrast         # WCAG on every palette
 bin/screenshots      # retake docs/screenshots and the landing page's cards
 bin/brand            # rewrite docs/poolhound*.svg from brand.py
 
-# These five REFUSE on a workstation, and the server is where they run:
+# These six REFUSE on a workstation, and the server is where they run:
 bin/watch            # has a collector gone quiet? notify if so
 bin/wg-collect       # pull WaterGuru (spends one of the two calls a day we respect)
 bin/leslies          # pull Leslie's; returns the whole history, safe to re-run
+bin/weather          # Open-Meteo, ended days only; --dry-run is allowed here
 bin/chem --help      # log a dose, and see the whole chemical catalogue
 bin/backup           # copy the history OFF the share; 02:40 UTC in cron, 30 days kept
 
@@ -231,6 +233,14 @@ measurement counted 131 times while `by_day()` averaged them all. The docs
 asserted the sentinel covered "the SWG and water temperature" alike, which is
 why nobody looked. `commands.drop_stale_flow_readings()` is the one rule both
 collectors pass their row through; history is not rewritten.
+
+**A dirty filter LOWERS the pump's watts at a fixed speed.** Less flow
+against more head, and a radial impeller draws less at less flow. The sign
+in `equipment.py` is deliberate; a rise is reported as something else. And
+the latch rule decides which salt readings are live: `_per_day` first gated
+salt on `pump == 1` as well, which was a second copy of
+`drop_stale_flow_readings()`. Its breaker went green until that gate came
+out.
 
 **A config is not a history, and the guard must ask first.** `seed_config()`
 refused to start a REQUIRE_DATA deployment whose data directory was empty — and
@@ -412,6 +422,53 @@ and the gap this tab measures would never have grown. Lateness is measured from
 the last attempt that was NOT a skip; `collection.NEEDS_ATTENTION` is the one
 copy of the set; and a skip keeps its own word and the amber pill without being
 graded broken, because the ordinary skip means the previous run is still going.
+
+**A schedule is a button pressed later, and gets nothing a button does not.**
+`schedule.py` issues every scheduled command and every auto-off through
+`server.command()` — the function `/api/control` calls — so validation, the
+rate limit, `audit.csv` and the Pi's Guard apply unchanged and the agent cannot
+tell the difference. Do not give it a shortcut to the queue. The two directions
+are deliberately unequal: an ON more than `GRACE_S` late is recorded as missed
+and never run (a heater lit hours late is lit for nobody), while an OFF that
+could not be delivered is re-issued until a READING says the device is off.
+The household max-on reads the panel's state, not our commands, so it covers
+the wall panel too. Schedules live in `schedules.json` on the share, not in the
+queue; the thread runs in `bin/serve` only, and its liveness is in
+`/api/health`, on the Control tab, and in `alive_at` for `bin/watch`. And
+anything in that module that takes `now` must pass it on — `mark_alerted` once
+read the wall clock inside a test running in November, dropped every history
+row as "from the future", and saved the file without them.
+
+**A program change is acknowledged before it is done, and only a read-back
+says it happened.** Changing one of the panel's own programs walks the
+handheld's editor for about a minute, so the agent acks when the patched
+AqualinkD *accepts* the job and a thread follows it to the panel's answer --
+the device screen read back after the save -- then pushes a fresh
+`/api/agent/schedules`. The page says "Sent" until that answer arrives; it
+must never call an ack "done". AqualinkD's two acting routes,
+`programs/refresh` and `programs/set`, are **HTTP PUT only** and refused over
+its websocket: as GETs, any page open on a browser in the house could fire one
+with an image tag. `docs/JANDY-PROGRAMS.md` has the screens the setter walks;
+what has not been seen there (the hour crossing 11/12, Back inside CHANGE,
+DELETE, the days) is refused or treated as unknown in the code,
+not guessed at. And **never wait on AqualinkD's `waitForPDAMessageType()` after
+a key press**: it checks the LAST packet before waiting, so it returns at once
+on a stale one. On the first live change the presses ran ahead of the screen
+and Select opened ADD instead of CHANGE. It failed safe, and nothing changed.
+Press, `waitfor_pda_queue2empty()`, then wait for the SCREEN to show the
+change (`wait_until()` in `pda_programs.c`).
+
+**AqualinkD's schedules are replaced whole, and each field ends up in a root
+cron line.** `/api/schedules/set` rewrites `/etc/cron.d/aqualinkd` from the
+list it is sent, so a `cron` command carries the complete list plus `expect`,
+the fingerprint of the list the page showed (`commands.cron_fingerprint`).
+The server and the agent both refuse a save whose `expect` is not current, and
+the agent refuses a list holding anything `programs.shape_schedules` dropped:
+saving it would delete entries nobody was shown. Never pass a command's string
+into the save: the agent builds each line from `commands.cron_entry()`'s
+output, and a heater may be switched off there, never on. A refusal is
+*raised* as `C.Refused`, never returned: the stream loop logs
+`result['detail']` for every returned dict.
 
 **`runlog.Run` takes `by` and `cfg` by keyword only.** `bin/backup` called
 `Run("backup", cfg)` — `by` is the second positional — so every nightly backup
@@ -982,18 +1039,30 @@ deploy leaves `REVISION` in the working tree: `version_string()` reads it, so
 a stray copy stamps every later local render with the commit of the last
 deploy.
 
-**But `bootstrap-server.sh --check` answers "is what is deployed working", never
-"is what is deployed current", and it is all green on a stale server.** It
-compares the image REVISION against the two rendered pages, so a server three
-commits behind reports every line green — including `served public page is the
-deployed build (<old rev>)`, which is true. MEASURED: on 2026-09-28 the server
-was found three commits behind, having failed EVERY image build for four days.
+**"Is what is deployed working" and "is what is deployed current" are two
+questions, and `--check` answered only the first until 2026-10-09.** It
+compared the image REVISION against the two rendered pages, and an old image
+agrees with its own pages perfectly, so a server three commits behind reported
+every line green — including `served public page is the deployed build (<old
+rev>)`, which is true. MEASURED: on 2026-09-28 the server was found three
+commits behind, having failed EVERY image build for four days.
 `python -m poolhound.selftest` is the Dockerfile's build gate, and a proof
 breaker opened `deploy/bootstrap-server.sh`, which is not in the image —
 `FileNotFoundError`, exit 1, build dead — while the site kept serving, the
-collectors kept running and `--check` kept passing. After any deploy, compare
-explicitly: `git log --oneline <rev-from-check>..main`. And treat "the install
-step failed" as a four-day-old problem rather than a new one.
+collectors kept running and `--check` kept passing.
+
+Both `--check`s now hand the REVISION they read to `deploy/rev-freshness.sh`,
+which fetches `origin main` and grades it against `origin/main` AND local
+`main`, because pushing drifts from deploying here (origin was once 22 commits
+behind a server that was current). Behind either, not on main, `-dirty`, a
+hash this clone lacks, or a fetch that failed is a FAILURE; deployed ahead of
+origin, or local main ahead of it, is a WARNING — the push has drifted, not
+the deployment. The REVISION is read off another machine, so it is matched
+against the shapes `git describe` writes before git sees it. What this still
+cannot see is a deploy that never happened from a checkout that was never
+pulled on a machine with no network: the fetch fails, and that is a failure
+rather than a pass against whatever was fetched last. Treat "the install step
+failed" as a four-day-old problem rather than a new one.
 
 `bin/render` runs `node --check` on every inline script when node is installed,
 and validates every embedded JSON block always. Do not remove that: an apostrophe

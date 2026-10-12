@@ -18,6 +18,8 @@ test that reads a file somebody can regenerate is a test that changes meaning
 without anybody editing it.
 
   bin/demo-data /tmp/demo          # writes /tmp/demo/data/*.csv and a config
+  bin/demo-data /tmp/bad --anomalies   # the same pool on a bad day; see
+                                       # with_anomalies() for what goes wrong
   POOLHOUND_DATA=/tmp/demo/data POOLHOUND_SITE=/tmp/demo/site \
     POOLHOUND_CONFIG=/tmp/demo/config.toml bin/render
 
@@ -67,62 +69,174 @@ def iso(t):
     return t.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+# THE ONE DIAL CHANGE, in days before NOW. Before it the cell ran at 45%, after
+# it at 60% -- the deliberate variation THEORY.md says separates the cell's pH
+# push from the spillover's, so the demo's "What moves this pool" has
+# something to separate. Leave the dial alone and the two come back combined,
+# which is the other half of the story and the second selftest fixture.
+DIAL_BEFORE, DIAL_AFTER, DIAL_CHANGED = 45, 60, 21
+
+# What the demo pool's chemistry actually obeys, in THEORY.md's units. The
+# readings are not drawn as curves any more: fit.simulate() integrates these
+# over the samples below, so the coefficients the Home tab reports for this
+# pool are coefficients it really has. Plausible for a salt pool, and nobody's.
+TRUTH = dict(prod=0.30, uv=0.011, demand=0.07, temp=0.004, T_ref=78.0,
+             cya=-0.0002, C_ref=60.0,
+             spill=0.005, cell=0.010, sheer=0.006, spa=0.02, acid_ratio=1.4)
+
+
+def _hours(d):
+    """The day's pump block: varied, because a schedule never quite repeats."""
+    return R.uniform(5.0, 8.5)
+
+
+# THE FILTER HAS A STORY, so Equipment health has something to show. It was
+# cleaned twice in this record; between cleanings the pump's draw at its one
+# speed sags as the filter loads -- the direction equipment.py assumes and says
+# it assumes -- and a cleaning puts it back. The rate is a fast one, a dirty
+# season compressed so a 45-day demo reaches the "clean it" threshold.
+FILTER_CLEANED = (40, 21)            # days before NOW, at 17:00
+SAG_PER_DAY = 0.008
+# The valves change the plumbing, and so the draw: the reason equipment.py
+# compares only samples with all three shut. Without this the demo could not
+# show that exclusion doing anything.
+VALVE_DRAW = {"solar_valve": 1.06, "sheer": 0.95, "spa": 1.10}
+# The pump schedule was moved an hour later at the panel ten days ago, with no
+# poolhound command, which is what "moved without a command" is there to see.
+SCHEDULE_MOVED = 10
+
+
+def _since_clean(t):
+    """Days since the filter was last cleaned, as of `t`."""
+    done = [NOW.replace(hour=17, minute=0) - dt.timedelta(days=d)
+            for d in FILTER_CLEANED]
+    before = [c for c in done if c <= t]
+    return (t - max(before)).total_seconds() / 86400 if before else 5.0
+
+
 def samples():
     """Fifteen-minute controller samples. The pump runs one block a day."""
     out = []
     for d in range(DAYS, -1, -1):
         day = NOW - dt.timedelta(days=d)
-        hours = 6.5 + R.uniform(-0.4, 0.4)
-        start = 8.0
+        hours = _hours(d)
+        start = 9.0 if d < SCHEDULE_MOVED else 8.0
+        heated = 0.0                  # hours the pool heater has fired today
+        dial = DIAL_BEFORE if d > DIAL_CHANGED else DIAL_AFTER
+        # The water's own day-to-day wander, apart from the season, so warm
+        # and cool days are not simply early and late ones.
+        wander = R.gauss(0, 1.5)
         for q in range(96):
             t = day.replace(hour=0, minute=0) + dt.timedelta(minutes=15 * q)
             if t > NOW:
                 break
             h = q / 4.0
-            pump = start <= h < start + hours
-            spa = pump and 18.0 <= h < 18.75 and d % 9 == 0
+            # The spa runs on a ninth evening, after the pump's block, and
+            # needs the pump to: it is the same water through the same pump.
+            spa = d % 9 == 0 and 17.5 <= h < 19.0
+            pump = start <= h < start + hours or spa
+            priming = pump and h == start
+            # A few cool mornings the pool heater fires before the solar opens.
+            pool_heat = pump and not spa and d > 12 and d % 4 == 0 and \
+                start + 0.25 <= h < 10.75
+            if pool_heat:
+                heated += 0.25
             # Water warms through the afternoon and cools overnight.
-            temp = 79 + 5 * math.sin((h - 9) / 24 * 2 * math.pi) - d * 0.08
+            temp = (79 + 5 * math.sin((h - 9) / 24 * 2 * math.pi) - d * 0.08
+                    + 0.7 * heated + wander)
             air = 72 + 14 * math.sin((h - 9) / 24 * 2 * math.pi)
+            # The spa from pool temperature to its setpoint at about 18 deg/h.
+            spa_t = min(102.0, temp + 3 + 18 * (h - 17.5)) if spa else None
+            valves = {"solar_valve": pump and not spa and 11 <= h < 16,
+                      # Not every day: a sheer that runs whenever the pump
+                      # does is one column twice, and its pH cost unpriceable.
+                      "sheer": pump and not spa and h > 12 and d % 3 != 0,
+                      "spa": spa}
+            watts = None
+            if pump:
+                watts = 900 * (1 - SAG_PER_DAY * _since_clean(t))
+                for k, on in valves.items():
+                    if on:
+                        watts *= VALVE_DRAW[k]
+                watts = 1150 if priming else watts + R.uniform(-6, 6)
             row = dict.fromkeys(aqualink.COLS, "")
             row.update(
                 ts=iso(t),
                 pump="1" if pump else "0",
-                pump_rpm="2750" if pump else "",
-                pump_watts=f"{R.uniform(880, 910):.0f}" if pump else "",
-                swg_pct="45",
+                pump_rpm=("3000" if priming else "2750") if pump else "",
+                pump_watts=f"{watts:.0f}" if pump else "",
+                swg_pct=str(dial),
                 # The cell only reports salt while water is moving; the collector
                 # drops the stale repeat, so an off hour carries nothing.
                 salt_ppm=f"{R.uniform(3280, 3360):.0f}" if pump else "",
-                pool_temp=f"{temp:.1f}" if pump else "",
+                pool_temp=f"{temp:.1f}" if pump and not spa else "",
                 air_temp=f"{air:.1f}",
-                spa_temp=f"{temp + 21:.1f}" if spa else "",
+                spa_temp=f"{spa_t:.1f}" if spa else "",
                 spa="1" if spa else "0",
-                sheer="1" if pump and h > 12 else "0",
-                pool_light="1" if 19.5 <= h < 22 else "0",
+                sheer="1" if valves["sheer"] else "0",
+                # Left on one evening and never switched off: the thing
+                # "unusually long" is there to notice.
+                pool_light="1" if (19.5 <= h < 22 or (d == 1 and h >= 19.5)
+                                   or d == 0) else "0",
                 spa_light="1" if spa else "0",
-                pool_heat="0",
-                spa_heat="1" if spa else "0",
-                solar_valve="1" if pump and 11 <= h < 16 else "0",
+                pool_heat="1" if pool_heat else "0",
+                spa_heat="1" if spa and spa_t < 101.5 else "0",
+                solar_valve="1" if valves["solar_valve"] else "0",
                 freeze="0",
                 pool_set="88.0", spa_set="102.0", freeze_set="36.0")
             out.append(row)
     return out
 
 
-def readings():
-    """The pod: free chlorine and pH, daily."""
+def maintenance_rows():
+    """The two cleanings, as the Equipment health form would have marked them."""
+    return [{"ts": iso(NOW.replace(hour=17, minute=0) - dt.timedelta(days=d)),
+             "task": "filter", "note": "backwashed" if d == 40 else "cartridge hosed",
+             "by": "demo", "id": f"demo{d:04d}"} for d in FILTER_CLEANED]
+
+
+def readings(samp, wx_rows, labs):
+    """The pod: free chlorine and pH, daily -- and the acid that kept pH down.
+
+    NOT CURVES. These used to be sine waves, which gave the demo a chemistry
+    with no cause: nothing in the samples beside them had moved the numbers.
+    They are now what TRUTH does to this pool over these samples and this
+    weather, read at 09:40 with the pod's noise, and dosed the way an owner
+    would: acid the evening pH reads 7.65 or more, liquid chlorine the evening
+    free chlorine reads under 1.5. So the coefficient fit on Home recovers
+    something real, and the dose table pairs doses an owner would have made.
+    """
+    from poolhound import fit as F, render as RD
+    wx = {r["date"]: {"sun_mj_m2": float(r["sun_mj_m2"])} for r in wx_rows}
+    at = [(NOW - dt.timedelta(days=d)).replace(hour=9, minute=40)
+          for d in range(DAYS, -1, -1)]
+
+    def acid(t, fc, ph):
+        if ph >= 7.65:
+            return {"ts": iso(t.replace(hour=17, minute=5)), "chemical": "acid",
+                    "amount": "32", "unit": "floz", "pct": "31.45", "note": "",
+                    "by": "demo"}
+
+    def chlorine(t, fc, ph):
+        if fc < 1.5:
+            return {"ts": iso(t.replace(hour=17, minute=30)),
+                    "chemical": "chlorine", "amount": "64", "unit": "floz",
+                    "pct": "12.5", "note": "", "by": "demo"}
+
+    got, doses = F.simulate(samp, wx, TRUTH, at, 18400, ta=76.0, labs=labs,
+                            fc0=2.8, ph0=7.45, noise=(0.2, 0.02),
+                            seed=20260914, acid_rule=acid,
+                            chlorine_rule=chlorine)
     out = []
-    for d in range(DAYS, -1, -1):
-        t = (NOW - dt.timedelta(days=d)).replace(hour=9, minute=40)
-        fc = 2.4 + 0.9 * math.sin(d / 7.0) + R.uniform(-0.25, 0.25)
-        ph = 7.52 + 0.10 * math.sin(d / 5.0) + R.uniform(-0.03, 0.03)
+    for r in got:
+        t = RD.when(r["measured"])
+        d = (NOW.date() - t.date()).days
         out.append({"fetched": iso(t + dt.timedelta(minutes=5)), "measured": iso(t),
-                    "free_cl": f"{max(0.2, fc):.1f}", "ph": f"{ph:.2f}",
+                    "free_cl": r["free_cl"], "ph": r["ph"],
                     "water_temp": f"{82 - d * 0.08:.1f}", "skimmer_flow": "ok",
                     "status": "ok",
                     "alerts": "Total Alkalinity measurement outdated" if d < 3 else ""})
-    return out
+    return out, doses
 
 
 def lab_rows():
@@ -131,7 +245,9 @@ def lab_rows():
     for d in (38, 9):
         t = (NOW - dt.timedelta(days=d)).replace(hour=11, minute=0)
         out.append({"measured": iso(t), "fetched": iso(t + dt.timedelta(days=2)),
-                    "ta": "74" if d == 9 else "88", "ch": "310", "cya": "62",
+                    "ta": "74" if d == 9 else "88", "ch": "310",
+                    # Before and after the stabiliser in chem_rows().
+                    "cya": "62" if d == 9 else "46",
                     "salt": "3320", "phosphates": "180", "copper": "0.1",
                     "iron": "0.0", "saturation_index": "-0.18"})
     return out
@@ -146,7 +262,8 @@ def leslies_rows(cols):
         r = {c: "" for c in cols}
         r.update(measured=iso(t), fetched=iso(t), score="92",
                  free_cl="2.8", total_cl="3.0", ph="7.6",
-                 ta="81" if d == 4 else "90", ch="288", cya="58",
+                 ta="81" if d == 4 else "90", ch="288",
+                 cya="58" if d == 4 else "44",
                  iron="0.0", copper="0.1", phosphates="150", salt="3260",
                  tds="4100", total_hardness="300", borate="0",
                  saturation_index="-0.11")
@@ -154,14 +271,44 @@ def leslies_rows(cols):
     return out
 
 
-def chem_rows():
+def chem_rows(simulated):
+    """The doses the owner chose, plus the ones readings() made in response.
+
+    Calcium and a gallon of liquid stabiliser are decisions, so they are
+    written here; the stabiliser is why the labs read CYA in the 40s before
+    it and around 60 after, which is the variation the fit needs to say what
+    stabiliser buys. Acid and chlorine are the simulation's: an owner doses
+    when the reading says to, not on a calendar.
+    """
     out = []
-    for d, (what, amt, unit, pct) in ((26, ("acid", 32, "floz", 31.45)),
-                                      (17, ("calcium", 8, "lb", 77)),
-                                      (6,  ("acid", 24, "floz", 31.45))):
+    for d, (what, amt, unit, pct) in ((25, ("cya_liquid", 1, "gal", 100)),
+                                      (17, ("calcium", 8, "lb", 77))):
         t = (NOW - dt.timedelta(days=d)).replace(hour=17, minute=5)
         out.append({"ts": iso(t), "chemical": what, "amount": f"{amt:g}",
                     "unit": unit, "pct": f"{pct:g}", "note": "", "by": "demo"})
+    out += simulated
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+def stock_rows():
+    """What was bought and counted: a count, then purchases after it.
+
+    One of each kind on purpose, since the tab's argument is that a count is
+    what keeps the figure honest -- and the acid count comes BEFORE the doses
+    above, so the picture shows them being taken off it.
+    """
+    out = []
+    for d, kind, what, amt, unit, pct, paid, note in (
+            (30, "stocktake", "acid", 1.5, "gal", 31.45, "", "half a jug left"),
+            (20, "purchase", "acid", 2, "gal", 31.45, "19.49", "two jugs"),
+            (18, "purchase", "calcium", 16, "lb", 77, "25.88", ""),
+            (12, "purchase", "salt", 160, "lb", 100, "31.92", "four bags")):
+        t = (NOW - dt.timedelta(days=d)).replace(hour=11, minute=20)
+        out.append({"ts": iso(t), "kind": kind, "chemical": what,
+                    "amount": f"{amt:g}", "unit": unit, "pct": f"{pct:g}",
+                    "paid": paid, "note": note, "by": "demo",
+                    "id": f"demo{d:02d}{what[:4]}"})
     return out
 
 
@@ -172,6 +319,54 @@ def manual_rows(cols):
              ph="7.5", free_cl="2.6", ta="76", ch="300", cya="60",
              note="drop kit, morning")
     return [r]
+
+
+def weather_rows():
+    """One row per ENDED day, for the same span as the samples.
+
+    A coastal early autumn: sun falling slowly with the season and knocked
+    down hard on the cloudy days, two wet spells, evaporation that tracks the
+    sun. The last five days are the forecast model's, provisional, the way a
+    live install looks before the archive catches up -- and the archive rows
+    carry their UV index from it, because reanalysis has none. Written in the
+    pool's own calendar, from weather.today_local(), so "yesterday" here is
+    the yesterday the product means.
+    """
+    from poolhound import weather as WX
+    lat, lon = DEMO_LAT, DEMO_LON
+    today = WX.today_local()
+    out = []
+    for back in range(DAYS, 0, -1):
+        d = today - dt.timedelta(days=back)
+        n = DAYS - back
+        wet = n in (9, 10, 31)
+        cloud = R.uniform(70, 100) if wet else max(0.0, R.gauss(18, 16))
+        sun = max(2.0, (23.5 - 0.08 * n) * (1 - 0.0072 * cloud) + R.gauss(0, 0.6))
+        rain = round(R.uniform(0.08, 0.6), 2) if wet else 0.0
+        hi = 84 - 0.25 * n + R.gauss(0, 3) - (6 if wet else 0)
+        lo = hi - R.uniform(14, 20)
+        provisional = back <= 5
+        out.append({
+            "date": d.isoformat(),
+            "source": "forecast" if provisional else "archive",
+            "fetched": iso(NOW),
+            "lat": f"{lat:.1f}", "lon": f"{lon:.1f}",
+            "sun_mj_m2": f"{sun:.2f}",
+            "sunshine_h": f"{max(0.0, 11.5 * (1 - cloud / 100)):.2f}",
+            "uv_max": f"{max(1.0, sun / 3.4):.2f}",
+            "cloud_pct": f"{cloud:.0f}",
+            "air_max_f": f"{hi:.1f}", "air_min_f": f"{lo:.1f}",
+            "air_mean_f": f"{(hi + lo) / 2:.1f}",
+            "precip_in": f"{rain:.3f}", "rain_in": f"{rain:.3f}",
+            "et0_in": f"{0.0075 * sun:.3f}",
+            "carried": "" if provisional else "uv_max:forecast",
+        })
+    return out
+
+
+# Synthetic, and stated as such: a location already at the precision weather.py
+# sends, so the Collection card's "Sends" line shows exactly this pair.
+DEMO_LAT, DEMO_LON = 36.0, -120.0
 
 
 def run_rows():
@@ -246,6 +441,11 @@ def run_rows():
                 added="" if bad else (1 if d == 3 else 0),
                 detail="500 from WaterTest-Home; retried next run" if bad
                        else "")
+        # Weather, daily, after the pool's midnight.
+        t = day.replace(hour=3, minute=20)
+        if t <= ran:
+            row(t, "weather", "ok", seconds=f"{R.uniform(0.8, 1.9):.1f}",
+                added=6, detail="Weather: 1 new day(s), 5 revised")
         # The backup, nightly, off the share.
         t = day.replace(hour=2, minute=40)
         if t <= ran:
@@ -264,8 +464,40 @@ def run_rows():
     return out
 
 
+def with_anomalies(samp):
+    """The same pool on a bad day, for `--anomalies`: what Home and bin/watch
+    look like when something IS wrong. The ordinary demo must trip no serious
+    anomaly -- the screenshots are of it, and a false alarm in a picture is a
+    false alarm -- so the faults are only ever added on request.
+
+    Three, each a rule in poolhound/anomaly.py: the spa heater reported firing
+    for the last ninety minutes with the pump stopped; an hour of spa last
+    night at 106 degF; and the pump drawing 40% less at its speed through
+    yesterday's settled morning, the shape of air in the suction.
+    """
+    from poolhound.render import when
+    newest = max(when(r["ts"]) for r in samp)
+    yday = newest.date() - dt.timedelta(days=1)
+    for r in samp:
+        t = when(r["ts"])
+        if newest - t < dt.timedelta(minutes=90):
+            r.update(pump="0", pump_rpm="", pump_watts="", salt_ppm="",
+                     pool_temp="", spa_heat="1")
+        if t.date() == yday and 20 <= t.hour < 21:
+            r.update(pump="1", pump_rpm="2750", pump_watts="990", spa="1",
+                     spa_temp="106.0", pool_temp="", sheer="0",
+                     solar_valve="0")
+        # Settled, valves shut: before the solar opens at 11.
+        if (t.date() == yday and r["pump"] == "1" and r["spa"] == "0"
+                and 9.5 <= t.hour + t.minute / 60 < 11 and r["pump_watts"]):
+            r["pump_watts"] = f"{float(r['pump_watts']) * 0.6:.0f}"
+    return samp
+
+
 def main():
-    root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "demo")
+    bad = "--anomalies" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--anomalies"]
+    root = os.path.abspath(args[0] if args else "demo")
     data = os.path.join(root, "data")
     os.makedirs(data, exist_ok=True)
     os.makedirs(os.path.join(root, "site"), exist_ok=True)
@@ -277,21 +509,36 @@ def main():
            "pool_type", "surface", "note"]
 
     print(f"  writing a synthetic pool into {data}")
-    w(os.path.join(data, "samples.csv"), aqualink.COLS, samples())
+    from poolhound import weather as WX
+    # The order matters only in that the readings are CAUSED by the rest: the
+    # samples, the weather and the labs' stabiliser are drawn first, and the
+    # chemistry is what TRUTH makes of them.
+    samp = samples()
+    if bad:
+        samp = with_anomalies(samp)
+    wx = weather_rows()
+    labs, les, man = lab_rows(), leslies_rows(LES), manual_rows(S.MANUAL_COLS)
+    pod, dosed = readings(samp, wx, labs + les + man)
+    w(os.path.join(data, "samples.csv"), aqualink.COLS, samp)
     w(os.path.join(data, "readings.csv"),
       ["fetched", "measured", "free_cl", "ph", "water_temp", "skimmer_flow",
-       "status", "alerts"], readings())
+       "status", "alerts"], pod)
     w(os.path.join(data, "lab.csv"),
       ["measured", "fetched", "ta", "ch", "cya", "salt", "phosphates", "copper",
-       "iron", "saturation_index"], lab_rows())
-    w(os.path.join(data, "leslies.csv"), LES, leslies_rows(LES))
-    w(os.path.join(data, "chemicals.csv"), CH.CHEM_COLS, chem_rows())
-    w(os.path.join(data, "manual.csv"), S.MANUAL_COLS, manual_rows(S.MANUAL_COLS))
+       "iron", "saturation_index"], labs)
+    w(os.path.join(data, "leslies.csv"), LES, les)
+    w(os.path.join(data, "chemicals.csv"), CH.CHEM_COLS, chem_rows(dosed))
+    from poolhound import stock as ST
+    w(os.path.join(data, ST.FILE), ST.COLS, stock_rows())
+    w(os.path.join(data, "manual.csv"), S.MANUAL_COLS, man)
+    from poolhound import equipment
+    w(os.path.join(data, equipment.FILE), equipment.COLS, maintenance_rows())
     # The columns from runlog, not retyped here: the header is written once at
     # creation, so a COLS list with a column the writers do not know corrupts
     # every row appended afterwards.
     from poolhound import runlog as RL
     w(os.path.join(data, RL.FILE), RL.COLS, run_rows())
+    w(os.path.join(data, WX.FILE), WX.COLS, wx)
 
     cfg = os.path.join(root, "config.toml")
     with open(cfg, "w") as f:
@@ -300,7 +547,8 @@ def main():
                 'pool_only_gallons = 17600\nspa_gallons = 800\n'
                 'spa_shares_water = true\nacid_pct = 31.45\n'
                 'sanitiser = "salt_cell"\npump_watts = 900\n\n'
-                '[power]\nkwh_cost = 0.31\n')
+                '[power]\nkwh_cost = 0.31\n\n'
+                f'[weather]\nlatitude = {DEMO_LAT}\nlongitude = {DEMO_LON}\n')
     print(f"  {os.path.basename(cfg):18} written")
     print()
     print("  render it with:")

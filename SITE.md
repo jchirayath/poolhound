@@ -118,10 +118,31 @@ publishing chemistry is that it is useful to *somebody else's* pool, and that
 argument does not reach this household's current chlorine. The masthead's
 freshness line and overall verdict are gated with it.
 
+Home's **What moves this pool** section is the same argument at its
+strongest: fitted coefficients are this household's water and nothing else.
+It sits on Home rather than in Pool chemistry's private corner because it is
+read beside the day strip it is fitted from, and because Pool chemistry is
+public — a private card there survives the tab excision and has to be
+withheld by hand. Even so it is belt and braces: `fit.analyse()` is not called
+for the public build at all, and the card carries `render.HOUSEHOLD_FIT_MARK`,
+which is on the public build's leak list beside the saturation index's.
+
 **Ask AI** is private for a second reason on top of that one: asking sends this
 pool's readings to a third party and spends money doing it, so `/api/ask` needs
 `operate` rather than `view` — the floor for merely reading the private tabs is
 not enough for a route that acts.
+
+### A public tab can carry one private card
+
+Pool chemistry is public, and its saturation section has a card that is not:
+this household's computed index, at this household's water and spa
+temperatures. The tab excision cannot remove it — it is inside a public panel —
+so the card is simply **not rendered** for the public build
+(`chemistry.panel(public=True)` never calls `render.current_saturation()`), and
+the card carries `render.HOUSEHOLD_LSI_MARK`, which is on the public build's
+leak list. If the gate on `public` is ever lost the build refuses to write the
+page rather than publishing the card. The public half of the section is the
+explanation and a handbook example pool, labelled as nobody's.
 
 ### Adding a tab
 
@@ -205,9 +226,24 @@ page. Every embedded JSON block is validated always.
 
 ```
 render.py       the page shell, the loaders, the charts, and the Home panel
+equipment.py    Home's Equipment health section, its form and its script
+anomaly.py      Home's Anomalies section, just above it, and the open
+                serious ones that lead "What to do next"; no script
 info.py         Poolhound info — the public landing page
 chemistry.py    Pool chemistry, and its own EXTRA_CSS
 panels.py       Pool control, Chemicals, Settings, and the volume calculator
+schedule_ui.py  Pool control's schedule section AND its script, which
+                render.TEMPLATE takes as one @@schedule_js@@ inside a priv
+                pair; everything it shows is fetched from /api/schedules
+scenes_ui.py    Pool control's Scenes section (one tap, several controls)
+                and its editor; @@scenes_js@@ in the same priv pair, fetched
+                from /api/scenes, run through /api/control as action "scene"
+programs_ui.py  Pool control's "Programmed on the panel" section and its
+                script, @@programs_js@@ in the same priv pair; fetched from
+                /api/panel-schedules. Its Change form posts a `program`
+                command to /api/control, like any other control; AqualinkD's
+                schedules are edited in the same section, each save one
+                `cron` command carrying the whole list
 collection.py   Collection — every fetch, and whether alerts were delivered
 assistant.py    Ask — the question, the context it sends, and the client
 help.py         Guide (tab id `help`), and the two architecture drawings

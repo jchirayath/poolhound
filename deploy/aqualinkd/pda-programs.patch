@@ -1,0 +1,1640 @@
+diff --git a/Makefile b/Makefile
+index f4b7b8d..39a4072 100755
+--- a/Makefile
++++ b/Makefile
+@@ -77,7 +77,7 @@ SRCS = aqualinkd.c utils.c config.c aq_serial.c aq_panel.c aq_programmer.c allbu
+ AQ_FLAGS =
+ # Add source and flags depending on protocols to support.
+ ifeq ($(AQ_PDA), true)
+-  SRCS := $(SRCS) pda.c pda_menu.c pda_aq_programmer.c
++  SRCS := $(SRCS) pda.c pda_menu.c pda_aq_programmer.c pda_programs.c
+   AQ_FLAGS := $(AQ_FLAGS) -D AQ_PDA
+ endif
+ 
+diff --git a/extras/test_pda_programs.c b/extras/test_pda_programs.c
+new file mode 100644
+index 0000000..d41acea
+--- /dev/null
++++ b/extras/test_pda_programs.c
+@@ -0,0 +1,268 @@
++/*
++ * Feed screens captured off a PDA-PS6 Combo through the real menu tracker and
++ * the real parser. Built against every AqualinkD object except main().
++ *
++ *   make test_pda_programs   (see deploy/aqualinkd/build.sh in poolhound)
++ *
++ * Exits non-zero on the first wrong answer.
++ */
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++
++#include "aqualink.h"
++#include "pda_menu.h"
++#include "pda_programs.h"
++#include "aq_scheduler.h"
++#include "config.h"
++#include <unistd.h>
++
++// Defined in aqualinkd.c beside main(), which this harness replaces.
++void intHandler(int dummy) { (void)dummy; }
++bool isAqualinkDStopping() { return false; }
++bool checkAqualinkTime() { return true; }
++bool isVirtualButtonEnabled() { return false; }
++
++static int failures = 0;
++#define CHECK(name, cond) do { if (cond) printf("  ok    %s\n", name); \
++  else { printf("  FAIL  %s\n", name); failures++; } } while (0)
++
++static void pkt_clear(void) {
++  unsigned char p[] = {0x10, 0x02, 0x60, CMD_PDA_CLEAR, 0x46, 0x00, 0x00, 0x10, 0x03};
++  process_pda_menu_packet(p, sizeof(p), false);
++}
++static void pkt_line(int line, const char *text) {
++  unsigned char p[32] = {0x10, 0x02, 0x60, CMD_MSG_LONG, (unsigned char)line};
++  memcpy(p + 5, text, 16);
++  p[21] = 0x00; p[22] = 0x10; p[23] = 0x03;
++  process_pda_menu_packet(p, 24, false);
++}
++static void pkt_highlight(int line) {
++  unsigned char p[] = {0x10, 0x02, 0x60, CMD_PDA_HIGHLIGHT, (unsigned char)line, 0x00, 0x00, 0x00, 0x10, 0x03};
++  process_pda_menu_packet(p, sizeof(p), false);
++}
++static void pkt_shift(void) {
++  unsigned char p[] = {0x10, 0x02, 0x60, CMD_PDA_SHIFTLINES, 0x02, 0x09, 0xff, 0x00, 0x10, 0x03};
++  process_pda_menu_packet(p, sizeof(p), false);
++}
++
++static void screen_lines(char out[PDA_LINES][AQ_MSGLEN + 1]) {
++  int i;
++  for (i = 0; i < PDA_LINES; i++) snprintf(out[i], AQ_MSGLEN + 1, "%s", pda_m_line(i));
++}
++
++int main(void)
++{
++  char lines[PDA_LINES][AQ_MSGLEN + 1];
++  panel_program p;
++
++  printf("menu detection, in the order the panel sends the lines\n");
++
++  pkt_clear();
++  pkt_line(0, "   MAIN MENU    "); pkt_line(2, "HELP           >"); pkt_line(3, "PROGRAM        >");
++  pkt_line(4, "SET TEMP       >"); pkt_line(5, "SET TIME       >"); pkt_line(6, "PDA OPTIONS    >");
++  pkt_line(7, "SYSTEM SETUP   >"); pkt_highlight(2);
++  CHECK("the main menu is still PM_MAIN, though it lists PROGRAM", pda_m_type() == PM_MAIN);
++
++  pkt_clear();
++  pkt_line(0, "    PROGRAM     "); pkt_line(2, "FILTER PUMP     "); pkt_line(3, "SPA             ");
++  pkt_line(4, "VSP1 SPD PGM    "); pkt_line(5, "POOL HEAT       "); pkt_line(6, "SPA HEAT        ");
++  pkt_line(7, "SOLAR HEAT      "); pkt_line(8, "POOL LIGHT      "); pkt_line(9, "SHEER DSCNT     ");
++  pkt_highlight(2);
++  CHECK("the device list is PM_PROGRAM", pda_m_type() == PM_PROGRAM);
++  CHECK("with FILTER PUMP highlighted", strncmp(pda_m_hlight(), "FILTER PUMP", 11) == 0);
++
++  pkt_highlight(9); pkt_shift(); pkt_line(9, "SPA LIGHT       ");
++  CHECK("past line 9 the list shifts and the highlight stays on line 9",
++        pda_m_type() == PM_PROGRAM && strncmp(pda_m_hlight(), "SPA LIGHT", 9) == 0);
++
++  // With a program. ADD/DELETE/CHANGE and the highlight arrive BEFORE the title.
++  pkt_clear();
++  pkt_line(7, "ADD      PROGRAM"); pkt_line(8, "DELETE   PROGRAM"); pkt_line(9, "CHANGE   PROGRAM");
++  pkt_highlight(7);
++  CHECK("a device screen is recognised before its title arrives", pda_m_type() == PM_PROGRAM_DEVICE);
++  pkt_line(0, "  FILTER PUMP   "); pkt_line(1, "   PGM 1 of 1   ");
++  pkt_line(3, "ON      10:00 AM"); pkt_line(4, "OFF      4:00 PM"); pkt_line(5, "ALL DAYS        ");
++  CHECK("and after it", pda_m_type() == PM_PROGRAM_DEVICE);
++  screen_lines(lines);
++  CHECK("FILTER PUMP parses", pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, "FILTER PUMP", &p));
++  CHECK("  as PGM 1 of 1", p.pgm == 1 && p.of == 1);
++  CHECK("  on 10:00 AM", strcmp(p.on, "10:00 AM") == 0);
++  CHECK("  off 4:00 PM", strcmp(p.off, "4:00 PM") == 0);
++  CHECK("  ALL DAYS", strcmp(p.days, "ALL DAYS") == 0);
++
++  // POOL HEAT's own title is the string PM_POOL_HEAT matches on line 0.
++  pkt_clear();
++  pkt_line(7, "ADD      PROGRAM"); pkt_line(8, "DELETE   PROGRAM"); pkt_line(9, "CHANGE   PROGRAM");
++  pkt_highlight(7);
++  pkt_line(0, "   POOL HEAT    "); pkt_line(1, "   PGM 2 of 3   ");
++  pkt_line(3, "ON       6:30 AM"); pkt_line(4, "OFF      8:00 AM"); pkt_line(5, "WEEKDAYS        ");
++  CHECK("POOL HEAT's program screen is not the pool heat setpoint screen", pda_m_type() == PM_PROGRAM_DEVICE);
++  screen_lines(lines);
++  CHECK("PGM 2 of 3 parses", pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, "POOL HEAT", &p)
++        && p.pgm == 2 && p.of == 3 && strcmp(p.on, "6:30 AM") == 0 && strcmp(p.days, "WEEKDAYS") == 0);
++
++  // None entered: NO PROGRAMS on 4-5, ADD PROGRAM on 9, then the title.
++  pkt_clear();
++  pkt_line(4, "  NO PROGRAMS   "); pkt_line(5, "    ENTERED     "); pkt_line(9, "  ADD PROGRAM   ");
++  pkt_highlight(9);
++  pkt_line(0, "      SPA       ");
++  CHECK("a device with no programs is PM_PROGRAM_DEVICE", pda_m_type() == PM_PROGRAM_DEVICE);
++  screen_lines(lines);
++  CHECK("and parses as none", pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, "SPA", &p)
++        && p.of == 0 && p.on[0] == '\0' && p.days[0] == '\0' && strcmp(p.device, "SPA") == 0);
++
++  // The real pool-heat setpoint screen must keep its own type.
++  pkt_clear();
++  pkt_line(0, "   POOL HEAT    "); pkt_line(2, "    80`F        ");
++  CHECK("the pool heat setpoint screen is still PM_POOL_HEAT", pda_m_type() == PM_POOL_HEAT);
++
++  // Home must stay home.
++  pkt_clear();
++  pkt_line(4, "POOL MODE    OFF"); pkt_line(8, "MENU            "); pkt_line(9, "EQUIPMENT ON/OFF");
++  pkt_highlight(8); pkt_line(0, "     FRI  4:07PM"); pkt_line(1, "AIR             ");
++  CHECK("home is still PM_HOME", pda_m_type() == PM_HOME);
++
++  printf("parser refuses what it does not recognise\n");
++  memset(lines, 0, sizeof(lines));
++  strcpy(lines[1], "   PGM 1 of 1   ");
++  strcpy(lines[3], "ON      10:00 AM");
++  CHECK("a screen with no OFF time is refused, not guessed",
++        !pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, "X", &p));
++  strcpy(lines[4], "OFF      4:00 PM");
++  strcpy(lines[1], "   PGM 3 of 2   ");
++  CHECK("PGM 3 of 2 is refused",
++        !pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, "X", &p));
++
++  printf("JSON\n");
++  {
++    static struct aqualinkdata d;
++    char buf[4096];
++    _aqconfig_.paneltype_mask = RSP_PDA;
++    d.panel_programs.state = PROGRAMS_OK;
++    d.panel_programs.read_at = 1760050000;
++    d.panel_programs.count = 2;
++    strcpy(d.panel_programs.programs[0].device, "FILTER PUMP");
++    d.panel_programs.programs[0].pgm = 1; d.panel_programs.programs[0].of = 1;
++    strcpy(d.panel_programs.programs[0].on, "10:00 AM");
++    strcpy(d.panel_programs.programs[0].off, "4:00 PM");
++    strcpy(d.panel_programs.programs[0].days, "ALL DAYS");
++    strcpy(d.panel_programs.programs[1].device, "SP\"A\\");
++    build_panel_programs_js(&d, buf, sizeof(buf));
++    printf("  %s\n", buf);
++    CHECK("JSON names the state", strstr(buf, "\"state\":\"ok\"") != NULL);
++    CHECK("JSON carries the program",
++          strstr(buf, "{\"device\":\"FILTER PUMP\",\"pgm\":1,\"of\":1,\"on\":\"10:00 AM\",\"off\":\"4:00 PM\",\"days\":\"ALL DAYS\"}") != NULL);
++    CHECK("JSON escapes quote and backslash", strstr(buf, "\"SP\\\"A\\\\\"") != NULL);
++    _aqconfig_.paneltype_mask = 0;
++    build_panel_programs_js(&d, buf, sizeof(buf));
++    CHECK("a non-PDA panel says unsupported", strstr(buf, "\"state\":\"unsupported\"") != NULL);
++  }
++
++  printf("panel clock\n");
++  {
++    char b[16];
++    CHECK("10:05 AM is 605", pda_parse_clock("10:05 AM") == 605);
++    CHECK("12:00 AM is midnight", pda_parse_clock("12:00 AM") == 0);
++    CHECK("12:30 PM is 750", pda_parse_clock("12:30 PM") == 750);
++    CHECK(" 3:55 PM, as the panel pads it, is 955", pda_parse_clock(" 3:55 PM") == 955);
++    CHECK("13:00 PM is not a panel time", pda_parse_clock("13:00 PM") == -1);
++    CHECK("10:05 with no AM/PM is refused", pda_parse_clock("10:05") == -1);
++    pda_format_clock(955, b, sizeof(b));
++    CHECK("955 is written 3:55 PM", strcmp(b, "3:55 PM") == 0);
++    pda_format_clock(0, b, sizeof(b));
++    CHECK("0 is written 12:00 AM", strcmp(b, "12:00 AM") == 0);
++  }
++
++  printf("a change is refused unless it is one this code has seen work\n");
++  {
++    static struct aqualinkdata d;
++    const char *why;
++    #define REQ(s) pda_programs_request_set(&d, s, (int)strlen(s))
++    _aqconfig_.paneltype_mask = RSP_PDA;
++    why = REQ("SOLAR HEAT/1040-1555");
++    CHECK("before any read: refused", why && strstr(why, "read the programs first"));
++    d.panel_programs.state = PROGRAMS_OK;
++    d.panel_programs.count = 3;
++    strcpy(d.panel_programs.programs[0].device, "SOLAR HEAT");
++    d.panel_programs.programs[0].pgm = 1; d.panel_programs.programs[0].of = 1;
++    strcpy(d.panel_programs.programs[1].device, "SPA");
++    strcpy(d.panel_programs.programs[2].device, "POOL HEAT");
++    d.panel_programs.programs[2].pgm = 1; d.panel_programs.programs[2].of = 2;
++    CHECK("a device not on the list", (why = REQ("HOT TUB/1040-1555")) && strstr(why, "no such device"));
++    CHECK("a device with no program (ADD is unmapped)", (why = REQ("SPA/1040-1555")) && strstr(why, "no program"));
++    CHECK("a device with several programs", (why = REQ("POOL HEAT/1040-1555")) && strstr(why, "several"));
++    CHECK("25:00 is not a time", (why = REQ("SOLAR HEAT/2500-1555")) && strstr(why, "24-hour"));
++    CHECK("10:60 is not a time", (why = REQ("SOLAR HEAT/1060-1555")) && strstr(why, "24-hour"));
++    CHECK("ON equal to OFF", (why = REQ("SOLAR HEAT/1040-1040")) && strstr(why, "same time"));
++    CHECK("no times at all", (why = REQ("SOLAR HEAT")) != NULL);
++    CHECK("a time with a separator in it", (why = REQ("SOLAR HEAT/10:40-1555")) != NULL);
++    d.panel_programs.set.state = PROGRAM_SET_RUNNING;
++    CHECK("a second change while one runs", (why = REQ("SOLAR HEAT/1040-1555")) && strstr(why, "already"));
++    _aqconfig_.paneltype_mask = 0;
++    d.panel_programs.set.state = PROGRAM_SET_NONE;
++    CHECK("a panel that is not a PDA", (why = REQ("SOLAR HEAT/1040-1555")) && strstr(why, "only PDA"));
++    #undef REQ
++  }
++
++  printf("the program routes refuse what a cross-site page could send\n");
++  {
++    // net_services.c keeps its result enum to itself; these are its positions
++    // as this patch leaves them (uActioned, uBad, ... uPrograms is 11).
++    enum { R_ACTIONED = 0, R_BAD = 1, R_PROGRAMS = 11 };
++    int action_URI(request_source from, const char *URI, int uri_length, float value,
++                   bool convertTemp, char **rtnmsg);
++    char *msg = NULL;
++    // A websocket URI is not NUL-terminated. Here it is "programs/set" (12),
++    // and the bytes after it happen to continue "/SOLAR HEAT/...".
++    const char ws[] = "programs/set/SOLAR HEAT/1040-1555";
++    int r;
++    r = action_URI(NET_WS, "programs/refresh", 16, 0, false, &msg);
++    CHECK("refresh over the websocket is refused", r == R_BAD && msg && strstr(msg, "PUT only"));
++    msg = NULL;
++    r = action_URI(NET_API, "programs/refresh", 16, 0, false, &msg);
++    CHECK("refresh as a GET is refused", r == R_BAD && msg && strstr(msg, "PUT only"));
++    msg = NULL;
++    r = action_URI(NET_API, "programs/set/SOLAR HEAT/1040-1555", 33, 0, false, &msg);
++    CHECK("a set as a GET is refused", r == R_BAD && msg && strstr(msg, "PUT only"));
++    msg = NULL;
++    r = action_URI(NET_WS, ws, 12, 0, false, &msg);
++    CHECK("a URI that ends at 'programs/set' is the read, whatever follows it",
++          r == R_PROGRAMS);
++    r = action_URI(NET_API, "programs", 8, 0, false, &msg);
++    CHECK("GET programs is still the read", r == R_PROGRAMS);
++    (void)R_ACTIONED;
++  }
++
++  printf("a schedule save writes only lines in the shape AqualinkD writes\n");
++  {
++    // Every field lands in a line cron runs as root. Each of these must be
++    // refused before the file is opened, so none of them may create it.
++    char out[256];
++    const char *bad[][2] = {
++      {"a url with a shell command in it",
++       "{\"devices\":[{\"enabled\":\"1\",\"min\":\"0\",\"hour\":\"1\",\"daym\":\"*\",\"month\":\"*\",\"dayw\":\"*\",\"url\":\"/api/x;reboot;/set\",\"value\":\"1\"}]}"},
++      {"a field longer than its buffer",
++       "{\"devices\":[{\"enabled\":\"1\",\"min\":\"0000000000000000000000000000000000\",\"hour\":\"1\",\"daym\":\"*\",\"month\":\"*\",\"dayw\":\"*\",\"url\":\"/api/Aux_1/set\",\"value\":\"1\"}]}"},
++      {"a value that is not a number",
++       "{\"devices\":[{\"enabled\":\"1\",\"min\":\"0\",\"hour\":\"1\",\"daym\":\"*\",\"month\":\"*\",\"dayw\":\"*\",\"url\":\"/api/Aux_1/set\",\"value\":\"1 -o /x\"}]}"},
++      {"a cron field with a space in it",
++       "{\"devices\":[{\"enabled\":\"1\",\"min\":\"0 1\",\"hour\":\"1\",\"daym\":\"*\",\"month\":\"*\",\"dayw\":\"*\",\"url\":\"/api/Aux_1/set\",\"value\":\"1\"}]}"},
++      {"an entry with a field missing",
++       "{\"devices\":[{\"enabled\":\"1\",\"min\":\"0\",\"hour\":\"1\",\"daym\":\"*\",\"month\":\"*\",\"url\":\"/api/Aux_1/set\",\"value\":\"1\"}]}"},
++      {"a good entry followed by a bad one",
++       "{\"devices\":[{\"enabled\":\"1\",\"min\":\"0\",\"hour\":\"1\",\"daym\":\"*\",\"month\":\"*\",\"dayw\":\"*\",\"url\":\"/api/Aux_1/set\",\"value\":\"1\"},"
++       "{\"enabled\":\"1\",\"min\":\"0\",\"hour\":\"2\",\"daym\":\"*\",\"month\":\"*\",\"dayw\":\"*\",\"url\":\"/api/Aux_1/set\",\"value\":\"$(id)\"}]}"},
++    };
++    _aqconfig_.enable_scheduler = true;
++    unlink(CRON_FILE);
++    for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
++      out[0] = '\0';
++      save_schedules_js(bad[k][1], (int)strlen(bad[k][1]), out, sizeof(out));
++      CHECK(bad[k][0], strstr(out, "refused") != NULL && access(CRON_FILE, F_OK) != 0);
++    }
++  }
++
++  printf(failures ? "%d FAILED\n" : "all passed\n", failures);
++  return failures ? 1 : 0;
++}
+diff --git a/source/aq_programmer.c b/source/aq_programmer.c
+index aed6267..b5104c0 100644
+--- a/source/aq_programmer.c
++++ b/source/aq_programmer.c
+@@ -32,6 +32,7 @@
+   #include "pda.h"
+   #include "pda_menu.h"
+   #include "pda_aq_programmer.h"
++  #include "pda_programs.h"
+ #endif
+ 
+ #include "aq_panel.h"
+@@ -114,6 +115,8 @@ const func_ptr _prog_functions[AQP_RSSADAPTER_MAX] = {
+      [AQ_PDA_SET_FREEZE_PROTECT_TEMP]  = set_aqualink_PDA_freeze_protectsetpoint,
+      [AQ_PDA_SET_TIME]                 = set_PDA_aqualink_time,
+      [AQ_PDA_SET_LIGHT_MODE]           = set_aqualink_PDA_light_mode,
++     [AQ_PDA_GET_PROGRAMS]             = get_PDA_aqualink_programs,
++     [AQ_PDA_SET_PROGRAM]              = set_PDA_aqualink_program,
+      //[AQ_PDA_GET_POOL_SPA_HEATER_TEMPS]= get_aqualink_PDA_pool_spa_heater_temps,
+      [AQ_PDA_GET_FREEZE_PROTECT_TEMP]  = get_PDA_aqualink_pool_spa_heater_temps
+      /*
+@@ -648,6 +651,9 @@ void _aq_programmer_(program_type r_type, char *args, aqkey *button, int value,
+       case AQ_SET_LIGHTCOLOR_MODE:
+         type = AQ_PDA_SET_LIGHT_MODE;
+       break;
++      case AQ_GET_PROGRAMS:
++        type = AQ_PDA_GET_PROGRAMS;
++      break;
+ #ifdef BETA_PDA_AUTOLABEL
+       case AQ_GET_AUX_LABELS:
+         type = AQ_PDA_AUX_LABELS:
+@@ -1077,6 +1083,12 @@ const char *ptypeName(program_type type)
+     case AQ_PDA_SET_LIGHT_MODE:
+       return "Set PDA light  mode";
+     break;
++    case AQ_PDA_GET_PROGRAMS:
++      return "Get PDA programs";
++    break;
++    case AQ_PDA_SET_PROGRAM:
++      return "Set PDA program";
++    break;
+ #endif
+     case AQP_NULL:
+     default:
+@@ -1179,6 +1191,12 @@ const char *programtypeDisplayName(program_type type)
+     case AQ_PDA_SET_LIGHT_MODE:
+       return "Programming: setting light color";
+     break;
++    case AQ_PDA_GET_PROGRAMS:
++      return "Programming: reading panel programs";
++    break;
++    case AQ_PDA_SET_PROGRAM:
++      return "Programming: changing a panel program";
++    break;
+ #endif
+     default:
+       return "Programming: please wait!";
+diff --git a/source/aq_programmer.h b/source/aq_programmer.h
+index 8a9aa8c..c6d7a22 100644
+--- a/source/aq_programmer.h
++++ b/source/aq_programmer.h
+@@ -87,6 +87,8 @@ typedef enum {
+   AQ_PDA_GET_POOL_SPA_HEATER_TEMPS,
+   AQ_PDA_GET_FREEZE_PROTECT_TEMP,
+   AQ_PDA_SET_LIGHT_MODE,
++  AQ_PDA_GET_PROGRAMS,
++  AQ_PDA_SET_PROGRAM,
+   // ******** OneTouch Delimiter make sure to change MAX/MIN below
+   AQ_SET_ONETOUCH_PUMP_RPM,
+   AQ_SET_ONETOUCH_MACRO,
+diff --git a/source/aq_scheduler.c b/source/aq_scheduler.c
+index 6956d53..9ea0a99 100644
+--- a/source/aq_scheduler.c
++++ b/source/aq_scheduler.c
+@@ -41,6 +41,48 @@ Example /etc/cron.d/aqualinkd
+ 
+ 
+ 
++/*
++ * poolhound: every field of a schedule ends up in a line cron runs AS ROOT
++ * (`root curl ... <url> -d value=<value>`), and each was copied into a fixed
++ * buffer with no length check. So a field is copied only if it fits, and a
++ * line is written only if every field is in the shape AqualinkD itself writes:
++ * cron fields of digits and * , / -, a url /api/<id>/set of letters, digits,
++ * _ and /, and a numeric value. Anything else refuses the whole save before
++ * the file is opened, so a bad entry neither runs nor truncates the list.
++ */
++static bool sc_copy(char *dst, size_t size, const char *src, int len)
++{
++  if (len < 0 || (size_t)len >= size)
++    return false;
++  memcpy(dst, src, len);
++  dst[len] = '\0';
++  return true;
++}
++
++static bool sc_only(const char *v, const char *allowed, size_t maxlen)
++{
++  size_t n = strlen(v);
++  if (n == 0 || n > maxlen)
++    return false;
++  for (size_t i = 0; i < n; i++)
++    if (strchr(allowed, v[i]) == NULL)
++      return false;
++  return true;
++}
++
++static bool sc_valid(const aqs_cron *c)
++{
++  const char *cronchars = "0123456789*,/-";
++  const char *urlchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_/";
++  size_t ul = strlen(c->url);
++  return sc_only(c->minute, cronchars, CV_SIZE - 1) && sc_only(c->hour, cronchars, CV_SIZE - 1)
++      && sc_only(c->daym, cronchars, CV_SIZE - 1) && sc_only(c->month, cronchars, CV_SIZE - 1)
++      && sc_only(c->dayw, cronchars, CV_SIZE - 1)
++      && sc_only(c->url, urlchars, CV_SIZE * 2 - 1) && ul > 9
++      && strncmp(c->url, "/api/", 5) == 0 && strcmp(c->url + ul - 4, "/set") == 0
++      && sc_only(c->value, "0123456789", 8);
++}
++
+ bool passJson_scObj(const char* line, int length, aqs_cron *values)
+ {
+   int keystart=0;
+@@ -72,32 +114,25 @@ bool passJson_scObj(const char* line, int length, aqs_cron *values)
+         values->enabled = (line[valuestart]=='0'?false:true);
+         captured++;
+       } else if ( strncmp(&line[keystart], "min", 3) == 0) {
+-        strncpy(values->minute, &line[valuestart], (i-valuestart) );
+-        values->minute[i-valuestart] = '\0';
++        if (!sc_copy(values->minute, sizeof(values->minute), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       } else if( strncmp(&line[keystart], "hour", 4) == 0) {
+-        strncpy(values->hour, &line[valuestart], (i-valuestart) );
+-        values->hour[i-valuestart] = '\0';
++        if (!sc_copy(values->hour, sizeof(values->hour), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       } else if( strncmp(&line[keystart], "daym", 4) == 0) {
+-        strncpy(values->daym, &line[valuestart], (i-valuestart) );
+-        values->daym[i-valuestart] = '\0';
++        if (!sc_copy(values->daym, sizeof(values->daym), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       } else if( strncmp(&line[keystart], "month", 5) == 0) {
+-        strncpy(values->month, &line[valuestart], (i-valuestart) );
+-        values->month[i-valuestart] = '\0';
++        if (!sc_copy(values->month, sizeof(values->month), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       } else if( strncmp(&line[keystart], "dayw", 4) == 0) {
+-        strncpy(values->dayw, &line[valuestart], (i-valuestart) );
+-        values->dayw[i-valuestart] = '\0';
++        if (!sc_copy(values->dayw, sizeof(values->dayw), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       } else if( strncmp(&line[keystart], "url", 3) == 0) {
+-        strncpy(values->url, &line[valuestart], (i-valuestart) );
+-        values->url[i-valuestart] = '\0';
++        if (!sc_copy(values->url, sizeof(values->url), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       } else if( strncmp(&line[keystart], "value", 5) == 0) {
+-        strncpy(values->value, &line[valuestart], (i-valuestart) );
+-        values->value[i-valuestart] = '\0';
++        if (!sc_copy(values->value, sizeof(values->value), &line[valuestart], i-valuestart)) return false;
+         captured++;
+       }
+       keystart=0;
+@@ -122,7 +157,7 @@ int save_schedules_js(const char* inBuf, int inSize, char* outBuf, int outSize)
+   aqs_cron cline;
+   bool fileexists = false;
+   bool fs = false;
+-  const net_iface *iface = get_first_valid_interface();
++  const net_iface *iface = NULL;    // poolhound: looked up after the check below
+ 
+   if ( !_aqconfig_.enable_scheduler) {
+     LOG(SCHD_LOG,LOG_WARNING, "Schedules are disabled\n");
+@@ -130,6 +165,29 @@ int save_schedules_js(const char* inBuf, int inSize, char* outBuf, int outSize)
+   }
+ 
+   LOG(SCHD_LOG,LOG_NOTICE, "Saving Schedule:\n");
++
++  // poolhound: parse and check EVERY entry before the file is opened; see
++  // sc_valid(). One bad entry refuses the save and leaves the file as it was.
++  {
++    bool checking = false;
++    int n = 0;
++    aqs_cron check;
++    for (i=0; i < inSize; i++) {
++      if ( inBuf[i] == '[' ) {
++        checking=true;
++      } else if ( inBuf[i] == ']' ) {
++        checking=false;
++      } else if ( checking && inBuf[i] == '{') {
++        memset(&check, 0, sizeof(check));
++        n++;
++        if (!passJson_scObj( &inBuf[i], (inSize-i), &check) || !sc_valid(&check)) {
++          LOG(SCHD_LOG,LOG_WARNING, "Schedule %d refused: a field is missing, too long or not in the shape AqualinkD writes\n", n);
++          return sprintf(outBuf, "{\"message\":\"Error schedule %d refused, nothing saved\"}", n);
++        }
++      }
++    }
++  }
++  iface = get_first_valid_interface();
+   
+   /*
+   bool fs = remount_root_ro(false);
+@@ -158,6 +216,7 @@ int save_schedules_js(const char* inBuf, int inSize, char* outBuf, int outSize)
+       } else if ( inBuf[i] == ']' ) {
+         inarray=false;
+       } else if ( inarray && inBuf[i] == '{') {
++        memset(&cline, 0, sizeof(cline));
+         passJson_scObj( &inBuf[i], (inSize-i), &cline);
+         LOG(SCHD_LOG,LOG_DEBUG, "Write to cron Min:%s Hour:%s DayM:%s Month:%s DayW:%s URL:%s Value:%s\n",cline.minute,cline.hour,cline.daym,cline.month,cline.dayw,cline.url,cline.value);
+         //LOG(SCHD_LOG,LOG_INFO, "%s%s %s %s %s %s curl -s -S --show-error -o /dev/null localhost:%s%s -d value=%s -X PUT\n",(cline.enabled?"":"#"),cline.minute, cline.hour, cline.daym, cline.month, cline.dayw, _aqconfig_.socket_port, cline.url, cline.value);
+diff --git a/source/aqualink.h b/source/aqualink.h
+index a62ee7a..6259af3 100644
+--- a/source/aqualink.h
++++ b/source/aqualink.h
+@@ -8,6 +8,9 @@
+ #include "aq_serial.h"
+ #include "aq_programmer.h"
+ #include "sensors.h"
++#ifdef AQ_PDA
++#include "pda_programs.h"
++#endif
+ //#include "aq_panel.h"  // Moved to later in file to overcome circular dependency. (crappy I know)
+ 
+ #define DPRINTF(format, ...) printf("%s:%d: " format, __FILE__, __LINE__, ##__VA_ARGS__)
+@@ -526,6 +529,7 @@ struct aqualinkdata
+   int pool_heater_index;
+   int spa_heater_index;
+   int solar_heater_index;
++  panel_programs panel_programs;  // the panel's own on/off programs, pda_programs.c
+   #endif
+   // Timing for DEBUG
+   #ifdef AQ_DEBUG
+diff --git a/source/net_services.c b/source/net_services.c
+index fed97e6..afc3ae0 100644
+--- a/source/net_services.c
++++ b/source/net_services.c
+@@ -19,6 +19,7 @@
+ #include <unistd.h>
+ #include <getopt.h>
+ #include <string.h>
++#include <strings.h>
+ #include <sys/time.h>
+ #include <syslog.h>
+ 
+@@ -41,6 +42,13 @@
+ #include "serialadapter.h"
+ #include "aq_timer.h"
+ #include "aq_scheduler.h"
++#ifdef AQ_PDA
++#include "pda_programs.h"
++// Whether the HTTP request being routed is a PUT. action_URI() does not see
++// the method; the web server is single-threaded, so this is set just before
++// each HTTP call to it and read inside.
++static bool _request_is_put = false;
++#endif
+ #include "rs_msg_utils.h"
+ #include "simulator.h"
+ #include "mqtt_discovery.h"
+@@ -956,7 +964,7 @@ void mqtt_broadcast_aqualinkstate(struct mg_connection *nc)
+ }
+ 
+ 
+-typedef enum {uActioned, uBad, uDevices, uStatus, uHomebridge, uDynamicconf, uDebugStatus, uDebugDownload, uSimulator, uSchedules, uSetSchedules, uAQmanager, uLogDownload, uNotAvailable, uConfig, uSaveConfig, uConfigDownload, uSaveWebConfig} uriAtype;
++typedef enum {uActioned, uBad, uDevices, uStatus, uHomebridge, uDynamicconf, uDebugStatus, uDebugDownload, uSimulator, uSchedules, uSetSchedules, uPrograms, uAQmanager, uLogDownload, uNotAvailable, uConfig, uSaveConfig, uConfigDownload, uSaveWebConfig} uriAtype;
+ //typedef enum {NET_MQTT=0, NET_API, NET_WS, DZ_MQTT} netRequest;
+ const char actionName[][5] = {"MQTT", "API", "WS", "DZ"};
+ 
+@@ -1049,6 +1057,41 @@ uriAtype action_URI(request_source from, const char *URI, int uri_length, float
+     return uSetSchedules;
+   } else if (strncmp(ri1, "schedules", 9) == 0) {
+     return uSchedules;
++#ifdef AQ_PDA
++  // The panel's own programs, read through the PDA menus. Reading them walks
++  // the menus for about a minute, so a GET returns the last read and
++  // programs/refresh starts a new one and returns at once.
++  //
++  // BOTH ACTIONS ARE HTTP PUT ONLY. As a GET, any page open on a browser in
++  // the house could fire one with an image tag; a cross-site PUT needs a CORS
++  // preflight this server never grants. Not over the websocket either, which
++  // browsers let any site open. Lengths are checked against uri_length, not
++  // trusted to strncmp: a websocket URI is not NUL-terminated.
++  } else if (uri_length >= 16 && strncmp(ri1, "programs/refresh", 16) == 0) {
++    if (from != NET_API || !_request_is_put) {
++      *rtnmsg = "programs/refresh is HTTP PUT only";
++      return uBad;
++    }
++    if (_aqualink_data->panel_programs.state != PROGRAMS_READING)
++      aq_programmer(AQ_GET_PROGRAMS, NULL, AQP_NULL, AQP_NULL, _aqualink_data);
++    return uActioned;
++  // programs/set/<DEVICE>/<HHMM>-<HHMM>: change one device's ON and OFF
++  // times. Queued, like refresh; the outcome is the "set" object in
++  // GET /api/programs, which is read back off the panel after the save.
++  } else if (uri_length > 13 && strncmp(ri1, "programs/set/", 13) == 0) {
++    if (from != NET_API || !_request_is_put) {
++      *rtnmsg = "programs/set is HTTP PUT only";
++      return uBad;
++    }
++    const char *why = pda_programs_request_set(_aqualink_data, ri1 + 13, uri_length - 13);
++    if (why != NULL) {
++      *rtnmsg = (char *)why;
++      return uBad;
++    }
++    return uActioned;
++  } else if (uri_length >= 8 && strncmp(ri1, "programs", 8) == 0) {
++    return uPrograms;
++#endif
+   } else if (strncmp(ri1, "config/download", 10) == 0) {
+     return uConfigDownload;
+   } else if (strncmp(ri1, "config/set", 10) == 0) {
+@@ -1664,6 +1707,9 @@ void action_web_request(struct mg_connection *nc, struct mg_http_message *http_m
+ 
+   int len = mg_url_decode(http_msg->uri.buf, http_msg->uri.len, buf, 50, 0);
+ 
++#ifdef AQ_PDA
++  _request_is_put = http_msg->method.len == 3 && strncasecmp(http_msg->method.buf, "PUT", 3) == 0;
++#endif
+   if (strncmp(http_msg->uri.buf, "/api/", 4) == 0)
+   {
+     switch (action_URI(NET_API, &buf[5], len - 5, value, false, &msg))
+@@ -1719,9 +1765,27 @@ void action_web_request(struct mg_connection *nc, struct mg_http_message *http_m
+       mg_http_reply(nc, 200, CONTENT_JSON, message);
+     }
+     break;
++#ifdef AQ_PDA
++    case uPrograms:
++    {
++      char message[JSON_BUFFER_SIZE];
++      build_panel_programs_js(_aqualink_data, message, JSON_BUFFER_SIZE);
++      mg_http_reply(nc, 200, CONTENT_JSON, "%s", message);
++    }
++    break;
++#endif
+     case uSetSchedules:
+     {
+       char message[JSON_BUFFER_SIZE];
++      // poolhound: HTTP PUT only, as programs/set. As a GET or a POST, any
++      // page open in a browser in the house could rewrite the cron file: a
++      // GET with no body empties it, and a text/plain POST needs no preflight.
++      // AqualinkD's own schedule page saves over the websocket, unchanged;
++      // what either may write is checked in aq_scheduler.c.
++      if (!(http_msg->method.len == 3 && strncasecmp(http_msg->method.buf, "PUT", 3) == 0)) {
++        mg_http_reply(nc, 400, CONTENT_TEXT, "schedules/set is HTTP PUT only");
++        break;
++      }
+       DEBUG_TIMER_START(&tid2);
+       save_schedules_js(http_msg->body.buf, http_msg->body.len, message, JSON_BUFFER_SIZE);
+       DEBUG_TIMER_STOP(tid2, NET_LOG, "action_web_request() save_schedules_js took");
+@@ -1904,6 +1968,15 @@ void action_websocket_request(struct mg_connection *nc, struct mg_ws_message *wm
+       ws_send(nc, message);
+     }
+     break;
++#ifdef AQ_PDA
++    case uPrograms:
++    {
++      char message[JSON_BUFFER_SIZE];
++      build_panel_programs_js(_aqualink_data, message, JSON_BUFFER_SIZE);
++      ws_send(nc, message);
++    }
++    break;
++#endif
+     case uSetSchedules:
+     {
+       DEBUG_TIMER_START(&tid);
+diff --git a/source/pda.c b/source/pda.c
+index a71e84c..277306d 100644
+--- a/source/pda.c
++++ b/source/pda.c
+@@ -1033,6 +1033,11 @@ bool process_pda_packet(unsigned char *packet, int length)
+           case PM_SET_TIME:
+             process_pda_packet_msg_long_set_time(msg);
+           break;
++          case PM_PROGRAM:
++          case PM_PROGRAM_DEVICE:
++            // Read whole by get_PDA_aqualink_programs(). NOT the unknown-line
++            // handler, which sets device LEDs from any line ending N/F/A.
++          break;
+           //case PM_FW_VERSION:
+           //  process_pda_packet_msg_long_FW_version(msg);
+           //break;
+diff --git a/source/pda_aq_programmer.c b/source/pda_aq_programmer.c
+index 6566abb..6ac278b 100644
+--- a/source/pda_aq_programmer.c
++++ b/source/pda_aq_programmer.c
+@@ -592,6 +592,16 @@ bool goto_pda_menu(struct aqualinkdata *aqdata, pda_menu_type menu) {
+             ret = waitForPDAnextMenu(aqdata);
+         }
+         break;
++      case PM_PROGRAM:
++        if (pda_m_type() == PM_HOME) {
++            ret = select_pda_menu_item(aqdata, "MENU", true);
++        } else if (pda_m_type() == PM_MAIN) {
++            ret = select_pda_menu_item(aqdata, "PROGRAM", true);
++        } else {
++            send_pda_cmd(KEY_PDA_BACK);
++            ret = waitForPDAnextMenu(aqdata);
++        }
++        break;
+       case PM_SET_TIME:
+         if (pda_m_type() == PM_HOME) {
+             ret = select_pda_menu_item(aqdata, "MENU", true);
+diff --git a/source/pda_menu.c b/source/pda_menu.c
+index 7cdf4ec..d37f573 100644
+--- a/source/pda_menu.c
++++ b/source/pda_menu.c
+@@ -136,6 +136,19 @@ int pda_find_m_index_swcase(char *text, int limit)
+   return -1;
+ }
+ */
++// A device's own program screen. Its ADD PROGRAM line (7 or 9) arrives before
++// its title, and the title is the device name -- "   POOL HEAT    " -- which
++// the PM_POOL_HEAT test below would otherwise claim. So this is tested first.
++static bool pda_m_is_program_device()
++{
++  int i;
++  for (i = 7; i < PDA_LINES; i++) {
++    if (strcasestr(_menu[i], "ADD") != NULL && strcasestr(_menu[i], "PROGRAM") != NULL)
++      return true;
++  }
++  return strcasestr(_menu[4], "NO PROGRAMS") != NULL;
++}
++
+ pda_menu_type pda_m_type()
+ {
+   if (strncasecmp(_menu[1],"AIR  ", 5) == 0) {
+@@ -154,6 +167,10 @@ pda_menu_type pda_m_type()
+     } else {
+       return PM_HOME;
+     }
++  } else if (strncasecmp(_menu[0],"    PROGRAM     ", 16) == 0) {
++    return PM_PROGRAM;
++  } else if (pda_m_is_program_device()) {
++    return PM_PROGRAM_DEVICE;
+   } else if (strncasecmp(_menu[0],"    SET TEMP    ", 16) == 0) {
+     return PM_SET_TEMP;
+   } else if (strncasecmp(_menu[0],"    SET TIME    ", 16) == 0) {
+diff --git a/source/pda_menu.h b/source/pda_menu.h
+index f0c337a..301fa4e 100644
+--- a/source/pda_menu.h
++++ b/source/pda_menu.h
+@@ -28,7 +28,8 @@ typedef enum pda_menu_type {
+   PM_EQUIPTMENT_CONTROL,
+   PM_EQUIPTMENT_STATUS,
+   PM_PALM_OPTIONS, // This seems to be only older revisions
+-  PM_BOOST
++  PM_BOOST,
++  PM_PROGRAM_DEVICE  // one device's own program screen, under PM_PROGRAM
+ } pda_menu_type;
+ 
+ /*
+diff --git a/source/pda_programs.c b/source/pda_programs.c
+new file mode 100644
+index 0000000..dbbbe4d
+--- /dev/null
++++ b/source/pda_programs.c
+@@ -0,0 +1,809 @@
++/*
++ * Read the panel's own equipment programs through the PDA PROGRAM menu.
++ *
++ * The screens, as captured off a PDA-PS6 Combo (PDA 0x60), line by line:
++ *
++ *   PROGRAM device list            one device, with a program   one device, none
++ *   0 "    PROGRAM     "           0 "  FILTER PUMP   "          0 "      SPA       "
++ *   2 "FILTER PUMP     " (hlight)  1 "   PGM 1 of 1   "          4 "  NO PROGRAMS   "
++ *   3 "SPA             "           3 "ON      10:00 AM"          5 "    ENTERED     "
++ *   ...                            4 "OFF      4:00 PM"          9 "  ADD PROGRAM   " (hlight)
++ *   9 "SHEER DSCNT     "           5 "ALL DAYS        "
++ *                                  7 "ADD      PROGRAM" (hlight)
++ *                                  8 "DELETE   PROGRAM"
++ *                                  9 "CHANGE   PROGRAM"
++ *
++ * The device list is a ring: past line 9 the panel shifts the lines up and
++ * redraws line 9 with the highlight left on it, and after the last device it
++ * comes back round to the first. The walk stops when the first name returns.
++ *
++ * A device screen arrives in pieces -- the ADD/DELETE/CHANGE lines and the
++ * highlight first, then the title and the times -- so it is read only after
++ * the first STATUS packet following the CLEAR, when the panel has finished
++ * drawing it.
++ *
++ * READ ONLY. SELECT is pressed in exactly two kinds of place: on the home and
++ * main menus by goto_pda_menu(), as every PDA programmer thread does, and on
++ * the PROGRAM device list after checking that is the screen showing. Never on
++ * a device's own screen, where every selectable line adds, deletes or changes
++ * a program.
++ */
++
++#define _GNU_SOURCE 1 // for strcasestr
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <ctype.h>
++#include <pthread.h>
++#include <time.h>
++
++#include "aqualink.h"
++#include "utils.h"
++#include "aq_programmer.h"
++#include "aq_serial.h"
++#include "pda.h"
++#include "pda_menu.h"
++#include "pda_programs.h"
++#include "config.h"
++#include "aq_panel.h"
++#include <unistd.h>
++
++// Non-static helpers in pda_aq_programmer.c that its header does not declare.
++void send_pda_cmd(unsigned char cmd);
++void goto_pda_home_first(struct aqualinkdata *aqdata);
++bool goto_pda_menu(struct aqualinkdata *aqdata, pda_menu_type menu);
++bool waitForPDAMessageType(struct aqualinkdata *aqdata, unsigned char mtype, int numMessageReceived);
++bool waitForPDAMessageTypes(struct aqualinkdata *aqdata, unsigned char mtype1, unsigned char mtype2, int numMessageReceived);
++bool waitForPDAMessages(struct aqualinkdata *aqdata, int numberMessages);
++bool waitForPDAnextMenu(struct aqualinkdata *aqdata);
++
++// Copy a panel line with surrounding spaces removed. Never edits the source,
++// which is the live menu buffer the serial thread is writing.
++static void trim_copy(char *dst, const char *src, size_t size)
++{
++  size_t len;
++  while (*src != '\0' && isspace((unsigned char)*src)) src++;
++  len = strnlen(src, AQ_MSGLEN);
++  while (len > 0 && isspace((unsigned char)src[len - 1])) len--;
++  if (len >= size) len = size - 1;
++  memcpy(dst, src, len);
++  dst[len] = '\0';
++}
++
++// "ON      10:00 AM" -> "10:00 AM", when the line starts with the word.
++static bool after_word(char *dst, const char *line, const char *word, size_t size)
++{
++  char t[AQ_MSGLEN + 1];
++  size_t wl = strlen(word);
++  trim_copy(t, line, sizeof(t));
++  if (strncasecmp(t, word, wl) != 0 || (t[wl] != ' ' && t[wl] != '\0'))
++    return false;
++  trim_copy(dst, t + wl, size);
++  return true;
++}
++
++bool pda_parse_program_screen(const char lines[][AQ_MSGLEN + 1], int nlines,
++                              const char *device, panel_program *out)
++{
++  int i, pgm = 0, of = 0;
++  char t[AQ_MSGLEN + 1];
++  bool none = false, have_pgm = false;
++
++  memset(out, 0, sizeof(*out));
++  trim_copy(out->device, device, sizeof(out->device));
++
++  for (i = 0; i < nlines; i++) {
++    trim_copy(t, lines[i], sizeof(t));
++    if (t[0] == '\0')
++      continue;
++    if (strncasecmp(t, "NO PROGRAMS", 11) == 0) {
++      none = true;
++    } else if (sscanf(t, "PGM %d of %d", &pgm, &of) == 2 ||
++               sscanf(t, "PGM %d OF %d", &pgm, &of) == 2) {
++      have_pgm = true;
++    } else if (after_word(out->on, t, "ON", sizeof(out->on))) {
++      ;
++    } else if (after_word(out->off, t, "OFF", sizeof(out->off))) {
++      ;
++    } else if (i >= 2 && i <= 6 && out->days[0] == '\0' &&
++               strcasestr(t, "PROGRAM") == NULL && strcasestr(t, "ENTERED") == NULL) {
++      // The line under the times: ALL DAYS, WEEKDAYS, a list of days.
++      trim_copy(out->days, t, sizeof(out->days));
++    }
++  }
++
++  if (none) {
++    out->pgm = 0;
++    out->of = 0;
++    out->on[0] = out->off[0] = out->days[0] = '\0';
++    return true;
++  }
++  if (!have_pgm || pgm < 1 || of < 1 || pgm > of || of > 99 ||
++      out->on[0] == '\0' || out->off[0] == '\0')
++    return false;   // not a screen this parser recognises; say so rather than guess
++  out->pgm = (unsigned char)pgm;
++  out->of = (unsigned char)of;
++  return true;
++}
++
++// Wait until a device screen has been cleared and fully drawn.
++static bool wait_device_screen(struct aqualinkdata *aqdata)
++{
++  if (!waitForPDAMessageType(aqdata, CMD_PDA_CLEAR, 10))
++    return false;
++  // Lines and the highlight arrive first, the STATUS that ends the frame last.
++  if (!waitForPDAMessageType(aqdata, CMD_STATUS, 30))
++    return false;
++  return pda_m_type() == PM_PROGRAM_DEVICE;
++}
++
++static void fail(struct aqualinkdata *aqdata, const char *why)
++{
++  LOG(PDA_LOG, LOG_ERR, "PDA get programs: %s (menu %d, line '%s')\n",
++      why, pda_m_type(), pda_m_hlight());
++  snprintf(aqdata->panel_programs.error, sizeof(aqdata->panel_programs.error), "%s", why);
++  aqdata->panel_programs.state = PROGRAMS_FAILED;
++}
++
++void *get_PDA_aqualink_programs(void *ptr)
++{
++  struct programmingThreadCtrl *threadCtrl = (struct programmingThreadCtrl *)ptr;
++  struct aqualinkdata *aqdata = threadCtrl->aqdata;
++  static panel_program found[PANEL_PROGRAMS_MAX];
++  char lines[PDA_LINES][AQ_MSGLEN + 1];
++  char first[AQ_MSGLEN + 1] = "";
++  char dev[AQ_MSGLEN + 1];
++  char prev[AQ_MSGLEN + 1] = "";
++  int n = 0, i, l;
++
++  waitForSingleThreadOrTerminate(threadCtrl, AQ_PDA_GET_PROGRAMS);
++
++  aqdata->panel_programs.state = PROGRAMS_READING;
++  aqdata->panel_programs.started_at = time(NULL);
++  aqdata->panel_programs.error[0] = '\0';
++
++  goto_pda_home_first(aqdata);
++  if (!goto_pda_menu(aqdata, PM_PROGRAM)) {
++    fail(aqdata, "could not reach the PROGRAM menu");
++    goto f_end;
++  }
++
++  for (i = 0; i < PANEL_PROGRAMS_MAX; i++) {
++    if (pda_m_type() != PM_PROGRAM || pda_m_hlightindex() < 0) {
++      fail(aqdata, "lost the PROGRAM device list");
++      goto f_home;
++    }
++    trim_copy(dev, pda_m_hlight(), sizeof(dev));
++    if (dev[0] == '\0') {
++      fail(aqdata, "no device highlighted on the PROGRAM list");
++      goto f_home;
++    }
++    if (i == 0) {
++      strcpy(first, dev);
++    } else if (strcmp(dev, first) == 0) {
++      break;   // the ring has come back round: every device has been read
++    }
++
++    // VSP1 SPD PGM is a submenu of pump speeds, not a schedule. Not entered.
++    if (!(strncasecmp(dev, "VSP", 3) == 0 && strcasestr(dev, "SPD") != NULL)) {
++      send_pda_cmd(KEY_PDA_SELECT);
++      if (!wait_device_screen(aqdata)) {
++        fail(aqdata, "a device's program screen did not appear");
++        goto f_home;
++      }
++      for (l = 0; l < PDA_LINES; l++)
++        snprintf(lines[l], sizeof(lines[l]), "%s", pda_m_line(l));
++      if (!pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, dev, &found[n])) {
++        fail(aqdata, "a program screen was not in a recognised form");
++        goto f_home;
++      }
++      LOG(PDA_LOG, LOG_NOTICE, "PDA program '%s' %d of %d on '%s' off '%s' '%s'\n",
++          found[n].device, found[n].pgm, found[n].of, found[n].on, found[n].off, found[n].days);
++      n++;
++
++      send_pda_cmd(KEY_PDA_BACK);
++      if (!waitForPDAnextMenu(aqdata) || pda_m_type() != PM_PROGRAM) {
++        fail(aqdata, "BACK did not return to the PROGRAM list");
++        goto f_home;
++      }
++    }
++
++    // Down one. Mid-list the panel moves the highlight; at the bottom it
++    // shifts the lines and redraws line 9 with the highlight left in place.
++    strcpy(prev, dev);
++    send_pda_cmd(KEY_PDA_DOWN);
++    waitForPDAMessageTypes(aqdata, CMD_PDA_HIGHLIGHT, CMD_MSG_LONG, 10);
++    trim_copy(dev, pda_m_hlight(), sizeof(dev));
++    if (strcmp(dev, prev) == 0) {
++      waitForPDAMessages(aqdata, 6);
++      trim_copy(dev, pda_m_hlight(), sizeof(dev));
++      if (strcmp(dev, prev) == 0) {
++        fail(aqdata, "DOWN did not move along the PROGRAM list");
++        goto f_home;
++      }
++    }
++  }
++
++  if (i >= PANEL_PROGRAMS_MAX) {
++    fail(aqdata, "the PROGRAM list never came back round to its first device");
++    goto f_home;
++  }
++
++  // Publish all at once, so a reader of /api/programs never sees half a walk.
++  memcpy(aqdata->panel_programs.programs, found, sizeof(found[0]) * n);
++  aqdata->panel_programs.count = n;
++  aqdata->panel_programs.read_at = time(NULL);
++  aqdata->panel_programs.state = PROGRAMS_OK;
++  LOG(PDA_LOG, LOG_NOTICE, "PDA read %d program device(s)\n", n);
++
++f_home:
++  goto_pda_menu(aqdata, PM_HOME);
++f_end:
++  cleanAndTerminateThread(threadCtrl);
++  return ptr;
++}
++
++// JSON-safe copy of a panel string. The panel's character set is upper-case
++// ASCII, but nothing here assumes it.
++static int json_str(char *buf, int size, const char *s)
++{
++  int len = 0;
++  if (size < 3) return 0;
++  buf[len++] = '"';
++  for (; *s != '\0' && len < size - 2; s++) {
++    unsigned char c = (unsigned char)*s;
++    if (c == '"' || c == '\\') {
++      if (len >= size - 3) break;
++      buf[len++] = '\\';
++      buf[len++] = (char)c;
++    } else if (c >= 0x20 && c < 0x7f) {
++      buf[len++] = (char)c;
++    }
++  }
++  buf[len++] = '"';
++  buf[len] = '\0';
++  return len;
++}
++
++int build_panel_programs_js(struct aqualinkdata *aqdata, char *buffer, int size)
++{
++  static const char *state_name[] = {"never_read", "reading", "ok", "failed"};
++  panel_programs *pp = &aqdata->panel_programs;
++  int len, i;
++  char q[3 * AQ_MSGLEN + 3];
++
++  if (!isPDA_PANEL) {
++    return snprintf(buffer, size, "{\"type\":\"programs\",\"state\":\"unsupported\","
++                    "\"error\":\"only PDA panels are read\",\"programs\":[]}");
++  }
++
++  json_str(q, sizeof(q), pp->error);
++  len = snprintf(buffer, size,
++                 "{\"type\":\"programs\",\"state\":\"%s\",\"read_at\":%ld,"
++                 "\"started_at\":%ld,\"error\":%s,\"programs\":[",
++                 state_name[pp->state <= PROGRAMS_FAILED ? pp->state : PROGRAMS_FAILED],
++                 (long)pp->read_at, (long)pp->started_at, q);
++
++  for (i = 0; i < pp->count && len < size - 256; i++) {
++    panel_program *p = &pp->programs[i];
++    len += snprintf(buffer + len, size - len, "%s{\"device\":", i ? "," : "");
++    len += json_str(buffer + len, size - len, p->device);
++    len += snprintf(buffer + len, size - len, ",\"pgm\":%d,\"of\":%d,\"on\":", p->pgm, p->of);
++    len += json_str(buffer + len, size - len, p->on);
++    len += snprintf(buffer + len, size - len, ",\"off\":");
++    len += json_str(buffer + len, size - len, p->off);
++    len += snprintf(buffer + len, size - len, ",\"days\":");
++    len += json_str(buffer + len, size - len, p->days);
++    len += snprintf(buffer + len, size - len, "}");
++  }
++  len += snprintf(buffer + len, size - len, "]");
++  if (pp->set.state != PROGRAM_SET_NONE && len < size - 400) {
++    static const char *set_name[] = {"none", "queued", "running", "ok", "failed"};
++    char on[12], off[12];
++    pda_format_clock(pp->set.on_min, on, sizeof(on));
++    pda_format_clock(pp->set.off_min, off, sizeof(off));
++    len += snprintf(buffer + len, size - len, ",\"set\":{\"state\":\"%s\",\"device\":",
++                    set_name[pp->set.state <= PROGRAM_SET_FAILED ? pp->set.state : PROGRAM_SET_FAILED]);
++    len += json_str(buffer + len, size - len, pp->set.device);
++    len += snprintf(buffer + len, size - len, ",\"want_on\":\"%s\",\"want_off\":\"%s\","
++                    "\"requested_at\":%ld,\"done_at\":%ld,\"error\":",
++                    on, off, (long)pp->set.requested_at, (long)pp->set.done_at);
++    len += json_str(buffer + len, size - len, pp->set.error);
++    len += snprintf(buffer + len, size - len, ",\"now_on\":");
++    len += json_str(buffer + len, size - len, pp->set.now.on);
++    len += snprintf(buffer + len, size - len, ",\"now_off\":");
++    len += json_str(buffer + len, size - len, pp->set.now.off);
++    len += snprintf(buffer + len, size - len, "}");
++  }
++  len += snprintf(buffer + len, size - len, "}");
++  return len;
++}
++
++/* ------------------------------------------------------------------ setting
++ *
++ * CHANGE PROGRAM, as captured off this panel (docs/JANDY-PROGRAMS.md, 5):
++ *
++ *   device screen, cursor on CHANGE PROGRAM, Select:
++ *   no CLEAR. Line 1 becomes " CHANGE PROGRAM ", lines 6-9 the instructions,
++ *   and the highlight becomes a character range (HIGHLIGHTCHARS):
++ *
++ *     ON hour      line 3, chars 8-9      Select moves to the next field
++ *     ON minutes   line 3, chars 11-12    one minute per press; line 3 redrawn
++ *     OFF hour     line 4, chars 8-9
++ *     OFF minutes  line 4, chars 11-12
++ *     days         line 5, chars 0-7      Select here SAVES: CLEAR, and the
++ *                                         device screen is redrawn
++ *
++ * NOTHING IS TYPED BLIND. Every press is followed by reading the line the
++ * panel redraws, and the value must have moved by exactly one step in the
++ * direction asked for. Which way Up moves the HOUR has not been seen, so the
++ * first hour press is allowed to reveal the direction once; anything else
++ * unexpected stops the change.
++ *
++ * WHAT A FAILURE LEAVES. No way to leave the editor without saving has been
++ * seen, so a change that goes wrong mid-way puts the field it was on back to
++ * where it started and Selects through the rest UNCHANGED, which saves. Fields
++ * already completed stay changed. The device screen is then read back and
++ * reported as it is: the result always says what the panel holds, never what
++ * was intended.
++ */
++
++int pda_parse_clock(const char *s)
++{
++  int h, m;
++  char ap[3] = "";
++  char t[AQ_MSGLEN + 1];
++  trim_copy(t, s, sizeof(t));
++  if (sscanf(t, "%d:%d %2s", &h, &m, ap) != 3 || h < 1 || h > 12 || m < 0 || m > 59)
++    return -1;
++  if (strcasecmp(ap, "AM") == 0)
++    return (h % 12) * 60 + m;
++  if (strcasecmp(ap, "PM") == 0)
++    return (h % 12 + 12) * 60 + m;
++  return -1;
++}
++
++void pda_format_clock(int minutes, char *out, int size)
++{
++  int h = (minutes / 60) % 24, m = minutes % 60;
++  snprintf(out, size, "%d:%02d %s", h % 12 == 0 ? 12 : h % 12, m, h < 12 ? "AM" : "PM");
++}
++
++static pthread_mutex_t _set_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static int hhmm(const char *s, int n)
++{
++  int i, v = 0;
++  if (n != 4) return -1;
++  for (i = 0; i < 4; i++) {
++    if (s[i] < '0' || s[i] > '9') return -1;
++    v = v * 10 + (s[i] - '0');
++  }
++  if (v / 100 > 23 || v % 100 > 59) return -1;
++  return (v / 100) * 60 + v % 100;
++}
++
++const char *pda_programs_request_set(struct aqualinkdata *aqdata, const char *spec, int len)
++{
++  panel_programs *pp = &aqdata->panel_programs;
++  char dev[AQ_MSGLEN + 1];
++  const char *slash, *dash;
++  int i, on, off, dl;
++  panel_program *have = NULL;
++
++  if (!isPDA_PANEL)
++    return "only PDA panels can be programmed";
++  slash = memchr(spec, '/', len);
++  if (slash == NULL)
++    return "expected programs/set/<DEVICE>/<HHMM>-<HHMM>";
++  dl = (int)(slash - spec);
++  if (dl < 1 || dl > AQ_MSGLEN)
++    return "device name missing or too long";
++  memcpy(dev, spec, dl);
++  dev[dl] = '\0';
++  dash = memchr(slash + 1, '-', len - dl - 1);
++  if (dash == NULL)
++    return "expected <HHMM>-<HHMM>";
++  on = hhmm(slash + 1, (int)(dash - slash - 1));
++  off = hhmm(dash + 1, (int)(spec + len - dash - 1));
++  if (on < 0 || off < 0)
++    return "times are 24-hour HHMM, e.g. 1040-1555";
++  if (on == off)
++    return "ON and OFF are the same time";
++
++  // ONLY WHAT HAS BEEN SEEN. A device the last read did not list, one with
++  // no program (that needs ADD, unmapped) or several (paging, unseen).
++  if (pp->state != PROGRAMS_OK)
++    return "read the programs first (programs/refresh)";
++  for (i = 0; i < pp->count; i++) {
++    if (strcasecmp(pp->programs[i].device, dev) == 0) {
++      have = &pp->programs[i];
++      break;
++    }
++  }
++  if (have == NULL)
++    return "no such device on the panel's PROGRAM list";
++  if (have->of == 0)
++    return "that device has no program; adding one is not supported yet";
++  if (have->of > 1)
++    return "that device has several programs; only a single one can be changed yet";
++
++  pthread_mutex_lock(&_set_lock);
++  if (pp->set.state == PROGRAM_SET_QUEUED || pp->set.state == PROGRAM_SET_RUNNING) {
++    pthread_mutex_unlock(&_set_lock);
++    return "a change is already in progress";
++  }
++  memset(&pp->set, 0, sizeof(pp->set));
++  snprintf(pp->set.device, sizeof(pp->set.device), "%s", have->device);
++  pp->set.on_min = on;
++  pp->set.off_min = off;
++  pp->set.requested_at = time(NULL);
++  pp->set.state = PROGRAM_SET_QUEUED;
++  pthread_mutex_unlock(&_set_lock);
++
++  aq_programmer(AQ_PDA_SET_PROGRAM, NULL, AQP_NULL, AQP_NULL, aqdata);
++  return NULL;
++}
++
++/* ---------------------------------------------------------- waiting, fresh
++ *
++ * NOT waitForPDAMessageType(). It looks at the LAST packet before it waits, so
++ * once one highlight has arrived every later "wait for a highlight" returns at
++ * once -- before the key just pressed has reached the panel. MEASURED, on the
++ * first live change: the Down presses to CHANGE PROGRAM ran ahead of the
++ * screen, the loop saw CHANGE on a stale read and stopped with a third Down
++ * already sent, which wrapped the cursor to ADD, and Select opened the ADD
++ * editor. (It failed safe, and Back there was seen to cancel.)
++ *
++ * So a key is pressed and the queue flushed -- send_cmd() holds one key at a
++ * time and waitfor_pda_queue2empty() returns once it has gone -- and then the
++ * thread waits on packets that arrive AFTER that, until the SCREEN shows the
++ * change asked for. A wait is for a state, never for a packet type.
++ */
++void waitfor_pda_queue2empty();
++
++typedef bool (*screen_test)(const void *ctx);
++
++static bool wait_until(struct aqualinkdata *aqdata, screen_test test, const void *ctx, int max_packets)
++{
++  int i;
++  for (i = 0; i < max_packets; i++) {
++    if (test(ctx))
++      return true;
++    pthread_mutex_lock(&aqdata->active_thread.thread_mutex);
++    pthread_cond_wait(&aqdata->active_thread.thread_cond, &aqdata->active_thread.thread_mutex);
++    pthread_mutex_unlock(&aqdata->active_thread.thread_mutex);
++  }
++  return test(ctx);
++}
++
++static bool never(const void *ctx) { (void)ctx; return false; }
++
++static void press(unsigned char key)
++{
++  send_pda_cmd(key);
++  waitfor_pda_queue2empty();
++}
++
++// Let the panel finish answering whatever was last pressed.
++static void settle(struct aqualinkdata *aqdata)
++{
++  waitfor_pda_queue2empty();
++  wait_until(aqdata, never, NULL, 4);
++}
++
++// The highlighted character range's first column, or -1 when a whole line
++// (or nothing) is highlighted.
++static int hl_start(void)
++{
++  int len = 0, idx = pda_m_hlightindex();
++  char *p = pda_m_hlightchars(&len);
++  if (p == NULL || idx < 0 || len <= 0)
++    return -1;
++  return (int)(p - pda_m_line(idx));
++}
++
++struct hl_was { int idx; char text[AQ_MSGLEN + 1]; };
++static void hl_note(struct hl_was *w)
++{
++  w->idx = pda_m_hlightindex();
++  trim_copy(w->text, pda_m_hlight(), sizeof(w->text));
++}
++// The highlight moved: another line, or (at the bottom of a list that scrolls
++// under it) the same line with different text.
++static bool hl_moved(const void *ctx)
++{
++  const struct hl_was *w = ctx;
++  char now[AQ_MSGLEN + 1];
++  trim_copy(now, pda_m_hlight(), sizeof(now));
++  return pda_m_hlightindex() != w->idx || strcmp(now, w->text) != 0;
++}
++
++struct field_at { int line, col; };
++static bool at_field(const void *ctx)
++{
++  const struct field_at *f = ctx;
++  return pda_m_hlightindex() == f->line && hl_start() == f->col;
++}
++
++// The time on an ON/OFF line, in minutes after midnight, or -1.
++static int line_clock(int line, const char *word)
++{
++  char v[AQ_MSGLEN + 1];
++  if (!after_word(v, pda_m_line(line), word, sizeof(v)))
++    return -1;
++  return pda_parse_clock(v);
++}
++
++struct value_was { int line; const char *word; bool hour; int part; };
++static bool value_moved(const void *ctx)
++{
++  const struct value_was *v = ctx;
++  int now = line_clock(v->line, v->word);
++  return now >= 0 && (v->hour ? now / 60 : now % 60) != v->part;
++}
++
++// A device's program screen, fully drawn: its title, and either its times or
++// NO PROGRAMS. The editor's own screen does not pass (its line 1 is the word
++// CHANGE PROGRAM), nor does the device list.
++static bool device_screen_ready(const void *ctx)
++{
++  (void)ctx;
++  if (pda_m_type() != PM_PROGRAM_DEVICE || pda_m_line(0)[0] == '\0')
++    return false;
++  if (strcasestr(pda_m_line(4), "NO PROGRAMS") != NULL)
++    return true;
++  return strcasestr(pda_m_line(1), "PGM") != NULL
++      && line_clock(3, "ON") >= 0 && line_clock(4, "OFF") >= 0;
++}
++
++static bool wait_device_screen_fresh(struct aqualinkdata *aqdata)
++{
++  if (!wait_until(aqdata, device_screen_ready, NULL, 60))
++    return false;
++  settle(aqdata);
++  return device_screen_ready(NULL);
++}
++
++/* Step one field to `target` (minutes after midnight; only its hour or only
++ * its minute part is compared, by `hour`). One press at a time, each waited
++ * for on the screen. False on anything but exactly one step per press, with
++ * *moved = net Up presses applied, so the caller can undo them. */
++static bool step_field(struct aqualinkdata *aqdata, int line, const char *word,
++                       bool hour, int target, int *moved)
++{
++  bool up_is_plus = true, learned = !hour, key_up;   // minutes: Down was seen to go down
++  int presses, cur, want, dir, got, delta, mod = hour ? 24 : 60;
++  struct value_was was;
++
++  *moved = 0;
++  for (presses = 0; presses < 40; presses++) {
++    cur = line_clock(line, word);
++    if (cur < 0) return false;
++    cur = hour ? cur / 60 : cur % 60;
++    want = hour ? (target / 60) % 24 : target % 60;
++    if (cur == want) return true;
++    // Shortest way round for the hour; never wrap the minutes (the hour
++    // would not follow, and a minute field that carried would be unseen).
++    if (hour) dir = (((want - cur) % 24) + 24) % 24 <= 12 ? +1 : -1;
++    else dir = want > cur ? +1 : -1;
++
++    key_up = (dir > 0) == up_is_plus;
++    was.line = line; was.word = word; was.hour = hour; was.part = cur;
++    press(key_up ? KEY_PDA_UP : KEY_PDA_DOWN);
++    *moved += key_up ? 1 : -1;
++    if (!wait_until(aqdata, value_moved, &was, 30))
++      return false;                          // the press changed nothing on screen
++    got = line_clock(line, word);
++    got = hour ? got / 60 : got % 60;
++    delta = (((got - cur) % mod) + mod) % mod;
++    if (delta == 1) delta = +1;
++    else if (delta == mod - 1) delta = -1;
++    else return false;                       // more than one step
++    if (delta != dir) {
++      if (learned) return false;             // the wrong way, and not for the first time
++      up_is_plus = !up_is_plus;              // the hour's Up runs the other way
++    }
++    learned = true;
++  }
++  return false;
++}
++
++// Leave the editor the only way seen to keep the program: Select through the
++// remaining fields, unchanged, until the device screen is redrawn.
++static bool save_out_of_editor(struct aqualinkdata *aqdata)
++{
++  int i;
++  for (i = 0; i < 6; i++) {
++    press(KEY_PDA_SELECT);
++    if (wait_until(aqdata, device_screen_ready, NULL, 40)) {
++      settle(aqdata);
++      return true;
++    }
++  }
++  return false;
++}
++
++// Press the opposite key `moved` times (net Up presses), each waited for.
++static void undo_presses(struct aqualinkdata *aqdata, int line, const char *word, bool hour, int moved)
++{
++  int i, cur;
++  struct value_was was;
++  for (i = 0; i < abs(moved) && i < 40; i++) {
++    cur = line_clock(line, word);
++    was.line = line; was.word = word; was.hour = hour;
++    was.part = cur < 0 ? -1 : (hour ? cur / 60 : cur % 60);
++    press(moved > 0 ? KEY_PDA_DOWN : KEY_PDA_UP);
++    wait_until(aqdata, value_moved, &was, 30);
++  }
++}
++
++static void set_fail(struct aqualinkdata *aqdata, const char *why)
++{
++  LOG(PDA_LOG, LOG_ERR, "PDA set program: %s (menu %d, line '%s')\n",
++      why, pda_m_type(), pda_m_hlight());
++  snprintf(aqdata->panel_programs.set.error, sizeof(aqdata->panel_programs.set.error), "%s", why);
++  aqdata->panel_programs.set.state = PROGRAM_SET_FAILED;
++  aqdata->panel_programs.set.done_at = time(NULL);
++}
++
++static bool is_change_editor(void)
++{
++  return strcasestr(pda_m_line(1), "CHANGE PROGRAM") != NULL;
++}
++// An editor screen of some kind: the instructions are on lines 6-9.
++static bool is_an_editor(void)
++{
++  return strcasestr(pda_m_line(6), "ARROW") != NULL;
++}
++
++void *set_PDA_aqualink_program(void *ptr)
++{
++  struct programmingThreadCtrl *threadCtrl = (struct programmingThreadCtrl *)ptr;
++  struct aqualinkdata *aqdata = threadCtrl->aqdata;
++  panel_program_set *req = &aqdata->panel_programs.set;
++  panel_program before, after;
++  char lines[PDA_LINES][AQ_MSGLEN + 1];
++  char dev[AQ_MSGLEN + 1], first[AQ_MSGLEN + 1] = "";
++  bool in_editor = false, ok = true;
++  int i, l, moved = 0, field;
++  struct hl_was hw;
++  struct field_at fa;
++  static const struct { int line, col; const char *word; bool hour; } F[] = {
++    {3, 8, "ON", true}, {3, 11, "ON", false}, {4, 8, "OFF", true}, {4, 11, "OFF", false}};
++
++  waitForSingleThreadOrTerminate(threadCtrl, AQ_PDA_SET_PROGRAM);
++  req->state = PROGRAM_SET_RUNNING;
++
++  goto_pda_home_first(aqdata);
++  if (!goto_pda_menu(aqdata, PM_PROGRAM)) {
++    set_fail(aqdata, "could not reach the PROGRAM menu");
++    goto f_end;
++  }
++  settle(aqdata);
++
++  // Down the ring to the device, each press waited for on the screen.
++  for (i = 0; i < PANEL_PROGRAMS_MAX; i++) {
++    if (pda_m_type() != PM_PROGRAM) { set_fail(aqdata, "lost the PROGRAM device list"); goto f_home; }
++    trim_copy(dev, pda_m_hlight(), sizeof(dev));
++    if (strcasecmp(dev, req->device) == 0) break;
++    if (i == 0) strcpy(first, dev);
++    else if (strcmp(dev, first) == 0) { set_fail(aqdata, "the device is no longer on the PROGRAM list"); goto f_home; }
++    hl_note(&hw);
++    press(KEY_PDA_DOWN);
++    if (!wait_until(aqdata, hl_moved, &hw, 30)) { set_fail(aqdata, "DOWN did not move along the PROGRAM list"); goto f_home; }
++  }
++  if (i >= PANEL_PROGRAMS_MAX) { set_fail(aqdata, "never reached the device"); goto f_home; }
++  settle(aqdata);
++  trim_copy(dev, pda_m_hlight(), sizeof(dev));
++  if (pda_m_type() != PM_PROGRAM || strcasecmp(dev, req->device) != 0) {
++    set_fail(aqdata, "the cursor was not on the device when it came to Select");
++    goto f_home;
++  }
++
++  press(KEY_PDA_SELECT);
++  if (!wait_device_screen_fresh(aqdata)) { set_fail(aqdata, "the device's program screen did not appear"); goto f_home; }
++  for (l = 0; l < PDA_LINES; l++) snprintf(lines[l], sizeof(lines[l]), "%s", pda_m_line(l));
++  if (!pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, req->device, &before)
++      || before.of != 1) {
++    set_fail(aqdata, "the device does not show exactly one program");
++    goto f_back;
++  }
++  if (pda_parse_clock(before.on) == req->on_min && pda_parse_clock(before.off) == req->off_min) {
++    after = before;            // already so: nothing to press
++    goto f_done;
++  }
++
++  // To CHANGE PROGRAM: two lines under ADD, where the cursor starts. Each
++  // Down is waited for on the screen, and the cursor is read again after the
++  // panel has settled -- the check that was stale on the first live run.
++  for (i = 0; i < 3 && strncasecmp(pda_m_hlight(), "CHANGE", 6) != 0; i++) {
++    hl_note(&hw);
++    press(KEY_PDA_DOWN);
++    if (!wait_until(aqdata, hl_moved, &hw, 30)) { set_fail(aqdata, "DOWN did not move on the device's screen"); goto f_back; }
++  }
++  settle(aqdata);
++  if (strncasecmp(pda_m_hlight(), "CHANGE", 6) != 0) { set_fail(aqdata, "could not reach CHANGE PROGRAM"); goto f_back; }
++
++  press(KEY_PDA_SELECT);
++  fa.line = F[0].line; fa.col = F[0].col;
++  if (!wait_until(aqdata, at_field, &fa, 40) || !is_change_editor()) {
++    set_fail(aqdata, "the program editor did not open on the ON hour");
++    if (is_change_editor()) {
++      in_editor = !save_out_of_editor(aqdata);   // it did open, oddly: leave it unchanged
++      goto f_home;
++    }
++    if (is_an_editor()) {
++      // Some other editor -- ADD, the one the first live run reached. Back
++      // was seen to cancel ADD without adding anything.
++      press(KEY_PDA_BACK);
++      wait_until(aqdata, device_screen_ready, NULL, 40);
++    }
++    goto f_back;
++  }
++  in_editor = true;
++
++  for (field = 0; field < 4; field++) {
++    int target = F[field].line == 3 ? req->on_min : req->off_min;
++    if (ok && !step_field(aqdata, F[field].line, F[field].word, F[field].hour, target, &moved)) {
++      // Put this field back, and change nothing more: see WHAT A FAILURE LEAVES.
++      undo_presses(aqdata, F[field].line, F[field].word, F[field].hour, moved);
++      set_fail(aqdata, "a value did not move one step per press; the rest was left unchanged");
++      ok = false;
++    }
++    settle(aqdata);
++    press(KEY_PDA_SELECT);
++    fa.line = field < 3 ? F[field + 1].line : 5;
++    fa.col = field < 3 ? F[field + 1].col : 0;
++    if (!wait_until(aqdata, at_field, &fa, 40)) {
++      if (ok) set_fail(aqdata, "the editor did not move to the next field");
++      ok = false;
++      break;
++    }
++  }
++  // On the days field: unchanged. Select saves. After a failure, Select on
++  // through whatever is left, which also saves.
++  settle(aqdata);
++  in_editor = false;
++  if (!(ok ? (press(KEY_PDA_SELECT), wait_device_screen_fresh(aqdata)) : save_out_of_editor(aqdata))) {
++    if (ok) set_fail(aqdata, "the device's screen did not return after saving");
++    in_editor = true;
++    goto f_home;
++  }
++  for (l = 0; l < PDA_LINES; l++) snprintf(lines[l], sizeof(lines[l]), "%s", pda_m_line(l));
++  if (!pda_parse_program_screen((const char (*)[AQ_MSGLEN + 1])lines, PDA_LINES, req->device, &after)) {
++    set_fail(aqdata, "could not read the program back after saving");
++    goto f_back;
++  }
++
++f_done:
++  req->now = after;
++  // The cached read gets the panel's own answer for this device.
++  for (i = 0; i < aqdata->panel_programs.count; i++)
++    if (strcasecmp(aqdata->panel_programs.programs[i].device, req->device) == 0)
++      aqdata->panel_programs.programs[i] = after;
++  if (ok) {
++    if (pda_parse_clock(after.on) == req->on_min && pda_parse_clock(after.off) == req->off_min) {
++      req->state = PROGRAM_SET_OK;
++      req->done_at = time(NULL);
++      LOG(PDA_LOG, LOG_NOTICE, "PDA set program '%s' now on '%s' off '%s'\n", after.device, after.on, after.off);
++    } else {
++      set_fail(aqdata, "saved, but the panel shows different times");
++    }
++  }
++
++f_back:
++  press(KEY_PDA_BACK);
++  waitForPDAnextMenu(aqdata);
++f_home:
++  if (in_editor)   // still inside it: do NOT navigate; the panel times out to home
++    LOG(PDA_LOG, LOG_ERR, "PDA set program: could not leave the editor; leaving the panel to time out\n");
++  else
++    goto_pda_menu(aqdata, PM_HOME);
++f_end:
++  if (req->state == PROGRAM_SET_RUNNING || req->state == PROGRAM_SET_QUEUED)
++    set_fail(aqdata, "stopped without a result");
++  cleanAndTerminateThread(threadCtrl);
++  return ptr;
++}
+diff --git a/source/pda_programs.h b/source/pda_programs.h
+new file mode 100644
+index 0000000..20a0319
+--- /dev/null
++++ b/source/pda_programs.h
+@@ -0,0 +1,83 @@
++/*
++ * Read the panel's own equipment programs (on/off times) through the PDA
++ * PROGRAM menu, and serve them as JSON.
++ *
++ * READ ONLY. The thread walks MENU > PROGRAM > each device, reads the screen
++ * and presses BACK. It never presses SELECT on a device's program screen,
++ * where every line is an ADD / DELETE / CHANGE action.
++ */
++#ifndef PDA_PROGRAMS_H_
++#define PDA_PROGRAMS_H_
++
++#include <stdbool.h>
++#include <time.h>
++
++#include "aq_serial.h"   // AQ_MSGLEN
++
++#define PANEL_PROGRAMS_MAX 24   // devices on the PROGRAM list; this panel has 11
++
++typedef enum {
++  PROGRAMS_NEVER_READ = 0,
++  PROGRAMS_READING,
++  PROGRAMS_OK,
++  PROGRAMS_FAILED
++} panel_programs_state;
++
++typedef struct panel_program {
++  char device[AQ_MSGLEN + 1];
++  unsigned char pgm;     // which program is shown, 1-based
++  unsigned char of;      // how many the panel says the device has; 0 = none entered
++  char on[AQ_MSGLEN + 1];
++  char off[AQ_MSGLEN + 1];
++  char days[AQ_MSGLEN + 1];
++} panel_program;
++
++typedef enum {
++  PROGRAM_SET_NONE = 0,
++  PROGRAM_SET_QUEUED,
++  PROGRAM_SET_RUNNING,
++  PROGRAM_SET_OK,
++  PROGRAM_SET_FAILED
++} panel_program_set_state;
++
++// One change to one device's ON/OFF times, and what became of it. Only the
++// last request is kept: the caller reads the result back from /api/programs.
++typedef struct panel_program_set {
++  panel_program_set_state state;
++  char device[AQ_MSGLEN + 1];
++  int on_min, off_min;   // wanted, minutes after midnight
++  time_t requested_at, done_at;
++  char error[96];
++  panel_program now;     // what the panel showed after the save, read back
++} panel_program_set;
++
++typedef struct panel_programs {
++  panel_programs_state state;
++  time_t read_at;        // when the last COMPLETE read finished
++  time_t started_at;     // when the current or last read began
++  char error[64];        // why the last read failed, empty otherwise
++  int count;
++  panel_program programs[PANEL_PROGRAMS_MAX];
++  panel_program_set set;
++} panel_programs;
++
++struct aqualinkdata;
++
++void *get_PDA_aqualink_programs(void *ptr);
++void *set_PDA_aqualink_program(void *ptr);
++
++// Validate and queue a change. NULL when queued; otherwise why it was refused.
++// `spec` is "<DEVICE>/<HHMM>-<HHMM>" in 24-hour time, e.g. "SOLAR HEAT/1040-1555".
++const char *pda_programs_request_set(struct aqualinkdata *aqdata, const char *spec, int len);
++
++// "10:05 AM" -> 605; -1 if it is not a panel time. Exposed for the harness.
++int pda_parse_clock(const char *s);
++void pda_format_clock(int minutes, char *out, int size);
++
++// Parse one fully drawn device screen. Exposed for the test harness.
++bool pda_parse_program_screen(const char lines[][AQ_MSGLEN + 1], int nlines,
++                              const char *device, panel_program *out);
++
++int build_panel_programs_js(struct aqualinkdata *aqdata, char *buffer, int size);
++
++#endif

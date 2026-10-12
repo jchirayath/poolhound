@@ -50,6 +50,17 @@ from . import config
 # somebody else's service, and their cadence is a property of the deployment
 # rather than a choice about it — so they stay in the crontab, where a tick and
 # a schedule are the same thing.
+#
+# WEATHER IS NOT HERE EITHER, and it is the one that looks as if it belongs. It
+# IS somebody else's service — but an unrationed one with no key, and more to
+# the point there is no choice to offer: the data is one row per ENDED day, so a
+# second pull in a day can only re-read yesterday and a less frequent one only
+# delays it. Its hour is a fact about the pool's midnight in config.DEPLOY_TZ,
+# not a preference. A Settings dropdown whose every option but one is wrong is
+# a control that exists to be set wrong, so the crontab schedules it and
+# collection.schedule() reads it from there like watch and render. bin/weather
+# still asks tick_gate(), which answers "not a scheduled pull" — so if it is
+# ever moved into this table, it is gated without anybody editing that file.
 SOURCES = {
     "wg-collect": {
         "label": "WaterGuru",

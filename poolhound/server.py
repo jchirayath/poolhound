@@ -56,6 +56,7 @@ import collections, csv, datetime as dt, hmac, http.server, json, math, os, posi
 import socketserver, sys, threading, time, tomllib, traceback, urllib.parse
 
 from . import chemicals as CH
+from . import stock as STOCK
 from . import config
 from . import pool_shape
 from . import vault
@@ -975,6 +976,80 @@ def _delete_chemical(data, cfg, who="local"):
     return {"deleted": ts, "id": gone.get("id", ""),
             "remaining": len(keep)}, None
 
+
+# ------------------------------------------------------------------ stock
+# Purchases and stocktakes. stock.py owns the shape, the validation and the
+# arithmetic; these three only take the lock, find the row and write. Under a
+# lock of their own, "stock", for the reason the dose routes take "chemicals":
+# an append landing inside a rewrite is a row the browser was told about and
+# the file does not hold.
+#
+# Editable in place, like a dose and unlike a lab result: these rows are OUR
+# record of something we did, and nothing will put a wrong amount back.
+
+def _stock_path(cfg):
+    return os.path.join(config.data_dir(cfg), STOCK.FILE)
+
+
+def log_stock(data, cfg, who="local"):
+    from . import render
+    with locking.exclusive(config.data_dir(cfg), "stock"):
+        row, why = STOCK.validate(data, dt.datetime.now(), render.when, render.CLOCK_SKEW)
+        if why:
+            return None, why
+        row.update({"by": who, "id": CH.new_id()})
+        locking.append_locked(_stock_path(cfg), STOCK.COLS, row)
+    audit.record(f"stock.{row['kind']}", row["ts"], STOCK.describe(row),
+                 by=who, cfg=cfg, id=row["id"])
+    return {"logged": row, "id": row["id"]}, None
+
+
+def edit_stock(data, cfg, who="local"):
+    from . import render
+    out = _stock_path(cfg)
+    with locking.exclusive(config.data_dir(cfg), "stock"):
+        if not os.path.exists(out):
+            return None, "nothing recorded yet"
+        rows = list(csv.DictReader(open(out, newline="")))
+        if CH.ensure_ids(rows):
+            locking.rewrite_locked(out, STOCK.COLS, rows)
+        target, why = find_dose(rows, data, cfg)
+        if why:
+            return None, why
+        # `ts` in the body names the row (find_dose's fallback); a new time
+        # arrives as new_ts, the way the dose edit takes it.
+        body = {k: v for k, v in data.items() if k not in ("ts", "id")}
+        if data.get("new_ts"):
+            body["ts"] = data["new_ts"]
+        row, why = STOCK.validate(body, dt.datetime.now(), render.when, render.CLOCK_SKEW, target)
+        if why:
+            return None, why
+        row["by"] = who
+        locking.rewrite_locked(out, STOCK.COLS,
+                               [row if r is target else r for r in rows])
+    audit.record("stock.edit", target.get("ts", ""), STOCK.describe(row),
+                 by=who, cfg=cfg, id=row.get("id", ""))
+    return {"edited": row["ts"], "id": row.get("id", "")}, None
+
+
+def delete_stock(data, cfg, who="local"):
+    out = _stock_path(cfg)
+    with locking.exclusive(config.data_dir(cfg), "stock"):
+        if not os.path.exists(out):
+            return None, "nothing recorded yet"
+        rows = list(csv.DictReader(open(out, newline="")))
+        if CH.ensure_ids(rows):
+            locking.rewrite_locked(out, STOCK.COLS, rows)
+        gone, why = find_dose(rows, data, cfg)
+        if why:
+            return None, why
+        keep = [r for r in rows if r is not gone]
+        locking.rewrite_locked(out, STOCK.COLS, keep)
+    audit.record("stock.delete", gone.get("ts", ""), STOCK.describe(gone),
+                 by=who, cfg=cfg, id=gone.get("id", ""))
+    return {"deleted": gone.get("ts", ""), "id": gone.get("id", ""),
+            "remaining": len(keep)}, None
+
 def compute_pool_shape(data, cfg):
     """Work out the volume and show the reasoning, without adopting it.
 
@@ -1340,11 +1415,15 @@ def pending_devices():
     for h in QUEUE.history(40):
         cmd = h.get("cmd") or {}
         dev = cmd.get("device")
-        if not dev or cmd.get("action") not in ("set", "setpoint"):
+        if not dev or cmd.get("action") not in ("set", "setpoint", "heat"):
             continue
-        if dev in seen:
-            continue                      # an older instruction for this device
-        seen.add(dev)
+        # A heater is asked two different questions -- is it on, and what is
+        # it set to -- and the newest of EACH counts. Keyed by device alone, a
+        # temperature set after "heater on" hid the heater's pending mark.
+        kind = "value" if cmd.get("action") == "setpoint" else "state"
+        if (dev, kind) in seen:
+            continue                      # an older instruction of this kind
+        seen.add((dev, kind))
         res = h.get("result") or {}
         if res and not res.get("ok"):
             continue                      # refused or failed: not waiting on anything
@@ -1361,7 +1440,7 @@ def pending_devices():
         want = None
         col = COL.get(dev)
         vcol = VALUE_COL.get(dev)
-        if cmd.get("action") == "set" and col:
+        if cmd.get("action") in ("set", "heat") and col:
             want = "1" if cmd.get("value") in (1, "1", True) else "0"
             got = str(last.get(col, "")).strip()
             if last_at and last_at >= at and got == want:
@@ -1392,8 +1471,10 @@ def pending_devices():
         if (now - at).total_seconds() > CMD.PENDING_GIVES_UP_S:
             continue
 
-        out[dev] = "on" if cmd.get("value") in (1, "1", True) else (
-                   str(cmd.get("value")) if cmd.get("action") == "setpoint" else "off")
+        if dev in out:
+            continue                      # the newer of a heater's two already said
+        out[dev] = "on" if cmd.get("value") in (1, "1", True) and kind == "state" else (
+                   str(cmd.get("value")) if kind == "value" else "off")
     return out
 
 
@@ -1559,6 +1640,21 @@ def issue_control(data, cfg, who):
                       "issued": dt.datetime.now(dt.timezone.utc).isoformat()})
     except CMD.Refused as e:
         return None, str(e)
+    if data.get("action") == "program":
+        # Whether this device has a program that can be changed is a fact
+        # about the panel, which the agent's shape check cannot see. Checked
+        # here against what the page was showing; AqualinkD checks again.
+        from . import programs as _prog
+        why = _prog.check_change(data.get("device"), data.get("value"), cfg)
+        if why:
+            return None, why
+    if data.get("action") == "cron":
+        # The same, for AqualinkD's schedules: the list being replaced must be
+        # the one the page showed. The agent checks again against the file.
+        from . import programs as _prog
+        why = _prog.check_cron(data.get("value"), cfg)
+        if why:
+            return None, why
     if not QUEUE.agents_connected:
         return None, ("no agent is connected, so nothing can reach the panel. The "
                       "pool keeps running its own schedule meanwhile.")
@@ -1571,6 +1667,107 @@ def issue_control(data, cfg, who):
     return {"id": cmd["id"], "what": CMD.describe(cmd), "by": who,
             "delivered_to": delivered, "result": result,
             "pending": result is None}, None
+
+def command(data, cfg, who):
+    """THE path a command takes: a button press, a schedule and an auto-off.
+
+    issue_control() validates and queues it; the audit row is written here,
+    on the share, with the id its acknowledgement will carry. This was inline
+    in the /api/control branch of _dispatch_write, and the scheduler needs
+    exactly that and nothing else -- so it was lifted out rather than copied,
+    because a second copy of "issue, then audit" is a second command path the
+    day one of them gains a check the other does not.
+
+    `off_after_h`, when present, is checked BEFORE anything is issued: a bad
+    value must refuse the whole press, not switch the spa on with no off to
+    follow. After a successful issue the schedule is told, so a new ON
+    replaces an older off-after and an OFF retires the ones it made moot.
+    """
+    from . import schedule
+    if data.get("action") == "scene":
+        return run_scene(data, cfg, who)
+    off_after, err = schedule.check_off_after(data, cfg)
+    if err:
+        return None, err
+    result, err = issue_control(data, cfg, who)
+    if err:
+        return None, err
+    # On the share, not in the queue. The queue is what is PENDING and is
+    # right to be forgotten; this is what was ISSUED.
+    # A schedules save carries the whole list; the audit keeps how many,
+    # and the list itself arrives with the Pi's next report.
+    value = data.get("value")
+    if data.get("action") == "cron":
+        value = len((value or {}).get("schedules") or [])
+    audit.record("control", data.get("device") or data.get("action", ""),
+                 f"{data.get('action','')}"
+                 f"{'=' + str(value) if value is not None else ''}",
+                 by=who, cfg=cfg,
+                 # The key its acknowledgement will carry, so the two halves
+                 # of one event join on disk rather than being guessed at by
+                 # timestamp. describe() is the same sentence the session log
+                 # shows, so a restart changes what the table is READ FROM and
+                 # not what it says.
+                 id=(result or {}).get("id", ""))
+    # A refusal from the agent is not a command that happened; nothing to
+    # supersede and nothing to switch off later.
+    res = (result or {}).get("result")
+    if res is None or res.get("ok"):
+        try:
+            schedule.note_command(data, who, off_after, cfg)
+        except Exception as e:                            # noqa: BLE001
+            # The command has happened. Say loudly that its auto-off has not
+            # been arranged, rather than turning a working press into an error.
+            result["schedule_error"] = (f"the command was sent, but its automatic "
+                                        f"off could not be recorded: "
+                                        f"{type(e).__name__}: {e}")
+        if off_after:
+            result["off_after_h"] = off_after
+    return result, None
+
+def run_scene(data, cfg, who):
+    """Run one scene: its steps, in the safe order, each through command().
+
+    Not a second command path: every step is the ordinary command a press
+    would send, validated, audited and checked by the Pi's Guard exactly as
+    one, and recorded as whoever ran the scene. It STOPS at the first step
+    refused or failed, so a heater is never switched on after its pump was
+    refused. The shape of the answer matches a single command's -- `result`
+    with `ok` -- so the scheduler can fire a scene and judge it as it judges
+    any command. See scenes.py.
+    """
+    from . import scenes as SC, schedule
+    scene = SC.get(cfg, str(data.get("device") or "")[:16])
+    if scene is None:
+        return None, "no such scene — it may have been deleted"
+    ran = []
+    for st in sorted(scene["steps"], key=SC.order_key):
+        r, err = command(dict(st), cfg, who)
+        res = (r or {}).get("result")
+        why = err or (res.get("refused") or res.get("error") or "refused"
+                      if res is not None and not res.get("ok") else None)
+        if why:
+            audit.record("scene", scene["name"],
+                         f"stopped at {CMD.describe(st, cfg)}: {why}"[:400], by=who, cfg=cfg)
+            return {"what": f"scene {scene['name']}", "scene": scene["name"], "ran": ran,
+                    "stopped_at": CMD.describe(st, cfg),
+                    "result": {"ok": False, "error": f"stopped at {CMD.describe(st, cfg)}: {why}"},
+                    "pending": False}, None
+        ran.append({"what": r.get("what"), "action": st["action"], "device": st["device"],
+                    "value": st["value"], "pending": bool(r.get("pending"))})
+    off_after = scene.get("off_after_h")
+    if off_after:
+        for st in scene["steps"]:
+            if st["device"] in SC.off_steps([st]):
+                schedule.note_command(st, who, off_after, cfg)
+    audit.record("scene", scene["name"],
+                 SC.describe(scene, cfg)[:360]
+                 + (f"; off again after {off_after:g} h" if off_after else ""),
+                 by=who, cfg=cfg)
+    return {"what": f"scene {scene['name']}", "scene": scene["name"], "ran": ran,
+            "result": {"ok": True}, "pending": any(x["pending"] for x in ran),
+            "off_after_h": off_after}, None
+
 
 def refresh_sources(data, cfg, who="local"):
     """Run collectors on demand.
@@ -1935,6 +2132,41 @@ def save_correction(data, cfg, who):
             "field": field}, None
 
 
+def save_maintenance(data, cfg, who):
+    """Mark a filter or a salt cell cleaned.
+
+    equipment.py owns the record -- its columns, its tasks, the lock -- and
+    this only reads the request. AUDITED like a dose, because it changes what
+    a figure on Home is computed from: a mark resets the baseline the filter
+    and the cell are judged against, so "why did the filter warning go away"
+    must have an answer that names somebody.
+    """
+    from . import equipment
+    task = _s(data.get("task")).strip()
+    ts = _s(data.get("ts")).strip()
+    when = None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            when = dt.datetime.strptime(ts, fmt); break
+        except ValueError:
+            pass
+    # Empty is now; filled-in and unreadable is refused, for the reason
+    # _log_chemical gives: a silently moved timestamp is worse than a refusal.
+    if when is None and ts:
+        return None, (f"could not read the time {ts!r} — expected "
+                      f"YYYY-MM-DDTHH:MM. Leave it empty to mark it as now.")
+    try:
+        row = equipment.record(task, cfg, by=who,
+                               note=_s(data.get("note")).strip(), at=when)
+    except ValueError as e:
+        return None, str(e)
+    audit.record("maintenance", row["task"],
+                 equipment.TASKS[row["task"]] + f" at {row['ts']}"
+                 + (f" — {row['note']}" if row["note"] else ""),
+                 by=who, cfg=cfg, id=row["id"])
+    return {"marked": row}, None
+
+
 def combined_volume(pool_gal, spa_gal, shares):
     """Which body of water a dose is measured against.
 
@@ -2053,7 +2285,11 @@ FILE_NEEDS = {
     "manual.csv":      "view",
     "wg_targets.csv":  "view",
     "corrections.csv": "view",
+    # Public weather for a location rounded to 0.1 degree -- the same pair
+    # the Collection tab, which is `view`, prints as what is sent.
+    "weather.csv":     "view",
     "chemicals.csv":   "operate",  # what was added, and who added it
+    "maintenance.csv": "operate",  # what was cleaned, and who said so
     "pool_shape.json": "operate",
     "audit.csv":       "admin",    # who changed what, including credentials
 }
@@ -2065,9 +2301,12 @@ EXPORTABLE = {
     "leslies.csv":     "Leslie's lab results",
     "manual.csv":      "Readings entered by hand",
     "chemicals.csv":   "Doses logged",
+    "stock.csv":       "Chemicals bought and counted",
     "corrections.csv": "Corrections applied to readings",
     "audit.csv":       "Who changed what",
+    "maintenance.csv": "Filter and cell cleanings marked",
     "wg_targets.csv":  "WaterGuru's own target ranges",
+    "weather.csv":     "Daily weather at the pool, from Open-Meteo",
     # NOT a CSV, and the only artefact in here the owner made by hand rather
     # than collected. Twenty minutes of tracing an outline over a photograph,
     # with its scale point, depth model, ledge and bench -- on the tab whose
@@ -2482,6 +2721,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(421, {"error": "unrecognised Host"})
         if self.path.split("?")[0] == "/api/agent/commands":
             return self.stream_commands()
+        if self.path.split("?")[0] == "/api/agent/scenes":
+            # The household's scenes, for poolhound local on the Pi: the agent
+            # keeps them in memory and hands them to the page, so a scene can
+            # be run at the pool with the server unreachable. Steps come in
+            # the order they must run (scenes.order_key), so the page does
+            # not decide it.
+            ok, unavailable = self.agent_ok()
+            if not ok:
+                return self._json(503 if unavailable else 403,
+                                  {"error": "the agent token could not be read" if unavailable
+                                   else "agent authentication failed"})
+            from . import scenes as _SC
+            _cfg = config.load()
+            return self._json(200, {"scenes": [
+                {"id": sc["id"], "name": sc["name"], "off_after_h": sc.get("off_after_h"),
+                 "what": _SC.describe(sc, _cfg),
+                 "steps": [{**st, "label": CMD.label_for(st["device"], _cfg)}
+                           for st in sorted(sc["steps"], key=_SC.order_key)]}
+                for sc in _SC.load(_cfg)]})
         # The authenticated page is never served without an identity, whatever
         # the proxy did with the path — including how it spelled it.
         #
@@ -2631,6 +2889,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 # the pre-command render would show "waiting" indefinitely with
                 # nothing wrong on the server at all.
                 body["states"] = current_states()
+                # Whether the thread that fires schedules and auto-offs is
+                # alive, answered by the process that owns it. Nothing inside
+                # a process can report the process's absence -- bin/watch
+                # reads the file's alive_at for that -- but a thread that died
+                # inside a live server is exactly what this can see.
+                from . import schedule as _sched
+                body["scheduler"] = _sched.health()
             return self._json(200, body)
         if self.path.split("?")[0] == "/api/rows":
             # Gated like the export it slices: this is the household's own
@@ -2685,6 +2950,46 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                                         "available": sorted(n for n in EXPORTABLE
                                                             if n.endswith(".csv"))})
             return self._json(200, got)
+        if self.path.split("?", 1)[0] == "/api/schedules":
+            # LIVE, so fetched: a render happens in a different process and
+            # its idea of "next due" is stale the moment it is written.
+            if PUBLIC_HOST and not self.signed_in():
+                return self._json(401, {"error": "sign-in required"})
+            _cfg = config.load()
+            ok, need, have = access.may(self.whoami(), "/api/schedules", _cfg)
+            if not ok:
+                return self._json(403, {
+                    "error": f"this needs {need} access and you have {have}",
+                    "needs": need, "have": have})
+            from . import schedule as _sched
+            return self._json(200, _sched.listing(_cfg))
+        if self.path.split("?", 1)[0] == "/api/scenes":
+            # The household's scenes, for the Control tab and the schedule
+            # form. Fetched, for the reason everything live is.
+            if PUBLIC_HOST and not self.signed_in():
+                return self._json(401, {"error": "sign-in required"})
+            _cfg = config.load()
+            ok, need, have = access.may(self.whoami(), "/api/scenes", _cfg)
+            if not ok:
+                return self._json(403, {
+                    "error": f"this needs {need} access and you have {have}",
+                    "needs": need, "have": have})
+            from . import scenes as _SC
+            return self._json(200, _SC.listing(_cfg))
+        if self.path.split("?", 1)[0] == "/api/panel-schedules":
+            # The panel's own programs and AqualinkD's cron schedules, as the
+            # Pi last pushed them. Fetched for the same reason as the route
+            # above; NOT /api/schedules, which is this server's own scheduler.
+            if PUBLIC_HOST and not self.signed_in():
+                return self._json(401, {"error": "sign-in required"})
+            _cfg = config.load()
+            ok, need, have = access.may(self.whoami(), "/api/panel-schedules", _cfg)
+            if not ok:
+                return self._json(403, {
+                    "error": f"this needs {need} access and you have {have}",
+                    "needs": need, "have": have})
+            from . import programs as _prog
+            return self._json(200, _prog.listing(_cfg))
         if self.path.split("?", 1)[0] == "/api/commands":
             # The control tab's history was BAKED INTO THE RENDER. Cron renders
             # every six hours through `docker compose exec`, which is a
@@ -2794,7 +3099,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # nothing to say, and starting one for a request that will read no
             # body leaves a subscriber nobody drains.
             return self._json(405, {"error": "not allowed"})
-        if not self.agent_ok():
+        # agent_ok() RETURNS A PAIR, and a pair is always true. This line read
+        # `if not self.agent_ok():` from the day agent_ok() changed to say why
+        # it refused (2026-09-16) until 2026-10-11, so the command stream took
+        # anybody -- measured live, no token and a wrong one both answered 200
+        # ": connected". Whoever connected was sent every command, who issued
+        # it included, and counted as a connected agent, so the page could say
+        # "sent" with the real agent gone. The POST routes had been updated and
+        # this one had not. checks_gates.t_agent_ok_is_never_read_as_a_boolean
+        # now refuses the spelling.
+        ok, unavailable = self.agent_ok()
+        if not ok:
+            if unavailable:
+                return self._json(503, {"error": "the agent token could not be read"})
             return self._json(403, {"error": "agent authentication failed"})
         # What the Pi is running, so --check can compare it to what was shipped
         # instead of reading an mtime rsync copied from the source checkout.
@@ -2887,6 +3204,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 r, e = ingest_sample(body, config.load())
             elif route == "/api/agent/note":
                 r, e = record_panel_change(body, config.load())
+            elif route == "/api/agent/schedules":
+                # Both kinds of equipment schedule as the Pi read them. A
+                # snapshot, replaced whole each time, so it is a JSON file and
+                # not a CSV: nothing here is history.
+                from . import programs as _prog
+                r, e = _prog.ingest(body, config.load())
             elif route == "/api/agent/ack":
                 # AN ACK NAMES A COMMAND, OR IT IS NOT AN ACK.
                 #
@@ -3056,6 +3379,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             result, err = edit_chemical(data, cfg, self.whoami())
         elif route == "/api/chemical/delete":
             result, err = delete_chemical(data, cfg, self.whoami())
+        # Under /api/chemical/ on purpose: the vhost's private matcher already
+        # carries /api/chemical/*, so these are gated at the proxy by the line
+        # that gates the dose routes rather than by one somebody must remember.
+        elif route == "/api/chemical/stock":
+            result, err = log_stock(data, cfg, self.whoami())
+        elif route == "/api/chemical/stock/edit":
+            result, err = edit_stock(data, cfg, self.whoami())
+        elif route == "/api/chemical/stock/delete":
+            result, err = delete_stock(data, cfg, self.whoami())
         elif route == "/api/pool-shape":
             result, err = save_pool_shape(data, cfg, self.whoami())
         elif route == "/api/pool-shape/compute":
@@ -3074,21 +3406,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif route == "/api/credential/import":
             result, err = import_credentials(data, cfg, self.whoami())
         elif route == "/api/control":
-            result, err = issue_control(data, cfg, self.whoami())
-            # On the share, not in the queue. The queue is what is PENDING and
-            # is right to be forgotten; this is what was ISSUED.
+            # command() issues AND audits -- the one path a schedule takes too.
+            result, err = command(data, cfg, self.whoami())
+        elif route in ("/api/scene", "/api/scene/delete"):
+            from . import scenes as _SC
+            fn = _SC.save if route == "/api/scene" else _SC.delete
+            result, err = fn(data, self.whoami(), cfg)
             if not err:
-                audit.record("control", data.get("device") or data.get("action", ""),
-                             f"{data.get('action','')}"
-                             f"{'=' + str(data.get('value')) if data.get('value') is not None else ''}",
-                             by=self.whoami(), cfg=cfg,
-                             # The key its acknowledgement will carry, so the
-                             # two halves of one event join on disk rather than
-                             # being guessed at by timestamp. describe() is the
-                             # same sentence the session log shows, so a
-                             # restart changes what the table is READ FROM and
-                             # not what it says.
-                             id=(result or {}).get("id", ""))
+                audit.record(route.replace("/api/", "").replace("/", "."),
+                             (result or {}).get("name") or (result or {}).get("id", ""),
+                             (_SC.describe(result, cfg)[:360] if route == "/api/scene"
+                              else "deleted"),
+                             by=self.whoami(), cfg=cfg, id=(result or {}).get("id", ""))
+                return self._json(200, result)
+        elif route in ("/api/schedule", "/api/schedule/delete"):
+            from . import schedule
+            fn = schedule.create if route == "/api/schedule" else schedule.cancel
+            result, err = fn(data, self.whoami(), cfg)
+            if not err:
+                # Who arranged for the pool to be told something later, on
+                # the same durable record as who told it something now.
+                audit.record(route.replace("/api/", "").replace("/", "."),
+                             (result or {}).get("device") or (result or {}).get("id", ""),
+                             (f"{result.get('action')}={result.get('value')} "
+                              f"{schedule.describe_when(result)}"
+                              if route == "/api/schedule" else "cancelled"),
+                             by=self.whoami(), cfg=cfg, id=(result or {}).get("id", ""))
+                # Nothing on the rendered page depends on a schedule, and a
+                # render is the slow part of a write: answered now.
+                return self._json(200, result)
         elif route == "/api/reading":
             result, err = save_reading(data, cfg, self.whoami())
         elif route == "/api/ask":
@@ -3103,6 +3449,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                                        "left": assistant.budget_left()}
         elif route == "/api/lab-correction":
             result, err = save_correction(data, cfg, self.whoami())
+        elif route == "/api/maintenance":
+            result, err = save_maintenance(data, cfg, self.whoami())
         elif route == "/api/settings":
             result, err = save_settings(data, cfg)
             if not err:
@@ -3161,7 +3509,14 @@ def main():
         for public in (True, False):
             render.build(public=public)
     with Server((HOST, PORT), Handler) as httpd:
+        # The scheduler belongs to the SERVING process and to no other: a
+        # render or a cron job starting its own would be a second scheduler
+        # firing the same 19:00 spa. Started after the socket is bound, so a
+        # second server that cannot bind never gets as far as a thread.
+        from . import schedule
+        schedule.start()
         print(f"  poolhound  http://{HOST}:{PORT}/")
+        print(f"  schedule   every {schedule.TICK_S}s, in {config.DEPLOY_TZ}")
         print(f"  serving    {site}")
         print(f"  writing    {cfg['_source']} and {config.data_dir(cfg)}/chemicals.csv")
         # Say which it actually is. "loopback only" printed by a process bound

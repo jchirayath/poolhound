@@ -1,0 +1,39 @@
+{
+ "source": "aqualinkd /api/schedules (v3.1.0)",
+ "fetched": "2026-10-09T16:07:00-0700",
+ "response": {
+  "type": "schedules",
+  "schedules": [
+   {
+    "enabled": "1",
+    "min": "0",
+    "hour": "10",
+    "daym": "*",
+    "month": "*",
+    "dayw": "*",
+    "url": "/api/Filter_Pump/set",
+    "value": "1"
+   },
+   {
+    "enabled": "1",
+    "min": "30",
+    "hour": "16",
+    "daym": "*",
+    "month": "*",
+    "dayw": "1-5",
+    "url": "/api/Filter_Pump/set",
+    "value": "0"
+   },
+   {
+    "enabled": "0",
+    "min": "0",
+    "hour": "19",
+    "daym": "*",
+    "month": "*",
+    "dayw": "6,0",
+    "url": "/api/Aux_1/set",
+    "value": "1"
+   }
+  ]
+ }
+}

@@ -115,6 +115,9 @@ agent ──── POST /api/agent/sample ───────────►  
 agent ──── GET  /api/agent/commands ─────────►  hub      downstream, held open
       ◄─── text/event-stream, frames + heartbeat ───
 agent ──── POST /api/agent/ack ──────────────►  hub      what became of a command
+agent ──── POST /api/agent/note ─────────────►  hub      which door a change came through
+agent ──── POST /api/agent/schedules ────────►  hub      the panel's programs, every 30 min
+agent ──── GET  /api/agent/scenes ───────────►  hub      the scenes, for poolhound local
 ```
 
 Those are poolhound's paths. A generic implementation would name the upstream one
@@ -202,8 +205,37 @@ second service will get wrong.
   sample. A command is "pending" until a reading disagrees with the old state —
   not until a sample merely arrives, and only the newest command per device
   counts.
+- **An ack can say "accepted" rather than "done".** A change to one of the
+  panel's own programs takes about a minute in the panel's editor, and the
+  stream must not be held for it. So the agent acks when AqualinkD accepts the
+  job, and a thread on the agent follows it to the end and pushes the panel's
+  own answer with a fresh `/api/agent/schedules` report. The rule above still
+  holds: what the panel *is* comes from that read-back, not from the ack.
+- **A `cron` command replaces a whole list, so it names the list it replaces.**
+  AqualinkD rewrites its schedule file from what it is sent. The command
+  carries `expect`, the fingerprint of the list the page edited; the agent
+  re-reads AqualinkD's list and refuses if it has changed, rather than
+  overwrite an edit made in AqualinkD's own page. It acks `ok` only after
+  reading the saved list back and finding exactly what was sent, and pushes a
+  fresh schedules report either way.
 - **Fan-out is per subscriber.** Each held stream gets its own bounded buffer; a
   stalled reader is dropped rather than allowed to grow.
+- **A schedule is a press made later, by the hub, and nothing else.** "Spa at
+  seven" and "off again after two hours" live on the hub, in
+  `$POOLHOUND_DATA/schedules.json`, and a thread in `bin/serve` issues each one
+  at its time through `server.command()` — the function `/api/control` calls —
+  with `by` set to `schedule` or `auto-off`. On the wire it is an ordinary
+  command with a fresh id and a fresh `issued` stamp, so every rule above
+  applies unchanged: it expires in five minutes, the agent validates it again,
+  and the Guard's cooldowns and replay check refuse it exactly as they would a
+  person's. **The agent is not changed and stores nothing**; it cannot tell a
+  scheduled command from a pressed one, which is the point. The two things that
+  differ live on the hub, because they are about time the agent never sees: an
+  ON is issued only within fifteen minutes of its due time and is otherwise
+  recorded as missed rather than delivered late — expiry, one layer up — and an
+  OFF that could not be delivered is re-issued, as a NEW command with a new id,
+  until a *reading* says the device is off. Delivery stays at-most-once per
+  command; the retry is a decision the hub makes again, not a resend.
 
 ### Connection management
 

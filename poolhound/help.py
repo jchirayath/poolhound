@@ -29,11 +29,14 @@ value, rather than losing the sentence around it.
 """
 
 import html
+import json
+import os
 
 from . import commands as C
 from . import config
 from .style import SERIES as _SERIES
 from . import brand as _brand
+from . import weather as _wx
 
 # The project's own home. One constant, because it appears in several places
 # here and in the footer, and a repository that has moved should move once.
@@ -1132,6 +1135,103 @@ left alone.</figcaption>
 </figure>
 """
 
+
+# THE PANEL'S PROGRAM MENUS, AS THEY WERE READ OFF THIS PANEL. Mapped on
+# 2026-10-09 by driving AqualinkD's PDA simulator one key at a time and reading
+# the screen back after each, viewing only. Every screen below is the panel's
+# own text, which is the point: whatever reads the programs automatically walks
+# exactly this path, and docs/JANDY-PROGRAMS.md is the long form.
+#
+# The four LCDs are drawn from fixtures/pda-program-screens.json, so the panel's
+# text is data held once rather than typed here. A leading `>` marks the
+# highlighted line the way the handheld inverts it.
+def _pm_screens():
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "fixtures", "pda-program-screens.json"),
+              encoding="utf-8") as f:
+        return [(sc["id"], sc["x"], sc["y"], sc["title"], sc["lines"])
+                for sc in json.load(f)["screens"]]
+
+
+def _program_map_svg():
+    """The PDA path from the home screen to one device's program, as an SVG.
+
+    Text inside <text> is escaped here, once, because the screens are data.
+    """
+    lw, lh, row = 300, 244, 21          # an LCD box, and its line pitch
+    p = []
+    a = p.append
+    a('<figure class="wiring">')
+    a('<svg viewBox="0 0 960 700" role="img" aria-labelledby="pm-t pm-d">')
+    a('<title id="pm-t">The Jandy PDA menus that hold the panel’s own '
+      'programs</title>')
+    a('<desc id="pm-d">Four handheld screens. The home screen opens with the '
+      'cursor on POOL MODE, where Select would switch the pool; Down four times '
+      'reaches MENU. Select opens the menu; Down once reaches PROGRAM; Select '
+      'lists the devices, from FILTER PUMP to AUX5, wrapping at the end. Select '
+      'on a device shows its program, PGM 1 of 1 with its on and off times and its '
+      'days, with the cursor on ADD PROGRAM. A device with no program reads NO '
+      'PROGRAMS ENTERED. Back returns one screen each time.</desc>')
+    # Same rules as the wiring drawing above, and for the same two reasons:
+    # every selector is scoped to this svg, and nothing in this style element
+    # may look like a tag.
+    a('<defs><style>'
+      'svg .pm-l{font:13px ui-monospace,Menlo,monospace;fill:var(--ink);'
+      'white-space:pre}'
+      'svg .pm-h{font:600 14px system-ui,sans-serif;fill:var(--ink)}'
+      'svg .pm-s{font:12.5px system-ui,sans-serif;fill:var(--ink3)}'
+      'svg .pm-k{font:600 12.5px ui-monospace,Menlo,monospace;fill:var(--ink2)}'
+      'svg .pm-w{font:600 12.5px system-ui,sans-serif;fill:var(--bad)}'
+      'svg .pm-bx{fill:var(--bg);stroke:var(--line2)}'
+      'svg .pm-hl{fill:var(--line)}'
+      'svg .pm-dz{fill:none;stroke:var(--bad);stroke-width:2}'
+      'svg .pm-ar{fill:none;stroke:var(--ink3);stroke-width:1.8}'
+      '</style>'
+      '<marker id="pm-tip" viewBox="0 0 10 10" refX="9" refY="5" '
+      'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
+      '<path d="M0 0L10 5L0 10z" fill="var(--ink3)"/></marker></defs>')
+    for sid, x, y, name, lines in _pm_screens():
+        a(f'<text class="pm-h" x="{x}" y="{y - 10}">{html.escape(name)}</text>')
+        a(f'<rect class="pm-bx" x="{x}" y="{y}" width="{lw}" height="{lh}" '
+          f'rx="8"/>')
+        for i, ln in enumerate(lines):
+            ty = y + 24 + i * row
+            hl = ln.startswith(">")
+            if hl:
+                cls = "pm-dz" if sid == "pm-home" else "pm-hl"
+                a(f'<rect class="{cls}" x="{x + 8}" y="{ty - 15}" '
+                  f'width="{lw - 16}" height="{row - 1}" rx="3"/>')
+            a(f'<text class="pm-l" x="{x + 16}" y="{ty}">'
+              f'{html.escape(ln[1:])}</text>')
+    # The keys between the screens. Each arrow names the presses it stands for.
+    a('<path class="pm-ar" marker-end="url(#pm-tip)" d="M330 160 H490"/>')
+    a('<text class="pm-k" x="410" y="140" text-anchor="middle">Down ×4</text>')
+    a('<text class="pm-k" x="410" y="182" text-anchor="middle">Select</text>')
+    a('<path class="pm-ar" marker-end="url(#pm-tip)" '
+      'd="M650 294 V 336 H 170 V 366"/>')
+    a('<text class="pm-k" x="660" y="326">'
+      'Down ×1 to PROGRAM, Select</text>')
+    a('<path class="pm-ar" marker-end="url(#pm-tip)" d="M330 500 H490"/>')
+    a('<text class="pm-k" x="410" y="480" text-anchor="middle">Select</text>')
+    a('<path class="pm-ar" marker-end="url(#pm-tip)" d="M490 540 H330"/>')
+    a('<text class="pm-k" x="410" y="560" text-anchor="middle">Back</text>')
+    a('<text class="pm-w" x="20" y="306">Cursor starts here. Select on this '
+      'line switches the pool.</text>')
+    a('<text class="pm-s" x="20" y="652">Then SPA LIGHT, AUX4 and AUX5, and '
+      'back round</text>')
+    a('<text class="pm-s" x="20" y="672">to FILTER PUMP: the list is a ring.'
+      '</text>')
+    a('<text class="pm-s" x="500" y="652">With no program the screen reads NO '
+      'PROGRAMS ENTERED,</text>')
+    a('<text class="pm-s" x="500" y="672">with the cursor on ADD PROGRAM. '
+      'Viewing never presses Select here.</text>')
+    a('</svg>')
+    a('<figcaption>Read off this panel, one key at a time, viewing only. The '
+      'times on screen 4 are the ones it held when it was mapped, not a live '
+      'reading.</figcaption>')
+    a('</figure>')
+    return "".join(p)
+
 # -------------------------------------------------------------------- panel
 
 def help_panel(public=False):
@@ -1267,10 +1367,13 @@ def help_panel(public=False):
           "one — a solid has no gallons. Below the log, what upkeep takes: acid, "
           "baking soda, salt and stabiliser per week and per year, each worked "
           "out from this pool's doses, pH and runtime, and each saying how it "
-          "is known.",
-          "Doses. A dose is the one row in this product that is EDITED in place "
-          "rather than corrected, because it is the record of something you did "
-          "and nothing should put a wrong amount back."),
+          "is known. And what is on the shelf: the last count, plus what was "
+          "bought since, minus the doses logged since, and how many weeks that "
+          "lasts at the upkeep rate.",
+          "Doses, purchases and counts. These are the rows in this product that "
+          "are EDITED in place rather than corrected, because they are the "
+          "record of something you did and nothing should put a wrong amount "
+          "back."),
          "settings": (_tablink("settings", "Settings", public),
           "<b>Only what you change.</b> The pool's volume and targets, how "
           "often each lab is checked, the logins (kept encrypted, never "
@@ -1378,6 +1481,20 @@ def help_panel(public=False):
       "on " + _tablink("control", "Pool control", public) +
       " and the notification can be switched off on " +
       _tablink("settings", "Settings", public) + ".</p>")
+
+    a("<h3>When the equipment is doing something it should not</h3>")
+    a("<p>Separately from slow wear, poolhound watches the panel’s samples for "
+      "things that break equipment, are unsafe or burn gas for nothing "
+      "<i>this hour</i>: a heater firing with the pump stopped, a heater "
+      "firing and the water not warming, the spa above 104 °F, freezing air "
+      "with the pump stopped, a sudden change in what the pump draws at its "
+      "speed, the pump not running for a day, and a heater or the spa left "
+      "on far past any soak. The serious ones notify once when they start "
+      "and once when they end; the rest — a light left on, a sensor stuck "
+      "at one value — are listed on Home and notify only if asked. Every "
+      "threshold is set under <code>[anomaly]</code> in the configuration "
+      "file, and samples arrive every fifteen minutes, so anything shorter "
+      "is not seen.</p>")
 
     a("<h3>Who may do what</h3>")
     a("<p>Signing in says <i>who</i>; an access policy says <i>what they may "
@@ -1661,6 +1778,77 @@ def help_panel(public=False):
       'answers are local-time answers. Check the whole chain agrees:</p>')
     a(_shell(["# the Pi and the panel should report the same wall clock",
               "ssh @user@@@host@ 'date; curl -s localhost:8000/api/status | jq -r .time'"]))
+    a("</section>")
+
+    # -- the panel's own programs ---------------------------------------------
+    # The map is docs/JANDY-PROGRAMS.md drawn: the same screens, read off this
+    # panel. What is said here about the reader is what pda_programs.c does,
+    # and the cadence is read from agent.py rather than typed.
+    from . import agent as _AG
+    a('<section id="help-programs"><h2>The panel’s own programs</h2>')
+    a('<p class="sub">Schedules that survive everything else</p>')
+    a('<p>There are two kinds of equipment schedule in this house, and both are '
+      'kept. The panel’s <b>own programs</b> are stored in the Jandy panel '
+      'and run by it: they keep the filter pump on its hours when the Pi, '
+      'AqualinkD or this site are down, which is what they are for. AqualinkD’s '
+      '<b>schedules</b> are cron entries on the Pi that press a button through '
+      'AqualinkD; easier to edit, and they stop with the Pi. Both are shown, side '
+      'by side, on ' + _tablink("control", "Pool control", public) + '. There, '
+      'a panel program\u2019s on and off times can be changed too; adding or '
+      'deleting a program, its days, and AqualinkD\u2019s schedules are '
+      'changed at the panel or in AqualinkD.</p>')
+    a('<p><b>Use the panel\u2019s programs first.</b> The two kinds do not '
+      'know about each other, so equipment scheduled in both is switched on two '
+      'timetables and one undoes the other; Pool control says so when it sees '
+      'it. Put the regular hours \u2014 the pump, the heaters \u2014 in the '
+      'panel, where they survive everything, and keep AqualinkD\u2019s '
+      'schedules for what the panel cannot do.</p>')
+    a('<p>Stock AqualinkD can switch circuits but cannot read the panel’s '
+      'programs. A small patch to it, kept with this project, adds a reader '
+      'that walks the handheld’s menus exactly as a person would, read only, '
+      'and answers ' + _c("GET /api/programs") + '. The same patch can change '
+      'a program’s on and off times through the panel’s own editor, '
+      'checking every key press against what the panel redraws, and the change '
+      'counts only when the panel, read back, agrees. Both routes that act '
+      'are HTTP PUT only, so a page in somebody\u2019s browser on the house '
+      'network cannot fire one. The agent asks it to walk '
+      f'the menus about once every {_AG.PROGRAMS_REFRESH_EVERY // 3600} hours, '
+      'because a walk holds the panel’s menus for about a minute and a button '
+      'pressed meanwhile waits behind it. It reports both kinds every '
+      f'{_AG.SCHEDULES_EVERY // 60} minutes.</p>')
+    a(_program_map_svg())
+    a(_table(
+        "The six keys of the PDA handheld, as AqualinkD sends them. The reader "
+        "uses four of them, and only ever presses Select on the home screen and "
+        "the main menu — where AqualinkD’s own menu code checks which "
+        "screen is showing first — and on the PROGRAM device list.",
+        ("Key", "Code", "Used by the reader for"),
+        [("Up", _c("0x06"), "nothing"),
+         ("Down", _c("0x05"), "moving along a list"),
+         ("Select", _c("0x04"), "opening MENU, PROGRAM and each device"),
+         ("Back", _c("0x02"), "leaving a device’s screen"),
+         ("Page up", _c("0x03"), "nothing"),
+         ("Page down", _c("0x01"), "nothing")]))
+    a(_danger("Never Select on a device’s program screen",
+      "<p>Every selectable line there acts: <b>ADD PROGRAM</b>, <b>DELETE "
+      "PROGRAM</b>, <b>CHANGE PROGRAM</b>, and the cursor lands on ADD. The "
+      "reader presses Back. And on the home screen the cursor starts on "
+      "<b>POOL MODE</b>, where Select switches the pool; that is why the reader "
+      "goes through AqualinkD’s own navigation, which waits for the screen "
+      "to be the one it expects, rather than counting key presses.</p>"))
+    a('<p>Three things the map does not show, and the reader handles. The '
+      'device list is a ring: past its bottom line the panel scrolls one line and '
+      'keeps the cursor there, and after the last device it comes back round to '
+      'the first, which is how the reader knows it has seen them all. A device '
+      'screen arrives in pieces — the ADD/DELETE/CHANGE lines first, the '
+      'title and the times last — so it is read only once the panel has '
+      'finished drawing it. And a device’s title is its own name, so POOL '
+      'HEAT’s program screen begins with the same line as the pool heater’s '
+      'setpoint screen; the reader recognises a program screen by its ADD '
+      'PROGRAM line before anything else is tried.</p>')
+    a('<p>The long form, with every screen line by line, is '
+      + _c("docs/JANDY-PROGRAMS.md") + '; the patch, its build and its tests are '
+      'in ' + _c("deploy/aqualinkd") + '.</p>')
     a("</section>")
 
     # -- wiring ---------------------------------------------------------------
@@ -1989,8 +2177,20 @@ def help_panel(public=False):
           f"{v['min']}\u2013{v['max']}" + _UNIT.get(k, _degF),
           _dur(v["cooldown_s"]), html.escape(v.get("why") or ""))
          for k, v in C.SETPOINTS.items()]))
-    a("<p>Those two tables are the whole of it, and the agent refuses anything "
-      "that is not in them \u2014 including the solar valve, which is deliberately "
+    # THE THIRD KIND, kept out of the tables above because it is not a
+    # circuit: a change to one of the panel's own programs. The words come
+    # from commands.py, the cooldown included, for the reason the tables do.
+    a("<p>And one more kind of command, " + _c("program") + ": a new on and "
+      "off time for one of the panel\u2019s own programs, on a device that "
+      "holds exactly one. Its device is named as the panel\u2019s PROGRAM list "
+      "names it, this server checks it against what the Pi last read off the "
+      "panel, and the agent waits " + _dur(C.PROGRAM_COOLDOWN_S) + " between "
+      "two, because each one walks the panel\u2019s editor. It is acknowledged "
+      "when AqualinkD accepts it; it is <b>done</b> only when the panel, read "
+      "back after the save, shows the new times \u2014 see "
+      "<a href=\"#help-programs\">the panel\u2019s own programs</a>.</p>")
+    a("<p>Those are the whole of it, and the agent refuses anything "
+      "that is not one of them \u2014 including the solar valve, which is deliberately "
       "absent because the panel actuates it on its own schedule, and including "
       "every temperature and salt figure, which are collected and never written "
       "to. Each command is checked at three separate layers on the way:</p>")
@@ -1999,17 +2199,70 @@ def help_panel(public=False):
         [("The page", "Offers only buttons built from the shared catalogue, so an unsupported control cannot be drawn."),
          ("This server", "Shape, device, range, age and a ceiling of 12 commands a minute."),
          ("The agent", "All of the above again, plus per-device cooldowns and replay of a command it already ran.")]))
+    # SCHEDULES ADD NO CONTROL, and the paragraph says so in as many words,
+    # because the two tables above are the ones that claim completeness. Every
+    # row here is generated from schedule.py and commands.off_command(), the
+    # functions the scheduler itself calls, for the reason the tables above are
+    # generated: a list typed here would drift from the thing it describes.
+    from . import schedule as _S
+    from . import scenes as _SC
+    # SCENES ADD NO CONTROL either, for the same reason schedules do not.
+    a("<h3>Scenes: several controls in one tap</h3>")
+    a("<p>A scene is a named list of the commands above \u2014 switches on or off, a "
+      "heater on or off, a heater\u2019s temperature \u2014 pressed for you, up to "
+      f"{_SC.STEPS_MAX} at a time. Each press is an ordinary one: the same three "
+      "layers, the same cooldowns, recorded as whoever ran the scene. It runs in a "
+      "fixed safe order whatever order it was saved in (the pump first, a heater "
+      "last; offs before ons) and <b>stops at the first press refused</b>, so a "
+      "heater is never started after its pump was refused. \u201cThen switch off "
+      "after\u201d switches off what it turned on, except the filter pump, whose "
+      "hours belong to the panel\u2019s own program. A scene can be scheduled like "
+      "any command.</p>")
+    a("<h3>Later, and switched off again</h3>")
+    a("<p>A schedule is one of the commands above, pressed later by this server "
+      "rather than now by a person. It goes through the same three layers, the "
+      "same cooldowns and the same audit, recorded as " + _c("schedule") + " or "
+      + _c("auto-off") + " rather than as whoever set it up. It adds nothing to "
+      "the two tables above — the tables are still the whole of what can be "
+      "asked. Something switched <b>on</b> runs only within "
+      f"{_S.GRACE_S // 60} minutes of its time and is otherwise recorded as "
+      "missed; something switched <b>off</b> that cannot be delivered is "
+      "retried until the panel reports it off, and somebody is told. Times are "
+      "the pool's clock, " + html.escape(config.DEPLOY_TZ) + ".</p>")
+    _offs = []
+    for dev in list(C.SWITCHES) + list(C.SETPOINTS):
+        offc = C.off_command(dev)
+        if offc is None:
+            continue
+        auto = _S.DEFAULT_AUTO_OFF_H.get(dev)
+        net = _S.DEFAULT_MAX_ON_H.get(dev)
+        _offs.append((f"<b>{html.escape(C.label_for(dev))}</b>",
+                      html.escape(C.describe(offc)),
+                      f"{auto:g} h" if auto else "not offered",
+                      f"{net:g} h" if net else "—"))
+    a(_table(
+        "What “off” means for each control, as an ordinary command the "
+        "agent already accepts. A heater is switched off by its own switch, the "
+        "panel\u2019s POOL HEATER and SPA HEATER, and its temperature is left where "
+        "it was. Defaults shown; " + _c("[schedule.auto_off]")
+        + " and " + _c("[schedule.max_on]") + " in config.toml change them. The "
+        "household limit reads what the panel <i>reports</i>, so it applies to a "
+        "press at the wall panel as much as to one made here.",
+        ("Control", "Switched off by", "“Then off after”, preselected",
+         "Household limit"), _offs))
     a("<p>If the agent is not connected the controls say so and do nothing. The "
-      "pool carries on running its own schedule regardless — the schedule lives in "
-      "the panel, not here, so losing this site loses the remote control and "
-      "nothing else.</p>")
+      "pool carries on running its own schedule regardless — the panel's "
+      "schedule lives in the panel, not here, so losing this site loses the "
+      "remote control and nothing else. Schedules made <i>here</i> live on this "
+      "server; one that falls due while the agent is away is recorded as missed, "
+      "or, if it was switching something off, retried.</p>")
     a("</section>")
 
     # -- acknowledgements -----------------------------------------------------
     # Three other people's products do the work this one reasons about. Said
     # here, in the app, rather than only in a README somebody may never open.
     a('<section id="help-thanks"><h2>Built on other people\u2019s work</h2>')
-    a('<p class="sub">Three products this one would not exist without</p>')
+    a('<p class="sub">The products and data this one is built on</p>')
     a(_table(None, ("Project", "What it does for poolhound", "Where"),
         [("<b>AqualinkD</b><br><span class=\"sm\">Shaun Feakes and contributors</span>",
           "The Jandy RS485 protocol is undocumented. AqualinkD reverse-engineered it "
@@ -2030,6 +2283,20 @@ def help_panel(public=False):
           "the second opinion the whole two-labs comparison depends on: one number is "
           "a reading, two numbers that disagree is information.",
           _link("https://lesliespool.com/", "lesliespool.com")),
+         # Here and not only in a footnote, because the licence asks for credit
+         # and because what is SENT to it is a fact a reader deciding whether
+         # to run this would want stated where the source is named. The
+         # precision is read from weather.py, which is what does the rounding.
+         ("<b>Open-Meteo</b><br><span class=\"sm\">weather data, CC BY 4.0</span>",
+          "Daily sun, rain, air temperature and evaporation at the pool, so the "
+          "chemistry can tell what the sun did from what the heat did, and "
+          "account for rain diluting the stabiliser. Optional, and off until "
+          "coordinates are set. What it is sent is the pool&rsquo;s latitude "
+          f"and longitude <b>rounded to {_wx.ROUND_DEG:g}&deg;</b> &mdash; "
+          "about eleven kilometres &mdash; and the timezone. No account, no key, "
+          "no address. Only days that have ended are stored, and a forecast is "
+          "never recorded as a measurement.",
+          _link("https://open-meteo.com/", "open-meteo.com")),
          ("<b>poolhound</b>",
           "This. Open source, MIT.",
           _link(REPO, REPO_NAME))]))

@@ -363,7 +363,14 @@ def price_for(chem, own, pct):
     The household's own when one was entered; otherwise the labelled reference
     from chemicals.py; otherwise None. A reference price that names a strength
     -- acid's does -- is for that strength and is not applied to any other.
+
+    `own` is a number typed in Settings, or {"price", "source"} from a
+    purchase on the stock record (stock.household_prices() decides which), so
+    a price the household PAID says when it was paid rather than reading as
+    one somebody typed.
     """
+    if isinstance(own, dict):
+        return {"price": own["price"], "own": True, "source": own["source"]}
     if own:
         return {"price": own, "own": True, "source": "your price"}
     ref = CH.REFERENCE_PRICES.get(chem)

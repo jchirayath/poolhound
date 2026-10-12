@@ -396,6 +396,17 @@ EOF
 # JavaScript toolchain, and "did not run" has to be distinguishable from
 # "passed", which is how two gates in this project came to run nothing at all.
 if [[ -x "$SRC/.venv/bin/python" ]]; then
+  # RENDERED HERE, FROM THE SOURCE BEING SHIPPED. bin/drive drives whatever is
+  # in $SRC/site, and nothing in this script wrote it: a deploy after a pull
+  # drove pages rendered from the code BEFORE the pull, and refused six merged
+  # features for being absent from a page built before they existed. The gate
+  # must judge this build or it judges nothing -- and a render that fails is a
+  # build that fails, so it stops the deploy the same way.
+  if ! "$SRC/.venv/bin/python" "$SRC/bin/render" >/tmp/poolhound-render.log 2>&1; then
+    warn "bin/render FAILED on the source being shipped:"
+    tail -n 8 /tmp/poolhound-render.log | sed 's/^/    /'
+    die "refusing to deploy a build that does not render"
+  fi
   if "$SRC/.venv/bin/python" "$SRC/bin/drive" >/tmp/poolhound-drive.log 2>&1; then
     ok "the pages behave in a browser at phone width"
   else
@@ -1137,6 +1148,31 @@ else
     warn "  build leaves a fresh public page beside a stale private one."
     fails=$((fails+1))
   fi
+fi
+
+# IS WHAT IS DEPLOYED CURRENT, AND NOT ONLY WORKING?
+#
+# Everything above compares the server with ITSELF — the image's REVISION with
+# the pages that image rendered — and an old image agrees with its old pages
+# perfectly. MEASURED on 2026-09-28: the server was three commits behind after
+# four days of failed image builds, and every line of --check was green,
+# including "served public page is the deployed build (<old rev>)", which was
+# true. So the same REVISION is now compared with origin/main and with this
+# checkout's main.
+#
+# GRADED AS FAILURES, the convention every other line here follows: behind,
+# not on main, deployed from a dirty tree, and "could not tell" (a fetch that
+# failed, a REVISION that is not one) each count in `fails`, because a reader
+# of --check is deciding whether the deployment is right and each of those is a
+# no. Deployed AHEAD of origin/main, or local main ahead of origin, is a
+# WARNING: the server is running what was meant, and what has drifted is the
+# push — worth saying every run, and not a fault in the deployment.
+#
+# want_rev was read off the server and is untrusted; rev-freshness.sh
+# validates it before git sees it, and it is only ever passed as one quoted
+# argument here, never placed inside a command string.
+if [[ -n "$want_rev" && "$want_rev" != "unknown" ]]; then
+  "$SRC/deploy/rev-freshness.sh" --what "the server" "$want_rev" || fails=$((fails+1))
 fi
 
 # DO BOTH ENDS HOLD THE SAME AGENT TOKEN?

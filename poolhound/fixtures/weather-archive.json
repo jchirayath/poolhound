@@ -1,0 +1,49 @@
+{
+ "source": "archive",
+ "fetched": "2026-03-06T03:20:05-0800",
+ "params": {
+  "latitude": "12.3",
+  "longitude": "45.6",
+  "daily": "shortwave_radiation_sum,sunshine_duration,uv_index_max,cloud_cover_mean,temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,rain_sum,et0_fao_evapotranspiration",
+  "timezone": "America/Los_Angeles",
+  "temperature_unit": "fahrenheit",
+  "precipitation_unit": "inch",
+  "start_date": "2026-03-01",
+  "end_date": "2026-03-05"
+ },
+ "response": {
+  "latitude": 12.28,
+  "longitude": 45.59,
+  "generationtime_ms": 0.42,
+  "utc_offset_seconds": -28800,
+  "timezone": "America/Los_Angeles",
+  "timezone_abbreviation": "GMT-8",
+  "elevation": 0.0,
+  "daily_units": {
+   "time": "iso8601",
+   "shortwave_radiation_sum": "MJ/m²",
+   "sunshine_duration": "s",
+   "uv_index_max": "undefined",
+   "cloud_cover_mean": "%",
+   "temperature_2m_max": "°F",
+   "temperature_2m_min": "°F",
+   "temperature_2m_mean": "°F",
+   "precipitation_sum": "inch",
+   "rain_sum": "inch",
+   "et0_fao_evapotranspiration": "inch"
+  },
+  "daily": {
+   "time": ["2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05"],
+   "shortwave_radiation_sum": [13.9, 14.02, 2.88, 15.7, null],
+   "sunshine_duration": [35000.0, 35500.0, 900.0, 39000.0, null],
+   "uv_index_max": [null, null, null, null, null],
+   "cloud_cover_mean": [30, 25, 100, 8, null],
+   "temperature_2m_max": [62.0, 63.9, 54.6, 65.8, null],
+   "temperature_2m_min": [46.1, 46.8, 49.0, 45.0, null],
+   "temperature_2m_mean": [53.9, 54.9, 51.5, 54.7, null],
+   "precipitation_sum": [0.0, 0.0, 0.57, 0.0, null],
+   "rain_sum": [0.0, 0.0, 0.57, 0.0, null],
+   "et0_fao_evapotranspiration": [0.09, 0.096, 0.019, 0.108, null]
+  }
+ }
+}

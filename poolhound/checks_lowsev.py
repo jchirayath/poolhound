@@ -585,6 +585,10 @@ def t_the_tree_names_no_real_deployment():
         "poolhound.example.com", "pool.example.com", "auth.example.com",
         "github.com", "raw.githubusercontent.com", "docs.github.com",
         "waterguru.com", "lesliespool.com", "api.openai.com",
+        # THE WEATHER SOURCE: its two endpoints, which bin/weather calls with a
+        # location rounded to 0.1 degree, and its home page, which the Guide
+        # links because the data is CC BY 4.0 and asks to be credited.
+        "api.open-meteo.com", "archive-api.open-meteo.com", "open-meteo.com",
         "img.shields.io", "rfc-editor.org", "www.rfc-editor.org",
         "html.spec.whatwg.org", "developer.mozilla.org", "caddyserver.com",
         "smtp.gmail.com", "fonts.googleapis.com", "fonts.gstatic.com",

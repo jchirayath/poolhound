@@ -324,13 +324,34 @@ def t_access():
     # nothing. The ranking is written out for the same reason.
     WANT = {"/api/control": "operate", "/api/chemical": "operate",
             "/api/chemical/edit": "operate", "/api/chemical/delete": "operate",
+            # Recording what was bought or counted is the same household
+            # record as logging a dose, by the same person.
+            "/api/chemical/stock": "operate",
+            "/api/chemical/stock/edit": "operate",
+            "/api/chemical/stock/delete": "operate",
             "/api/reading": "operate", "/api/lab-correction": "operate",
             "/api/pool-shape": "operate", "/api/refresh": "operate",
             # Asking the assistant sends this pool's readings to a provider and
             # spends money doing it, so it sits with the routes that ACT rather
             # than with the two that only read.
             "/api/ask": "operate",
+            # Marking a cleaning restarts the baseline a Home figure is
+            # judged against -- a change to what is computed, like a lab
+            # correction.
+            "/api/maintenance": "operate",
+            # A schedule is a deferred press: it costs what a press costs, and
+            # so does deciding a press should not happen after all.
+            "/api/schedule": "operate", "/api/schedule/delete": "operate",
             "/api/commands": "view", "/api/rows": "view",
+            # What is due and what ran, for everybody who can see the controls.
+            "/api/schedules": "view",
+            # Scenes: saving one is deciding what a tap does; reading them is
+            # for everybody who can see the controls.
+            "/api/scene": "operate", "/api/scene/delete": "operate",
+            "/api/scenes": "view",
+            # What the panel and AqualinkD run by themselves: a read, for the
+            # same readers as the scheduler's own list.
+            "/api/panel-schedules": "view",
             "/api/settings": "admin", "/api/credential": "admin",
             "/api/credential/import": "admin", "/api/notify-test": "admin",
             "/api/export": "admin"}

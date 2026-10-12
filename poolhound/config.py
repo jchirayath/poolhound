@@ -305,6 +305,25 @@ def chemical_price(chem, cfg=None):
     return v if 0 < v < 1000 else None
 
 
+# How many weeks of a chemical left counts as "low" on the Chemicals tab, on
+# Home and in the watchdog's optional notice. Three: long enough to buy
+# before running out with a weekend in the way, short enough that a jug bought
+# last month is not nagged about.
+STOCK_LOW_WEEKS = 3.0
+
+
+def stock_low_weeks(cfg=None):
+    """`[stock] low_weeks`, or the default. A value that is not a sensible
+    number of weeks is the default, not an error: this is a nudge, and a typo
+    in it must not take the Chemicals tab down."""
+    cfg = cfg if cfg is not None else load()
+    try:
+        v = float((cfg.get("stock") or {}).get("low_weeks", STOCK_LOW_WEEKS))
+    except (TypeError, ValueError):
+        return STOCK_LOW_WEEKS
+    return v if 0 < v <= 52 else STOCK_LOW_WEEKS
+
+
 def root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -358,8 +377,18 @@ def caddy_vhost():
 # that a deploy ran -- not that the share behind the directory is mounted. The
 # guard in seed_config() asked about config.toml and was therefore disarmed by
 # the very script it was protecting; it asks about these instead.
+#
+# weather.csv is not in it either, for the same reason in a new place: the
+# weather collector's first run is a BACKFILL into whatever directory it is
+# given, so on an unmounted share it would create the file on local disk and
+# this guard would then read that as a pool. A file a collector can create
+# from nothing proves nothing about the share.
 HISTORY_FILES = ("samples.csv", "readings.csv", "leslies.csv", "lab.csv",
-                 "chemicals.csv", "manual.csv")
+                 "chemicals.csv", "manual.csv",
+                 # What was bought and counted. Our own record, like the
+                 # doses, and nothing re-measures it -- so it is history, and
+                 # bin/backup takes it because it reads this list.
+                 "stock.csv")
 
 def has_history(data):
     """True when `data` holds any file that only a running pool produces."""

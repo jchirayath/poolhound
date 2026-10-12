@@ -470,6 +470,7 @@ h2 { font-size:var(--h2); margin:0 0 6px; letter-spacing:-.012em;
 .c-low,.c-high { background:var(--warnbg); color:var(--warn); }
 .c-none,.c-unknown { background:var(--nonebg); color:var(--ink3); }
 .swg { color:var(--ink3); }
+.wx { color:var(--ink3); }
 
 /* ---- tables ---- */
 table { border-collapse:collapse; width:100%; font-size:12.5px; }
@@ -657,7 +658,7 @@ footer { color:var(--ink3); font-size:11.5px; border-top:1px solid var(--line);
   color:var(--ink3); }
 .f > span i { font-style:normal; text-transform:none; letter-spacing:0; opacity:.7; }
 input[type=text], input[type=number], input[type=datetime-local],
-input[type=month], select {
+input[type=month], input[type=date], input[type=time], select {
   font:inherit; font-size:13.5px; color:var(--ink); background:var(--panel);
   border:1px solid var(--line); border-radius:8px; padding:8px 10px; width:100%;
   font-variant-numeric:tabular-nums; }
@@ -706,6 +707,12 @@ input:focus, select:focus { outline:2px solid var(--pump); outline-offset:-1px;
 #dm-table tfoot th, #dm-table tfoot td { font-weight:600;
   border-top:1px solid var(--line); }
 #dm-table tfoot tr + tr th, #dm-table tfoot tr + tr td { border-top:0; }
+/* What is on the shelf: the last two columns are sentences -- how long, and
+   how it is known -- and `td { white-space:nowrap }` laid them out as one line
+   each, a table four screens wide on a laptop. They wrap; the figures do not. */
+#stock-table td:nth-child(4), #stock-table td:nth-child(5) {
+  white-space:normal; min-width:18ch; }
+#stock-table td:nth-child(5) { min-width:28ch; }
 .flbl { font-size:11.5px; text-transform:uppercase; letter-spacing:.06em;
   color:var(--ink3); }
 /* `select` is width:100% for the forms, which in a flex row is every control
@@ -906,6 +913,12 @@ input[type=file] { font:inherit; font-size:12.5px; color:var(--ink2); }
   color:var(--panel); }
 .ctl[data-state="off"] .ctl-off { background:var(--nonebg); border-color:var(--line); }
 .ctl-b input { flex:1; min-width:0; }
+/* A heater's own switch, above its temperature, lit the way a switch's
+   On/Off are: the state the panel reports, in the same colours and words. */
+.ctl-heat { margin-bottom:8px; }
+.ctl[data-state="on"] .ctl-heat-on { background:var(--good); border-color:var(--good);
+  color:var(--panel); }
+.ctl[data-state="off"] .ctl-heat-off { background:var(--nonebg); border-color:var(--line); }
 .a-src { font-size:11.5px; color:var(--ink3); margin:6px 0 0; }
 td.by { color:var(--ink3); font-size:12px; }
 /* ---- drill-down ---- */
@@ -961,6 +974,22 @@ tbody.rows-clickable tr:focus-visible { outline:2px solid var(--pump); outline-o
 .ctl-why { font-size:11.5px; color:var(--ink3); margin:0; }
 .ctl-cool { font-size:11px; color:var(--ink3); margin:0; opacity:.8; }
 .ctl-msg { font-size:11.5px; }
+/* "Then off after" on a card that offers it. A label wrapping its select, so
+   the words are the control's name as well as its caption. */
+.ctl-after { display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+  font-size:11.5px; color:var(--ink2); }
+.ctl-offafter { padding:4px 7px; font-size:12px; }
+/* The date and time pickers draw their own icon, in the colour scheme the
+   ELEMENT declares -- which is light unless told otherwise, so in the dark
+   palette the calendar and clock glyphs were near-black on --panel. Measured
+   by driving the schedule form with color_scheme=dark. Both dark states, as
+   every dark rule here is: the system's, and the stamped one. */
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme="light"]) input[type=date],
+  :root:not([data-theme="light"]) input[type=time] { color-scheme:dark; }
+}
+:root[data-theme="dark"] input[type=date],
+:root[data-theme="dark"] input[type=time] { color-scheme:dark; }
 td.ok { color:var(--good); }
 td.bad { color:var(--bad); }
 
@@ -1304,6 +1333,103 @@ input[type=password]:focus { outline:2px solid var(--pump); outline-offset:-1px;
   vertical-align:-2px; margin-right:3px; }
 .v-note b { color:var(--ink); }
 
+/* ---- the panel's programs (programs_ui.py) ----
+   A card per programmed device with its window on a 24-hour bar. The bar is
+   aria-hidden and never the only channel: the times and "on now / off now"
+   are written beside it, so it reads without colour and without sight. */
+.prog-why { margin:0 0 16px; }
+.prog-why p { font-size:13px; line-height:1.55; color:var(--ink2); margin:10px 0 0; max-width:78ch; }
+.prog-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.prog-head .fh { margin-bottom:6px; }
+.prog-cards { display:grid; gap:12px; margin:8px 0 10px; }
+@media (min-width:760px) { .prog-cards { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+.prog-card { background:var(--panel); border:1px solid var(--line);
+  border-radius:var(--r-md); padding:14px 16px; min-width:0; }
+.prog-card-head { display:flex; align-items:center; justify-content:space-between;
+  gap:10px; flex-wrap:wrap; }
+.prog-name { margin:0; font-size:15px; color:var(--ink); }
+.prog-times { margin:6px 0 10px; font-size:13px; color:var(--ink2);
+  font-variant-numeric:tabular-nums; }
+.prog-times b { color:var(--ink); font-weight:640; }
+.prog-bar { margin:2px 0 6px; }
+.prog-track { position:relative; height:12px; border-radius:6px;
+  background:var(--nonebg); border:1px solid var(--line); overflow:hidden; }
+.prog-seg { position:absolute; top:0; bottom:0; background:var(--accent); }
+.prog-seg.prog-preview { background:var(--warn); }
+.prog-now { position:absolute; top:-2px; bottom:-2px; width:2px; margin-left:-1px;
+  background:var(--ink); }
+.prog-ticks { display:flex; justify-content:space-between; font-size:10.5px;
+  color:var(--ink3); margin-top:3px; }
+.prog-state { margin:6px 0 0; font-size:12.5px; color:var(--ink2); }
+/* "On now" is a phrase; the state pill's capitalize would make it "On Now". */
+.prog-card .st { text-transform:none; }
+.prog-label { margin:10px 0 3px; font-size:11.5px; font-weight:600; color:var(--warn); }
+.prog-card .factions { padding-top:10px; }
+.prog-progress { display:flex; flex-wrap:wrap; gap:6px 14px; margin:10px 0 0;
+  font-size:12.5px; }
+.prog-step { color:var(--ink3); }
+.prog-step.active { color:var(--warn); font-weight:600; }
+.prog-step.done { color:var(--good); font-weight:600; }
+.prog-step.failed { color:var(--bad); font-weight:600; }
+@media (prefers-reduced-motion:no-preference) {
+  .prog-step.active { animation:prog-pulse 1.6s ease-in-out infinite; }
+  @keyframes prog-pulse { 50% { opacity:.55; } }
+}
+.prog-edit { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.prog-summary { margin:8px 0 0; font-size:12.5px; color:var(--ink); }
+.prog-summary.bad { color:var(--bad); }
+.prog-summary.muted { color:var(--ink3); }
+.prog-good { margin:6px 0 10px; font-size:13px; color:var(--good); }
+/* AqualinkD's own schedules: one row each, its actions beside it; a paused
+   one is dimmed and says "paused" in words as well. */
+.cron-list { list-style:none; margin:6px 0 10px; padding:0; display:grid; gap:8px; }
+.cron-row { display:flex; align-items:center; gap:8px 12px; flex-wrap:wrap;
+  background:var(--panel); border:1px solid var(--line); border-radius:var(--r-md);
+  padding:9px 12px; font-size:13px; color:var(--ink2); min-width:0; }
+.cron-what { flex:1 1 220px; min-width:0; }
+.cron-what b { color:var(--ink); }
+.cron-paused .cron-what { color:var(--ink3); }
+.cron-acts { gap:8px; }
+.cron-acts .btn { padding:4px 10px; font-size:12.5px; }
+.cron-edit { border:1px solid var(--line); border-radius:var(--r-md); padding:12px 14px;
+  background:var(--panel); margin-top:0; }
+.cron-days { display:flex; flex-wrap:wrap; gap:6px 14px; margin:10px 0 0; font-size:13px; }
+.cron-days[hidden] { display:none; }
+.cron-day { display:inline-flex; align-items:center; gap:4px; min-height:32px; }
+/* The note under the cards and the freshness line carry their verdict in
+   words ("Saved on the panel", "was not saved"); the colour repeats it. */
+#ctl-programs .sub.ok { color:var(--good); }
+#ctl-programs .sub.bad { color:var(--bad); }
+
+/* ---- scenes (scenes_ui.py) ----
+   Several controls in one tap. A card per scene: its steps in the order they
+   run, what "then off after" switches off, and Run. */
+.scene-cards { display:grid; gap:12px; margin:8px 0 10px; }
+@media (min-width:760px) { .scene-cards { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+.scene-card { background:var(--panel); border:1px solid var(--line);
+  border-radius:var(--r-md); padding:14px 16px; min-width:0; }
+.scene-name { margin:0 0 6px; font-size:15px; color:var(--ink); }
+.scene-steps { margin:0 0 6px; font-size:13px; line-height:1.7; color:var(--ink3); }
+.scene-step { color:var(--ink); white-space:nowrap; }
+.scene-then { margin:0 0 4px; }
+.scene-card .factions { padding-top:8px; }
+.scene-out { font-size:12.5px; }
+.scene-progress { margin:8px 0 0; color:var(--warn); font-weight:600; }
+.scene-ran { margin:8px 0 0; padding-left:18px; color:var(--ink2); }
+.scene-ran li { margin:2px 0; }
+.scene-ran li.ok { color:var(--good); }
+.scene-ran li.bad { color:var(--bad); font-weight:600; }
+.scene-new { margin:4px 0 14px; }
+.scene-new .sub { margin:0; }
+.scene-template { font-size:12px; }
+.scene-editor { margin:0 0 16px; }
+.scene-rows { margin-top:8px; }
+.scene-row { flex:1 1 150px; }
+.scene-row input { margin-top:5px; }
+.scene-preview { margin:10px 0 0; font-size:12.5px; color:var(--ink2); }
+#ctl-scenes .sub.ok { color:var(--good); }
+#ctl-scenes .sub.bad { color:var(--bad); }
+
 /* ---- the Ask tab ---- */
 .ask-answer { white-space:pre-wrap; line-height:1.6; font-size:13.5px;
   color:var(--ink); margin-top:14px; }
@@ -1458,6 +1584,24 @@ input[type=password]:focus { outline:2px solid var(--pump); outline-offset:-1px;
    nothing about the tables that were already here — they fit without wrapping,
    so there is nothing for it to wrap. */
 #tab-help table.ref td + td { white-space:normal; }
+
+/* What moves this pool: one row per coefficient, and the last column is a
+   sentence. Under the base nowrap it laid out 2,810px wide inside a 358px card
+   on a phone, so every reason a figure was not yet measured had to be dragged
+   into view. Cells wrap; at phone width each row stacks into a block, and
+   the two figures that lose their column heading carry it as a label. */
+table.fit td { white-space:normal; vertical-align:top; }
+table.fit td:first-child { min-width:11em; }
+table.fit .rel { display:block; margin-left:0; }
+table.fit th[scope="colgroup"] { padding-top:14px; color:var(--ink2); }
+table.fit .pill { white-space:normal; display:inline-block; }
+@media (max-width:640px) {
+  table.fit thead { display:none; }
+  table.fit tr { display:block; padding:8px 0; border-bottom:1px solid var(--line2); }
+  table.fit td { display:block; border:0; padding:2px 0; }
+  table.fit td[data-k]::before { content:attr(data-k) "  "; color:var(--ink3);
+    font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+}
 
 /* ---- the architecture diagram, and in-page jumps, on the help tab ----------
    Appended rather than folded into the help block above so the existing rules

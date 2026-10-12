@@ -9,6 +9,19 @@
   chem --list                     recent entries
   chem --help                     the full catalogue
 
+  chem bought acid 2 gal --paid 19.49     a purchase, and what it cost
+  chem bought salt 160 lb                 the price is optional
+  chem stocktake acid 2.5 gal             what is actually on the shelf now
+  chem stocktake shock 0 lb               "none left" is a count too
+  chem --stock                            on hand, and how long it lasts
+
+WHY A STOCKTAKE AND NOT ONLY PURCHASES
+  On hand is the last count, plus what was bought since, minus the doses
+  logged since. Purchases minus doses alone drifts for ever -- a dose nobody
+  logged is a jug that never empties on paper -- and a count is the only thing
+  that pulls it back. Both are corrected in place on the Chemicals tab, like a
+  dose: they are our record of something we did.
+
 WHY PERCENTAGE IS NOT OPTIONAL DETAIL
   "A gallon of acid" is not a dose. Muriatic ships at 31.45% (20 Baume) and at
   14.5%, which differ by more than a factor of two, and chlorine runs from 10%
@@ -24,6 +37,7 @@ THE CATALOGUE LIVES IN chemicals.py
 import csv, os, sys, time
 
 from . import chemicals as CH
+from . import stock as STOCK
 from . import access, config
 from . import locking
 
@@ -58,6 +72,11 @@ def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
         usage()
+
+    if args[0] in ("bought", "stocktake"):
+        return stock(args[0], args[1:])
+    if args[0] == "--stock":
+        return show_stock()
 
     if args[0] == "--list":
         if not os.path.exists(OUT):
@@ -162,6 +181,58 @@ def main():
         print("  volume, and every figure multiplies through it. Set pool.volume_gallons")
         print("  in config.toml, or use the Pool Volume Calculator on the site.")
     return 0
+
+def stock(verb, args):
+    """`bought` or `stocktake`: one row of stock.csv, through stock.validate().
+
+    The same validator the API runs, so "a gallon of salt" is refused here for
+    the reason a dose of it is, and --pct and --paid are the only options --
+    an unknown flag stops the command rather than becoming the note, for the
+    reason the dose path gives at length.
+    """
+    if len(args) < 3:
+        usage(f"need: {verb} chemical amount unit")
+    data = {"kind": "purchase" if verb == "bought" else "stocktake",
+            "chemical": args[0].lower(), "amount": args[1], "unit": args[2].lower()}
+    if data["chemical"] not in CH.CHEMICALS:
+        usage(f"unknown chemical {data['chemical']!r}")
+    i, opts = 3, ("--pct", "--paid") if verb == "bought" else ("--pct",)
+    while i < len(args):
+        if args[i] in opts and i + 1 < len(args):
+            data[args[i][2:]] = args[i + 1]
+            i += 2
+        elif args[i].startswith("--"):
+            usage(f"{args[i]!r} is not an option for bin/chem {verb}. The options "
+                  f"are {' and '.join(opts)}; everything after the unit is the "
+                  f"note, and a note does not begin with --.")
+        else:
+            data["note"] = " ".join(args[i:])
+            break
+    import datetime as dt
+    from . import render
+    row, why = STOCK.validate(data, dt.datetime.now(), render.when, render.CLOCK_SKEW)
+    if why:
+        usage(why)
+    row.update({"by": access.CONSOLE, "id": CH.new_id()})
+    path = os.path.join(config.data_dir(CFG), STOCK.FILE)
+    locking.append_row(config.data_dir(CFG), "stock", path, STOCK.COLS, row)
+    print(f"  recorded: {STOCK.describe(row)}"
+          + (f" — {row['note']}" if row.get("note") else ""))
+    return show_stock()
+
+
+def show_stock():
+    """What is on hand, the same summary the Chemicals tab draws."""
+    from . import render
+    rows = render.stock_now()
+    if not rows:
+        print("  nothing recorded yet — `bin/chem bought ...` or "
+              "`bin/chem stocktake ...` starts it")
+        return 0
+    for line in STOCK.context_lines(rows):
+        print(line)
+    return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

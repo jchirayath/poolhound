@@ -44,9 +44,10 @@ STDLIB ONLY
   No pip install on a box whose storage is the fragile part.
 """
 import argparse, datetime as dt, http.server, json, os, socket, ssl, sys, threading, time
-import urllib.error, urllib.request
+import urllib.error, urllib.parse, urllib.request
 
 from . import commands as C
+from . import programs as P
 
 STATE_DIR = "/run/poolhound" if os.path.isdir("/run") else "/tmp/poolhound"
 # The interlocks, across a RESTART but not across a reboot. See Guard.
@@ -440,7 +441,7 @@ class Guard:
         d = cmd.get("device")
         if d:
             cool = C.cooldown_for(cmd)
-            since = now - self.last.get(d, 0)
+            since = now - self.last.get(C.cooldown_key(cmd), 0)
             if since < cool:
                 spec = C.SWITCHES.get(d) or C.SETPOINTS.get(d) or {}
                 why = spec.get("why") or ""
@@ -452,7 +453,7 @@ class Guard:
         self.done[cmd["id"]] = now
         self.recent.append(now)
         if cmd.get("device"):
-            self.last[cmd["device"]] = now
+            self.last[C.cooldown_key(cmd)] = now
         # Ids are only needed until they can no longer be replayed; cooldowns
         # until they can no longer refuse anything.
         self._prune(now)
@@ -461,6 +462,15 @@ class Guard:
 def aq_get(path, timeout=15):
     with urllib.request.urlopen(f"{AQUALINK}{path}", timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+# AqualinkD's own route for a TEMPERATURE. Its plain /set route is on/off and
+# answers anything but 0 or 1 with 400 "Invalid value" -- which is what every
+# heater and freeze-protection setpoint from this agent got until 2026-10-10,
+# measured. The salt cell's percentage has a route of its own already, as its
+# device id says (SWG/Percent).
+SETPOINT_ROUTE = {"Pool_Heater": "Pool_Heater/setpoint", "Spa_Heater": "Spa_Heater/setpoint",
+                  "Freeze_Protect": "Freeze_Protect/setpoint"}
+
 
 def aq_set(device, value, timeout=20):
     """AqualinkD wants PUT with a form body.
@@ -511,9 +521,155 @@ def execute(cmd, guard):
         aq_get("/api/devices")          # raises if the panel is unreachable
         guard.record(cmd)
         return {"ok": True, "detail": "re-read the panel"}
+    if a == "program":
+        return change_program(cmd, guard)
+    if a == "cron":
+        return change_cron(cmd, guard)
+    if a == "setpoint":
+        # A temperature goes to its own route; the device id stays the
+        # vocabulary's, so the audit and the page are unchanged.
+        status, body = aq_set(SETPOINT_ROUTE.get(cmd["device"], cmd["device"]), cmd["value"])
+        guard.record(cmd)
+        return {"ok": 200 <= status < 300, "detail": f"{status} {body}"}
     status, body = aq_set(cmd["device"], cmd["value"])
     guard.record(cmd)
     return {"ok": 200 <= status < 300, "detail": f"{status} {body}"}
+
+
+# How long to follow a program change before calling it lost: a walk to the
+# device and through the editor has taken under a minute; a button press
+# queued behind it can hold it up to two more.
+PROGRAM_FOLLOW_S = 240
+# Set by main(): how a follow-up pushes a fresh report the moment a change
+# lands, so the page does not wait half an hour to show it.
+_REPORT = None
+
+
+def change_program(cmd, guard, poke=None, get=None, follow=None):
+    """Ask the patched AqualinkD to change one program's times, and return.
+
+    AqualinkD queues the change and answers at once; the walk through the
+    panel's editor takes about a minute. The command stream must not stall for
+    that, so this ACKS that the panel accepted the job, and a thread follows it
+    to the end and pushes the panel's own answer -- the `set` object, read back
+    off the panel after the save -- with a fresh schedules report.
+    """
+    poke = poke or aq_poke
+    status, body = poke(f"/api/programs/set/{cmd['device']}/{cmd['value']}")
+    guard.record(cmd)
+    if not 200 <= status < 300:
+        return {"ok": False, "error": f"AqualinkD refused it: {body.strip() or status}",
+                "detail": f"{status} {body}"}
+    (follow or _follow_program)(cmd, get or aq_get)
+    return {"ok": True, "detail": "accepted by AqualinkD; the panel is being "
+                                  "changed now, and the result arrives with "
+                                  "the schedules"}
+
+
+def aq_put_json(path, body, timeout=20):
+    """A PUT with a JSON body, for /api/schedules/set. PUT for aq_poke's
+    reason: a cross-site page can POST text at the Pi, it cannot PUT."""
+    req = urllib.request.Request(f"{AQUALINK}{path}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode(errors="replace")[:200]
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:200]
+
+
+def change_cron(cmd, guard, get=None, put=None, report=None):
+    """Replace AqualinkD's schedules with the list in the command, and check it.
+
+    AqualinkD rewrites its whole cron file from what it is sent, so this:
+      1. reads the list the Pi has NOW, and refuses unless it is the list the
+         page was editing (`expect`) -- otherwise somebody's change, made in
+         AqualinkD's own page meanwhile, would be wiped without a word;
+      2. refuses if that list has an entry this code cannot show, which a
+         save would delete;
+      3. sends the new list, built field by field from the validated command
+         -- never the command's own strings -- because each field becomes
+         part of a line cron runs as root;
+      4. reads it back and says ok only if the Pi now holds exactly that.
+    Quick (AqualinkD writes a file), so it runs on the stream's thread.
+    """
+    get, put = get or aq_get, put or aq_put_json
+    rep = report if report is not None else _REPORT
+
+    def report_now():
+        # The page shows what the Pi last reported, so tell the server now
+        # rather than in half an hour -- after a save, and after a refusal
+        # for a list that moved, or "reload it" would show the same old list.
+        # On its own thread: the server is who is waiting for this ack.
+        if rep:
+            threading.Thread(target=_quietly, args=(rep,), daemon=True,
+                             name="poolhound-cron-report").start()
+    want = cmd["value"]["schedules"]
+    try:
+        err, have, dropped = P.shape_schedules(get("/api/schedules"))
+    except Exception as e:
+        why = f"could not read AqualinkD's schedules: {type(e).__name__}"
+        return {"ok": False, "error": why, "detail": why}
+    # Refusals are raised, as the Guard's are: the stream loop reports them
+    # as `refused`, which is what the page shows.
+    if err or dropped:
+        raise C.Refused(err or "AqualinkD has schedules this page cannot show")
+    if C.cron_fingerprint(have) != cmd["value"]["expect"]:
+        report_now()
+        raise C.Refused("AqualinkD's schedules changed on the Pi since the page read "
+                        "them; the Pi's list is shown again in "
+                        "a moment, and the change can be made to that")
+    body = {"schedules": [{"enabled": "1" if e["enabled"] else "0",
+                           **{k: e[k] for k in ("min", "hour", "daym", "month", "dayw",
+                                                "url", "value")}}
+                          for e in (C.cron_entry(x) for x in want)]}
+    status, answer = put("/api/schedules/set", body)
+    guard.record(cmd)
+    if not 200 <= status < 300 or "Saved" not in answer:
+        return {"ok": False, "error": f"AqualinkD did not save them: {answer.strip() or status}",
+                "detail": f"{status} {answer}"}
+    try:
+        err, now_have, _ = P.shape_schedules(get("/api/schedules"))
+    except Exception as e:
+        why = f"saved, but could not be read back: {type(e).__name__}"
+        return {"ok": False, "error": why, "detail": why}
+    if C.cron_fingerprint(now_have) != C.cron_fingerprint(want):
+        why = ("AqualinkD saved something other than what was sent; "
+               f"it now holds {len(now_have)} schedule(s)")
+        return {"ok": False, "error": why, "detail": why}
+    report_now()
+    return {"ok": True, "detail": f"AqualinkD now holds {len(now_have)} schedule(s)"}
+
+
+def _quietly(fn):
+    try:
+        fn()
+    except Exception as e:
+        log(f"  schedules push after the change failed: {type(e).__name__}")
+
+
+def _follow_program(cmd, get, clock=time.time, wait=time.sleep):
+    def run():
+        end = clock() + PROGRAM_FOLLOW_S
+        st = {}
+        while clock() < end:
+            wait(5)
+            try:
+                st = (get("/api/programs") or {}).get("set") or {}
+            except Exception:
+                continue
+            if st.get("state") in ("ok", "failed"):
+                break
+        log(f"  program change for {cmd['device']}: {st.get('state', 'no answer')}"
+            f"{' - ' + st['error'] if st.get('error') else ''}")
+        if _REPORT is not None:
+            try:
+                _REPORT()
+            except Exception as e:
+                log(f"  schedules push after the change failed: {type(e).__name__}")
+    t = threading.Thread(target=run, daemon=True, name="poolhound-program")
+    t.start()
+    return t
 
 class Server:
     """Everything that talks to the server, in one place so the token cannot leak into
@@ -760,6 +916,96 @@ def sampler(server, stop):
         stop.wait(SAMPLE_EVERY)
 
 
+# How often the agent re-reads both kinds of schedule and pushes them; owned by
+# programs.py, because the server's staleness test is measured against it.
+SCHEDULES_EVERY = P.PUSH_EVERY_S
+# How often AqualinkD is asked to walk the panel's PROGRAM menus again. Rarely:
+# the walk holds the panel's menus for about a minute, and a button pressed
+# meanwhile waits behind it. The programs change when somebody edits them at
+# the panel, which is seldom. The first walk is a few minutes after start, not
+# at once, so a restart loop cannot keep the panel in its menus.
+PROGRAMS_REFRESH_EVERY = 24 * 3600
+PROGRAMS_FIRST_REFRESH = 300
+PROGRAMS_WALK_S = 120          # how long to give a walk before reading its result
+
+
+def read_schedules(get=None):
+    """Both kinds, read independently: a 404 from a stock AqualinkD that cannot
+    read the panel must not cost the cron schedules, and the reverse."""
+    get = get or aq_get
+    out = {}
+    for key, route in (("programs", "/api/programs"), ("schedules", "/api/schedules")):
+        try:
+            out[key], out[key + "_err"] = get(route), ""
+        except urllib.error.HTTPError as e:
+            out[key], out[key + "_err"] = None, f"AqualinkD answered {e.code} to {route}"
+        except Exception as e:
+            out[key], out[key + "_err"] = None, f"{type(e).__name__} reading {route}"
+    # The panel's own name for each of AqualinkD's devices -- Extra_Aux is
+    # SOLAR HEAT -- so the page can tell when both kinds of schedule switch
+    # the same equipment. Best effort: without it the page falls back to
+    # labels, and a failure here must not cost either schedule.
+    try:
+        names = {d.get("id"): d.get("name") for d in get("/api/devices").get("devices", [])}
+    except Exception:
+        names = None
+    return P.snapshot(out["programs"], out["programs_err"],
+                      out["schedules"], out["schedules_err"], names=names)
+
+
+def aq_poke(path, timeout=15):
+    """A PUT whose answer is a word, not JSON: /api/programs/refresh says Ok.
+
+    PUT because the patched AqualinkD refuses these as a GET: a GET can be
+    fired by any page open on a browser in the house, a cross-site PUT cannot.
+    An HTTP error carries AqualinkD's own reason, which is worth showing.
+    """
+    req = urllib.request.Request(f"{AQUALINK}{urllib.parse.quote(path)}", data=b"",
+                                 method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode(errors="replace")[:200]
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:200]
+
+
+def schedules_reporter(server, stop, get=None, poke=None, clock=time.time,
+                       first_refresh=PROGRAMS_FIRST_REFRESH):
+    """Push both kinds of schedule every SCHEDULES_EVERY, on its own thread.
+
+    Its own thread for the reason sampler() is: nothing here may stall the
+    command stream, and a panel walk that takes a minute must not delay a
+    sample. Never fatal, for the same reason.
+    """
+    get, poke = get or aq_get, poke or aq_poke
+    started = clock()
+    last_refresh = None
+    while not stop.is_set():
+        now = clock()
+        due = (now - started >= first_refresh if last_refresh is None
+               else now - last_refresh >= PROGRAMS_REFRESH_EVERY)
+        if due:
+            last_refresh = now
+            try:
+                status, _ = poke("/api/programs/refresh")
+                if not 200 <= status < 300:
+                    raise RuntimeError(f"AqualinkD answered {status}")
+                log("asked AqualinkD to read the panel's programs")
+                if stop.wait(PROGRAMS_WALK_S):
+                    return
+            except Exception as e:
+                log(f"panel programs refresh failed: {type(e).__name__}")
+        try:
+            body = read_schedules(get)
+            with server._req("/api/agent/schedules", body, "POST", 20):
+                pass
+        except Exception as e:
+            log(f"schedules push failed: {type(e).__name__}: {e}")
+        # Wake for a due refresh too, not only at the next push.
+        stop.wait(min(SCHEDULES_EVERY, max(5, first_refresh - (clock() - started)))
+                  if last_refresh is None else SCHEDULES_EVERY)
+
+
 class Claims:
     """Doors that have said they are about to change something.
 
@@ -951,7 +1197,53 @@ def record_change(activity, changes, door):
         activity.add(what, how, device=dev, now=now)
 
 
-def claim_server(claims, clock=None, activity=None):
+# Scenes for poolhound local, the page on the Pi that drives AqualinkD itself.
+# Fetched from the server and kept IN MEMORY ONLY -- nothing writes to this
+# card -- so a scene can be run at the pool while the server is unreachable,
+# from the last list this agent saw. A failed fetch keeps that list and says
+# why; it never empties it.
+SCENES_EVERY = 600
+
+
+class SceneCache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.scenes, self.fetched_at, self.error = [], None, "not fetched yet"
+
+    def put(self, scenes, now):
+        with self._lock:
+            self.scenes, self.fetched_at, self.error = scenes, now, None
+
+    def fail(self, why):
+        with self._lock:
+            self.error = why
+
+    def view(self):
+        with self._lock:
+            return {"scenes": list(self.scenes), "fetched_at": self.fetched_at,
+                    "error": self.error,
+                    "note": "the household's scenes as this Pi last fetched them; "
+                            "\"then switch off after\" is arranged only by the "
+                            "poolhound server"}
+
+
+def scenes_fetcher(server, stop, cache, clock=time.time):
+    """Fetch the scenes now and every SCENES_EVERY. Never fatal."""
+    while not stop.is_set():
+        try:
+            with server._req("/api/agent/scenes", None, "GET", 20) as r:
+                body = json.loads(r.read().decode())
+            got = body.get("scenes") if isinstance(body, dict) else None
+            if not isinstance(got, list):
+                raise ValueError("not a scenes list")
+            cache.put(got[:50], int(clock()))
+        except Exception as e:
+            cache.fail(f"{type(e).__name__} fetching the scenes")
+            log(f"scenes fetch failed: {type(e).__name__}")
+        stop.wait(SCENES_EVERY)
+
+
+def claim_server(claims, clock=None, activity=None, scenes=None):
     """The loopback endpoint. Records a door's claim, and reads back activity.
 
     Returns the HTTPServer so a caller can shut it down; serve_forever() is the
@@ -968,6 +1260,12 @@ def claim_server(claims, clock=None, activity=None):
             pass
 
         def do_GET(self):
+            # The scenes, for the page to offer -- read-only, like /activity:
+            # names and the commands they are made of, which anybody on this
+            # LAN can already send to AqualinkD directly.
+            if self.path.split("?")[0] == "/scenes":
+                return self._reply(200, scenes.view() if scenes else
+                                   {"scenes": [], "fetched_at": None, "error": "no scene cache"})
             if self.path.split("?")[0] != "/activity":
                 return self._reply(404, {"error": "no such path"})
             events = activity.recent() if activity else []
@@ -1131,17 +1429,29 @@ def main():
     stop = threading.Event()
     threading.Thread(target=sampler, args=(server, stop), daemon=True,
                      name="poolhound-sampler").start()
+    # Both kinds of equipment schedule, read off AqualinkD. See programs.py.
+    threading.Thread(target=schedules_reporter, args=(server, stop), daemon=True,
+                     name="poolhound-schedules").start()
+    global _REPORT
+    def _report_now():
+        with server._req("/api/agent/schedules", read_schedules(), "POST", 20):
+            pass
+    _REPORT = _report_now
     # The heartbeat and the watch are separate threads on purpose; see both
     # docstrings. One answers "what is the pool doing", the other "when did it
     # change", and a pool that is quiet must still produce the first.
     claims = Claims()
+    # Scenes for poolhound local. See SceneCache.
+    scene_cache = SceneCache()
+    threading.Thread(target=scenes_fetcher, args=(server, stop, scene_cache), daemon=True,
+                     name="poolhound-scenes").start()
     # What poolhound local's activity list reads. See Activity.
     activity = Activity()
     # RECORD-ONLY, ON LOOPBACK. See CLAIM_HOST for what this can and cannot do.
     # A failure to bind is not fatal: the watch is the floor and still captures
     # every change from every door, with no door named.
     try:
-        claim_srv = claim_server(claims, activity=activity)
+        claim_srv = claim_server(claims, activity=activity, scenes=scene_cache)
         threading.Thread(target=claim_srv.serve_forever, daemon=True,
                          name="poolhound-claims").start()
         log(f"claims on http://{CLAIM_HOST}:{CLAIM_PORT}/claim, "

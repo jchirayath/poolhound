@@ -277,6 +277,16 @@ def _fixture_data(d):
         w.writerow({"ts": "2026-09-14T10:00:00-0700", "chemical": "acid",
                     "amount": "16", "unit": "floz", "pct": "31.45",
                     "note": "selftest fixture", "by": "local"})
+    # And one purchase, for the same reason: the × on a stock row is the only
+    # control /api/chemical/stock/delete has.
+    from . import stock
+    with open(os.path.join(d, stock.FILE), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=stock.COLS)
+        w.writeheader()
+        w.writerow({"ts": "2026-09-14T09:00:00-0700", "kind": "purchase",
+                    "chemical": "acid", "amount": "1", "unit": "gal",
+                    "pct": "31.45", "note": "selftest fixture", "by": "local",
+                    "id": "0123456789ab"})
 
 
 def _rendered(name):
@@ -441,7 +451,7 @@ def t_the_public_routes_are_not_gated():
 
 
 # ---------------------------------------------------------- the cron roster
-COLLECTORS = {"wg-collect", "leslies", "watch", "render", "backup"}
+COLLECTORS = {"wg-collect", "leslies", "weather", "watch", "render", "backup"}
 
 
 def cron_collectors(path=None):
@@ -831,6 +841,147 @@ def t_the_deployment_pins_the_pools_timezone():
                   if f.endswith(".py")), 1)
 
 
+# ------------------------------------------- is what is deployed CURRENT, as
+#                                             well as working
+def _scratch_git(repo, *args):
+    """git in a scratch repository, deaf to whoever is running the suite.
+
+    No global or system config, because a signing hook or an `init.defaultBranch`
+    on the workstation would make the fixture say something different on CI.
+    """
+    import subprocess
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com",
+               GIT_TERMINAL_PROMPT="0")
+    return subprocess.run(["git", "-C", repo, *args], env=env, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def t_a_deployed_revision_is_graded_against_main():
+    """`--check` says whether the deployed build is CURRENT, not only working.
+
+    MEASURED on 2026-09-28: the server was three commits behind after four days
+    of failed image builds, and bootstrap-server.sh --check was green on every
+    line — including "served public page is the deployed build (<old rev>)",
+    which was true. It compared the image with the pages it rendered, and an old
+    image and its old pages agree perfectly.
+
+    deploy/rev-freshness.sh is the comparison both deploy scripts now call, and
+    neither of them can be run here, so the comparison is driven against a
+    scratch repository with fixture revisions. Every outcome is a case,
+    including the ones a reader will never see because the REVISION is hostile:
+    it is read back off another machine, and a check that hands it to a shell
+    or to git unvalidated is the backup-filename hole over again.
+    """
+    print("\n  deploy — a deployed revision is graded against main and origin")
+    import shutil
+    import subprocess
+    import tempfile
+    from . import config
+    script = os.path.join(config.root(), "deploy", "rev-freshness.sh")
+    if not os.path.exists(script):
+        skipped("a deployed revision graded against main", "deploy/ is not in this tree")
+        return
+    if not shutil.which("git") or not shutil.which("bash"):
+        skipped("a deployed revision graded against main", "no git or bash here")
+        return
+
+    tmp = tempfile.mkdtemp(prefix="ph-freshness-")
+    try:
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        G = lambda *a: _scratch_git(repo, *a)           # noqa: E731
+        G("init", "-q")
+        G("symbolic-ref", "HEAD", "refs/heads/main")
+        shas = []
+        for i in range(14):
+            G("commit", "-q", "--allow-empty", "-m", f"change {i}")
+            shas.append(G("rev-parse", "HEAD"))
+        short = lambda s: s[:9]                         # noqa: E731
+        # origin/main WITHOUT a remote: the fixture is the ref, not a fetch.
+        G("update-ref", "refs/remotes/origin/main", shas[-1])
+        G("branch", "unmerged", shas[5])
+        G("checkout", "-q", "unmerged")
+        G("commit", "-q", "--allow-empty", "-m", "never merged")
+        branch_tip = G("rev-parse", "HEAD")
+        G("checkout", "-q", "main")
+
+        def grade(rev, *flags):
+            r = subprocess.run(["bash", script, *flags, "-C", repo, rev],
+                               capture_output=True, text=True, cwd=tmp,
+                               env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+                                        GIT_CONFIG_NOSYSTEM="1",
+                                        GIT_TERMINAL_PROMPT="0"))
+            return r.returncode, r.stdout + r.stderr
+
+        rc, out = grade(short(shas[-1]), "--no-fetch")
+        check("the tip of main is current", (rc, "is origin/main" in out), (0, True))
+
+        rc, out = grade(short(shas[-4]), "--no-fetch")
+        check("three commits behind fails, and says three",
+              (rc, "3 commit(s) behind origin/main" in out), (1, True))
+        check("and names what is missing", "change 13" in out and "change 11" in out, True)
+
+        # DEPLOYED FROM A CLONE NOBODY PULLED: it matches local main exactly,
+        # which is the comparison update-pi.sh made alone, and origin has moved.
+        G("update-ref", "refs/heads/main", shas[-4])
+        rc, out = grade(short(shas[-4]), "--no-fetch")
+        G("update-ref", "refs/heads/main", shas[-1])
+        check("current with an unpulled checkout is still behind origin/main",
+              (rc, "3 commit(s) behind origin/main" in out,
+               "is this checkout's main" in out), (1, True, True))
+
+        # NEVER TRUNCATE WITHOUT SAYING SO: thirteen missing, ten shown.
+        rc, out = grade(short(shas[0]), "--no-fetch")
+        check("a long list is capped and says how many it left out",
+              (rc, "and 3 more not shown" in out, "change 3\n" in out),
+              (1, True, False))
+
+        rc, out = grade(short(shas[-1]) + "-dirty", "--no-fetch")
+        check("a dirty tree at the tip is still a failure, and a distinct one",
+              (rc, "DIRTY TREE" in out, "BEHIND" in out), (1, True, False))
+
+        rc, out = grade(short(branch_tip), "--no-fetch")
+        check("a commit main does not contain is NOT ON MAIN, not behind",
+              (rc, "NOT ON MAIN" in out, "never merged" in out), (1, True, True))
+
+        rc, out = grade(f"v1.0-3-g{short(shas[-1])}", "--no-fetch")
+        check("git describe's tagged form is read by its hash", rc, 0)
+
+        rc, out = grade("0123456789abcdef", "--no-fetch")
+        check("a well-formed hash this clone lacks is UNKNOWN COMMIT",
+              (rc, "UNKNOWN COMMIT" in out), (1, True))
+
+        # HOSTILE. Nothing may run, and nothing may reach git.
+        canary = os.path.join(tmp, "PWNED")
+        rc, out = grade(f"abc1234;touch {canary}$(touch {canary})", "--no-fetch")
+        check("a REVISION that is not a revision is refused before git sees it",
+              (rc, "UNRECOGNISED" in out, os.path.exists(canary)), (1, True, False))
+        rc, out = grade("--output=" + canary, "--no-fetch")
+        check("including one shaped like a git option",
+              (rc, "UNRECOGNISED" in out, os.path.exists(canary)), (1, True, False))
+
+        # THE PUSH DRIFTS: local main moves on, origin does not, and the server
+        # was deployed from local main. Nothing is wrong with the deployment.
+        G("commit", "-q", "--allow-empty", "-m", "unpushed")
+        rc, out = grade(short(G("rev-parse", "HEAD")), "--no-fetch")
+        check("deployed ahead of origin/main warns and does not fail",
+              (rc, "UNPUSHED" in out, "PUSH HAS DRIFTED" in out), (0, True, True))
+        rc, out = grade(short(shas[-1]), "--no-fetch")
+        check("and behind local main fails even when origin agrees",
+              (rc, "behind this checkout's main" in out), (1, True))
+
+        # A FETCH THAT FAILS IS NOT A PASS against whatever was fetched last.
+        G("remote", "add", "origin", os.path.join(tmp, "no-such-remote"))
+        rc, out = grade(short(G("rev-parse", "HEAD")))
+        check("a failed fetch fails, and says what it compared against instead",
+              (rc, "could not fetch origin" in out, "last fetched" in out),
+              (1, True, True))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --------------------------------------------- the demo pool's clock, which is
 #                                               what the screenshots are of
 def t_the_demo_pool_is_never_dated_in_the_future():
@@ -1069,3 +1220,31 @@ def t_the_rendered_pages_match_the_policy_they_get():
         pol = headers.csp_for_file(p)
         check(f"{name}: the policy it gets names that script",
               s[0] in pol if s else False, True)
+
+
+def t_agent_ok_is_never_read_as_a_boolean():
+    """agent_ok() returns (ok, unavailable), and a tuple is always true.
+
+    MEASURED, 2026-10-11: /api/agent/commands checked `if not self.agent_ok():`
+    and so accepted any caller, with no token or a wrong one, for three and a
+    half weeks after agent_ok() began returning a pair -- the command stream,
+    every issued command and who issued it, readable by anybody who could reach
+    /api/agent/*, which Caddy routes past the sign-in on purpose. Every call
+    must unpack it. Read from the source, comments and strings excluded, so a
+    sentence about the bug is not mistaken for the bug.
+    """
+    print("\n  gates — agent_ok() is unpacked everywhere, never tested for truth")
+    import io, os, re, tokenize
+    from . import config
+    path = os.path.join(config.root(), "poolhound", "server.py")
+    src = open(path, encoding="utf-8").read()
+    code = []
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+            code.append(tok.string)
+    text = " ".join(code)
+    calls = len(re.findall(r"\bagent_ok \( \)", text))
+    unpacked = len(re.findall(r"\w+ , \w+ = self \. agent_ok \( \)", text))
+    check("every call to agent_ok() unpacks its pair",
+          (calls, unpacked), (calls, calls))
+    check("and there is more than one, so the count above means something", calls >= 2, True)

@@ -13,11 +13,11 @@ set -euo pipefail
 # repository rather than a fact in server.env.
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-TOOL="${1:?usage: collect.sh <wg-collect|leslies|watch|render|backup> [args...]}"
+TOOL="${1:?usage: collect.sh <wg-collect|leslies|weather|watch|render|backup> [args...]}"
 shift || true
 
 case "$TOOL" in
-  wg-collect|leslies|watch|render|chem|backup) ;;
+  wg-collect|leslies|weather|watch|render|chem|backup) ;;
   *) echo "refusing to run '$TOOL' — not a known collector" >&2; exit 2 ;;
 esac
 

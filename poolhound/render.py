@@ -30,6 +30,9 @@ COLOUR
 import contextlib, csv, datetime as dt, html, json, math, os, re, sys
 from . import config, style, locking
 from . import access as _access
+from . import schedule_ui as _schedule_ui
+from . import programs_ui as _programs_ui
+from . import scenes_ui as _scenes_ui
 from . import brand as _brand
 from .icons import icon, icon_for
 from . import help as helpdoc
@@ -235,6 +238,58 @@ def ta_is_measured():
         return num(entry.get("value") if isinstance(entry, dict) else entry) is not None
     except Exception:
         return False
+
+def household_prices(cfg=None):
+    """What this household pays per chemical: Settings, else the newest
+    purchase on the stock record. One call, because the upkeep table, the
+    by-month ledger and the assistant each built this dict for themselves and
+    a fourth copy that forgot the purchases would price the same jug two ways
+    on one tab."""
+    from . import stock as _stock
+    cfg = cfg if cfg is not None else CFG
+    return _stock.household_prices(
+        {k: config.chemical_price(k, cfg) for k in config.PRICE_SETTINGS},
+        rows(_stock.FILE), float((cfg.get("pool") or {}).get("acid_pct", 31.45)),
+        when, num)
+
+
+def upkeep_now(now=None):
+    """upkeep.estimate() over the whole record, as the page computes it.
+
+    For the callers that are not build() -- the watchdog, bin/chem --stock,
+    the assistant -- which otherwise each rebuilt the same nine arguments.
+    """
+    from . import upkeep as _upkeep
+    samples, chems, readings = rows("samples.csv"), rows("chemicals.csv"), rows("readings.csv")
+    lab = best_lab((newest(rows("lab.csv")), "WaterGuru lab"),
+                   (newest(rows("leslies.csv")), "Leslie's"),
+                   (newest(rows("manual.csv")), "By hand"))
+    tg = targets(lab, POOL.get("sanitiser"),
+                 (newest(rows("leslies.csv")) or {}).get("sanitizer", ""))
+    return _upkeep.estimate(
+        by_day(samples, chems, readings), samples, chems, readings,
+        config.volume(CFG), current_ta(), float(POOL.get("acid_pct", 31.45)),
+        (tg.get("cya") or (None,) * 3)[1], now or dt.datetime.now(), when, num,
+        prices=household_prices())
+
+
+def stock_now(est=None, now=None):
+    """stock.summary() for this install: on hand, rate, and how long.
+
+    `est` is the upkeep estimate the caller already has, so build() does not
+    work the acid balance out twice per render.
+    """
+    from . import stock as _stock
+    now = now or dt.datetime.now()
+    if est is None:
+        try:
+            est = upkeep_now(now)
+        except Exception:
+            est = None
+    return _stock.summary(rows(_stock.FILE), rows("chemicals.csv"), est, now,
+                          when, num, float(POOL.get("acid_pct", 31.45)),
+                          config.stock_low_weeks(CFG))
+
 
 def num(v):
     """CSV cells are strings and often empty. Anything unparseable is absent,
@@ -452,9 +507,16 @@ MEASURE_NAMES = {"ph": "pH", "free_cl": "Free chlorine", "total_cl": "Total chlo
 # runs every 15 minutes, so two hours is eight consecutive misses. Leslie's only
 # updates when a sample is carried into a store, which is why its threshold is
 # long enough to be effectively informational.
+#
+# Weather is measured on the DATE of its newest day, which is yesterday at
+# best, so a daily pull that is working always looks a day old; four days is
+# two missed runs on top of that. Informational, like Leslie's: a gap closes
+# itself on the next run that works, because the archive is asked for every
+# day that has no archive row — nothing is lost by the silence, only delayed.
 STALE_AFTER = {"sample": dt.timedelta(hours=2),
                "waterguru": dt.timedelta(hours=36),
-               "leslies": dt.timedelta(days=75)}
+               "leslies": dt.timedelta(days=75),
+               "weather": dt.timedelta(days=4)}
 
 # Which collectors need a credential before they can run at all, and the vault
 # service each one asks for. The Pi's agent needs none — it is pushed to, not
@@ -488,11 +550,18 @@ def _source_configured(key):
         return None
 
 
-def collector_health(samples, readings, leslies):
+def collector_health(samples, readings, leslies, weather=None):
     # Is this the deployed host or a workstation? The same test panels.py uses
     # to disable the controller address on Settings.
     from . import vault as _v
     _KV = bool(_v.keyvault_name())
+    # WEATHER IS JUDGED ONLY WHEN IT IS SET UP, and only ever as information.
+    # It is optional context for a fit, not a reading anything acts on, so an
+    # install without coordinates hears nothing about it here (the Collection
+    # card says "not set up"), and one with them is never told to FIX it from
+    # Home: actions() shows warn and missing, and a weather gap is neither.
+    from . import weather as _wx
+    _wx_on = weather is not None and _wx.configured(CFG)
 
     """Say when a source has stopped, because stale data looks exactly like
     current data on a dashboard.
@@ -522,7 +591,10 @@ def collector_health(samples, readings, leslies):
           "Check the pod has battery and signal, and that ~/.waterguru is valid.")),
         ("leslies",   leslies,  "measured", "Leslie's lab",
          "Nothing is broken — this only updates when a sample is taken in."),
-    ):
+    ) + ((("weather", weather, "date", "Weather",
+           "See the Weather card on Collection. A gap fills itself in on the "
+           "next run that works — every day without an archive row is asked "
+           "for again."),) if _wx_on else ()):
         # A ROW DATED IN THE FUTURE CANNOT BE THE LAST THING WE RECEIVED.
         #
         # `last` was max() over every parsed timestamp, so one future-dated row
@@ -569,14 +641,72 @@ def collector_health(samples, readings, leslies):
                                    f"wrong and this is the only place it will "
                                    f"be mentioned."})
             else:
-                out.append({"key": key, "label": label, "state": "missing",
+                out.append({"key": key, "label": label,
+                            "state": "info" if key == "weather" else "missing",
                             "text": "has never returned anything", "fix": fix})
         elif now - last > STALE_AFTER[key]:
             out.append({"key": key, "label": label,
-                        "state": "warn" if key != "leslies" else "info",
+                        "state": "warn" if key not in ("leslies", "weather") else "info",
                         "text": f"last returned data {ago(last.isoformat())}",
                         "fix": fix})
     return out
+
+def weather_by_day(rs=None, today=None):
+    """Daily weather keyed by the pool's calendar date: {"2026-10-08": {...}}.
+
+    THE LOADER THE FIT WILL READ, and here because render.py owns the loaders:
+    a Home row and a coefficient fit must not be able to disagree about how
+    much sun fell on a day. Each value is a float or None — absent is absent,
+    never zero, for the reason num() gives: a missing rain figure averaged in
+    as 0 is a dry day nobody observed. Each day also carries `source` (archive
+    or forecast) and `carried`, the fields filled from a superseded row, so a
+    consumer can weigh a provisional figure as one.
+
+    A day that has not ENDED is not a day. weather.py never writes one, and
+    this refuses one anyway, because a reader is the last place a row can be
+    stopped before something treats half an afternoon's sun as a day's.
+    """
+    from . import weather as _wx
+    rs = rows(_wx.FILE) if rs is None else rs
+    today = today or _wx.today_local()
+    out = {}
+    for r in rs:
+        try:
+            d = dt.date.fromisoformat((r.get("date") or "").strip())
+        except ValueError:
+            continue
+        if d >= today:
+            continue
+        day = {m: num(r.get(m)) for m in _wx.MEASURES}
+        day["source"] = (r.get("source") or "").strip()
+        day["carried"] = (r.get("carried") or "").strip()
+        out[d.isoformat()] = day
+    return out
+
+
+def weather_line(day):
+    """One ended day's weather as the short text a Home day row carries.
+
+    Text, not a fourth colour: the series palette is validated as a set of
+    three. Sun as the day's shortwave energy, because that is the measure the
+    fit separates from heat; rain only when there was any; the air's high and
+    low. "provisional" where the figures are the forecast model's rather than
+    the archive's, so a number that may yet be revised says so.
+    """
+    if not day:
+        return ""
+    bits = []
+    if day.get("sun_mj_m2") is not None:
+        bits.append(f"sun {day['sun_mj_m2']:.0f} MJ/m²")
+    if day.get("precip_in"):
+        bits.append(f"rain {day['precip_in']:.2f} in")
+    hi, lo = day.get("air_max_f"), day.get("air_min_f")
+    if hi is not None and lo is not None:
+        bits.append(f"air {hi:.0f}/{lo:.0f}°")
+    if bits and day.get("source") == "forecast":
+        bits.append("provisional")
+    return " · ".join(bits)
+
 
 def trajectory(readings, samples, measure="free_cl", min_points=4):
     """Where a measure is heading, and when it gets there.
@@ -677,9 +807,226 @@ def trajectory(readings, samples, measure="free_cl", min_points=4):
         out["project"].append((d, eq_adj + (cur - eq_adj) * math.exp(-k_loss * d)))
     return out
 
+# ------------------------------------------------------------- saturation index
+# How far back "the coldest the water has been" looks. A month, because the
+# question is "what does the water do when it is cold", and a pool that was
+# cold in March has had six months of evaporation and top-ups since -- the
+# calcium and alkalinity the index is computed from are TODAY'S, so the
+# temperature it is paired with should be recent enough to be the same water.
+LSI_WINDOW_DAYS = 30
+
+def _water_temps(samples, col):
+    """(when, degF) for every sample in which `col` is the WATER'S temperature.
+
+    THROUGH drop_stale_flow_readings(), on a copy. The panel's temperature probe
+    sits in the plumbing, and with the pump off it reads the pipe in the
+    equipment pad: in the sun at noon, in the night air at 4 a.m. Both
+    collectors already blank it at write time; rows from before that rule are
+    still on disk and history is not rewritten, so the reader applies the same
+    rule rather than trusting that every row on disk was written after it.
+    Computing a winter index from a 4 a.m. pipe would call the pool aggressive
+    on the strength of a reading that was never the pool's.
+    """
+    from . import commands as _c
+    out = []
+    for s in samples:
+        r = _c.drop_stale_flow_readings(dict(s))
+        t, d = num(r.get(col)), when(r.get("ts"))
+        if t is not None and d is not None:
+            out.append((d, t))
+    return out
+
+def _sat_entry(e):
+    """A reconciled reading as the saturation index reports it: value, source, age."""
+    if not e or e.get("value") is None:
+        return None
+    return {"value": e["value"], "source": e.get("source") or "",
+            "measured": e.get("measured") or "", "age": ago(e.get("measured"))}
+
+# What each input is called in a sentence, and which ones the index cannot be
+# computed without. CYA and TDS are not here: their absence is handled, and
+# SAID, rather than refused.
+SAT_REQUIRED = (("ph", "a pH reading"), ("ch", "a calcium reading"),
+                ("ta", "an alkalinity reading"))
+SAT_NAMES = {"ph": "pH", "ch": "calcium", "ta": "alkalinity", "cya": "CYA",
+             "tds": "TDS"}
+
+def saturation(LAB, DAILY, samples, reported=(), shares=None, now=None):
+    """This pool's saturation index -- now, in the spa, and at its coldest.
+
+    PURE: every input is handed in, so the cases in bin/selftest can state a
+    pool and know the answer. current_saturation() is the loader that hands it
+    THIS pool, and is what every consumer calls; Home, Pool chemistry and the
+    assistant must not be able to disagree about whether the water is eating
+    the plaster.
+
+    The arithmetic is chemicals.saturation_index(). What lives here is which
+    reading each term rests on:
+
+      * pH from the daily reconciliation, calcium/alkalinity/CYA/TDS from the
+        labs -- the same best_lab() the tiles read, so the index is computed
+        from the numbers printed beside it.
+      * Temperature from the panel, only where the pump was moving water past
+        the probe (_water_temps). "now" is the newest such reading, with its
+        age; if the pump is off at this moment that is said, because the
+        index then describes the water as it was when it last ran.
+      * The spa at its SETPOINT where the panel reports one -- the temperature
+        the heater is driving it to, which is the one that scales the heater
+        exchanger -- and at its last measured temperature otherwise.
+      * The coldest flowing reading in the last LSI_WINDOW_DAYS, because cold
+        water is when a pool goes aggressive and a pool checked only in the
+        afternoon never sees it.
+
+    THE OLDEST INPUT BOUNDS THE ANSWER. A calcium reading from June and a pH
+    from this morning make an index no fresher than June, so the report names
+    the oldest reading it rests on rather than the newest.
+
+    When pH, calcium or alkalinity is missing there is no index, and `missing`
+    says which -- there is no typical calcium that would make an answer about
+    this water. TDS missing is filled with a stated default (raised to the
+    measured salt on a salt pool, since salt IS dissolved solids); CYA missing
+    is said, because it reads the index HIGH.
+
+    `reported` is ((row, name), ...) for the labs' OWN indices, carried beside
+    the computed one and never averaged with it. A lab computes its index at a
+    temperature it does not report to us; the two differing is information
+    about temperature as much as about either instrument.
+    """
+    from . import chemicals as CH
+    now = now or dt.datetime.now()
+    LAB, DAILY = LAB or {}, DAILY or {}
+    ins = {"ph": _sat_entry(DAILY.get("ph")),
+           "ch": _sat_entry(LAB.get("ch")), "ta": _sat_entry(LAB.get("ta")),
+           "cya": _sat_entry(LAB.get("cya")), "tds": _sat_entry(LAB.get("tds")),
+           "salt": _sat_entry(LAB.get("salt"))}
+    missing = [w for k, w in SAT_REQUIRED if ins[k] is None]
+
+    # TDS: measured, or a stated floor.
+    if ins["tds"]:
+        tds, tds_note = ins["tds"]["value"], ""
+    elif ins["salt"] and ins["salt"]["value"] > CH.TDS_ASSUMED:
+        tds = ins["salt"]["value"]
+        tds_note = (f"No lab has reported TDS, so it is taken as the measured salt, "
+                    f"{tds:.0f} ppm — a floor, since salt is only part of what is "
+                    f"dissolved. More would lower the index slightly.")
+    else:
+        tds = CH.TDS_ASSUMED
+        tds_note = (f"No lab has reported TDS, so {tds:.0f} ppm is assumed. It is "
+                    f"the gentlest term: 4000 ppm would lower the index by about 0.06.")
+    cya_note = ("" if ins["cya"] else
+                "No CYA reading is on file, so all of the alkalinity is counted as "
+                "carbonate. Stabiliser would make the true index LOWER than this.")
+
+    def at(temp_f):
+        if missing or temp_f is None:
+            return None
+        return CH.saturation_index(ins["ph"]["value"], temp_f, ins["ch"]["value"],
+                                   ins["ta"]["value"],
+                                   ins["cya"]["value"] if ins["cya"] else None, tds)
+
+    horizon = now + CLOCK_SKEW
+    temps = sorted(p for p in _water_temps(samples, "pool_temp") if p[0] <= horizon)
+    last_sample = newest([s for s in samples
+                          if when(s.get("ts")) and when(s.get("ts")) <= horizon], "ts")
+    pump_off = str((last_sample or {}).get("pump", "")).strip() == "0"
+
+    cur = None
+    if temps:
+        d, t = temps[-1]
+        cur = {"temp_f": t, "at": d.isoformat(timespec="minutes"),
+               "age": ago(d.isoformat()), "pump_off_now": pump_off, "result": at(t)}
+
+    cold = None
+    since = now - dt.timedelta(days=LSI_WINDOW_DAYS)
+    window = [p for p in temps if p[0] >= since]
+    if window:
+        d, t = min(window, key=lambda p: (p[1], p[0]))
+        cold = {"temp_f": t, "at": d.isoformat(timespec="minutes"),
+                "age": ago(d.isoformat()), "days": LSI_WINDOW_DAYS, "result": at(t)}
+
+    spa = None
+    if shares is not False:
+        sets = [(when(s.get("ts")), num(s.get("spa_set"))) for s in samples]
+        sets = sorted((d, v) for d, v in sets if d and v is not None and d <= horizon)
+        meas = sorted(p for p in _water_temps(samples, "spa_temp") if p[0] <= horizon)
+        if sets:
+            d, t = sets[-1]
+            spa = {"temp_f": t, "kind": "setpoint"}
+        elif meas:
+            d, t = meas[-1]
+            spa = {"temp_f": t, "kind": "measured"}
+        if spa:
+            spa.update({"at": d.isoformat(timespec="minutes"), "age": ago(d.isoformat()),
+                        "shares": shares, "result": at(spa["temp_f"])})
+
+    labs = []
+    for row, name in reported:
+        v = num((row or {}).get("saturation_index"))
+        if v is not None:
+            labs.append({"source": name, "value": v,
+                         "measured": row.get("measured") or "",
+                         "age": ago(row.get("measured"))})
+
+    used = [(k, ins[k]) for k in ("ph", "ch", "ta", "cya", "tds") if ins[k]]
+    oldest = None
+    if used and not missing:
+        # An unparseable date is the OLDEST, not the newest: a reading nobody
+        # can date cannot vouch for anything.
+        k, e = min(used, key=lambda p: when(p[1]["measured"]) or dt.datetime.min)
+        oldest = dict(e, name=SAT_NAMES[k])
+
+    return {"missing": missing, "inputs": ins, "tds": tds,
+            "tds_measured": bool(ins["tds"]), "tds_note": tds_note,
+            "cya_note": cya_note, "oldest": oldest,
+            "now": cur, "spa": spa, "coldest": cold, "reported": labs}
+
+def saturation_sources(sat):
+    """Which reading each term rests on, as one line: the action cards' `src`."""
+    if not sat:
+        return ""
+    bits = []
+    for k in ("ph", "ch", "ta", "cya", "tds"):
+        e = sat["inputs"].get(k)
+        if e:
+            bits.append(f"{SAT_NAMES[k]} {e['source']} {e['age']}".strip())
+    if sat.get("now"):
+        bits.append(f"water {sat['now']['temp_f']:.0f}°F, panel {sat['now']['age']}".strip())
+    return " · ".join(bits)
+
+def current_saturation(samples=None, now=None):
+    """The saturation report for THIS pool, from render's own loaders.
+
+    The one door. Pool chemistry and the assistant call this; build() calls it
+    with the samples it already read. Same reconciliation, same source names,
+    same answer -- a second assembly of "which calcium" is the defect this
+    project keeps finding.
+    """
+    lab, les, man = rows("lab.csv"), rows("leslies.csv"), rows("manual.csv")
+    wg, ph_, bh = newest(lab), newest(les), newest(man)
+    LAB = best_lab((wg, "WaterGuru lab"), (ph_, "Leslie's"), (bh, "By hand"))
+    DAILY = best_lab((newest(rows("readings.csv")), "WaterGuru pod"),
+                     (wg, "WaterGuru lab"), (ph_, "Leslie's"), (bh, "By hand"),
+                     measures=DAILY_MEASURES)
+    return saturation(LAB, DAILY,
+                      rows("samples.csv") if samples is None else samples,
+                      reported=_sat_reported(les, lab, man),
+                      shares=POOL.get("spa_shares_water"), now=now)
+
+def _sat_reported(leslies, lab, manual):
+    """Each source's newest row that CARRIES an index -- not its newest row.
+
+    A Leslie's visit that skipped the index would otherwise hide the one it
+    reported a week earlier, and "the lab has not said" is a different fact
+    from "the lab said, last time".
+    """
+    def has(rs):
+        return newest([r for r in rs if num(r.get("saturation_index")) is not None])
+    return ((has(leslies), "Leslie's"), (has(lab), "WaterGuru lab"),
+            (has(manual), "By hand"))
+
 # ---------------------------------------------------------------------- actions
 def actions(LAB, latest, TG, chems, health, gallons, acid_pct, traj=None,
-            DAILY=None, public=False):
+            DAILY=None, public=False, sat=None):
     """Turn the state of the water into a ranked list of things to do.
 
     A dashboard that only reports leaves the reader to do the chemistry, which
@@ -781,16 +1128,75 @@ def actions(LAB, latest, TG, chems, health, gallons, acid_pct, traj=None,
             bits.append(extra)
         return " · ".join(bits)
 
+    # THE SATURATION INDEX, computed at the water's own temperature. It is the
+    # quantity the calcium item below is really about -- "water short of
+    # calcium takes it from the plaster" is a statement about the index -- so
+    # where it is known it is what decides, and where it is not the cards say
+    # what they always said. sat is current_saturation()'s report.
+    sat = sat or {}
+    s_now = ((sat.get("now") or {}).get("result") or {}).get("lsi")
+    s_temp = (sat.get("now") or {}).get("temp_f")
+    s_cold = ((sat.get("coldest") or {}).get("result") or {}).get("lsi")
+    s_spa = ((sat.get("spa") or {}).get("result") or {}).get("lsi")
+    LO, HI = CH.LSI_BALANCED
+
+    def lsi_at_ph(target_ph):
+        """The index at today's water temperature if pH were `target_ph`."""
+        if s_now is None:
+            return None
+        ins = sat["inputs"]
+        r = CH.saturation_index(target_ph, s_temp, ins["ch"]["value"],
+                                ins["ta"]["value"],
+                                ins["cya"]["value"] if ins.get("cya") else None,
+                                sat.get("tds"))
+        return r["lsi"] if r else None
+
     # 1. Calcium. Low calcium is the only item here that does permanent damage.
+    ca_card = None
     if ch is not None and ch < TG["ch"][0]:
         need = TG["ch"][1] - ch
-        out.append(dict(pri="do", title="Raise calcium hardness",
+        ca_card = dict(pri="do", title="Raise calcium hardness",
             detail=f"{ch:.0f} ppm against a target of {TG['ch'][0]:.0f}–{TG['ch'][2]:.0f}. "
                    f"Water short of calcium takes it from the plaster and the grout, and "
                    f"that damage does not reverse when the number is fixed.",
             dose=dose_line('calcium', need, 'ch', '77% calcium chloride'),
             src=prov("ch"),
-            note="Dissolve in a bucket first — it gets hot. Re-test in a week."))
+            note="Dissolve in a bucket first — it gets hot. Re-test in a week.")
+        if s_now is not None:
+            ca_card["detail"] += (
+                f" Computed at the water's {s_temp:.0f}°F, the saturation index is "
+                f"<b>{s_now:+.2f}</b>"
+                + (" — aggressive, so that is happening now." if s_now < LO else
+                   f", inside the balanced band for the moment — but it is calcium "
+                   f"that holds it there, not pH." ))
+            ca_card["src"] = saturation_sources(sat)
+        out.append(ca_card)
+
+    # 1b. THE INDEX ITSELF IS AGGRESSIVE, with calcium inside its band. Same
+    # consequence as item 1 -- plaster dissolving, permanently -- so it sits
+    # beside it, above anything that reverses when corrected. It carries no
+    # dose of its own: which lever to pull depends on which term is low, and
+    # the cards for pH and alkalinity below already carry those doses.
+    if ca_card is None and s_now is not None and s_now < LO:
+        terms = []
+        if ph is not None and ph < TG["ph"][0]:
+            terms.append(f"pH {ph:.2f} is under its band")
+        if ta is not None and ta < TG["ta"][0]:
+            terms.append(f"alkalinity {ta:.0f} is under its band")
+        if ch is not None and ch < TG["ch"][1]:
+            terms.append(f"calcium {ch:.0f} is below the {TG['ch'][1]:.0f} aimed for")
+        out.append(dict(pri="do", title="The water is aggressive to plaster",
+            detail=(f"The saturation index, computed from these readings at the water's "
+                    f"{s_temp:.0f}°F, is <b>{s_now:+.2f}</b> — below {LO:+.1f}, where "
+                    f"water takes calcium out of plaster and grout rather than "
+                    f"leaving it there. "
+                    + ("It is low because " + "; ".join(terms) + "."
+                       if terms else
+                       "No single reading is out of its band; it is their "
+                       "combination at this temperature.")),
+            dose="", src=saturation_sources(sat),
+            note=("Calcium is the lever that stays put; pH is the one that drifts "
+                  "back. Raise whichever term above is low, and re-test.")))
 
     # 2. pH. Costs sanitiser effectiveness every hour it sits high.
     if ph is not None and ph > TG["ph"][2]:
@@ -802,20 +1208,43 @@ def actions(LAB, latest, TG, chems, health, gallons, acid_pct, traj=None,
         else:
             floz = abs(floz)
             amt = f"{floz/32:.1f} qt" if floz >= 32 else f"{floz:.0f} fl oz"
+        # WHERE THE ACID LANDS THE INDEX. Lowering pH lowers the saturation
+        # index one-for-one, and on a pool whose calcium is only just holding
+        # it up the dose this card prescribes is the one that tips the water
+        # aggressive. The dose does not change -- chlorine still needs it --
+        # but the reader is told what it costs, and what makes room for it.
+        lands = lsi_at_ph(TG["ph"][1])
+        cost = ""
+        if lands is not None and lands < LO:
+            cost = (f" At {TG['ph'][1]:.1f} and the water's {s_temp:.0f}°F the saturation "
+                    f"index would be <b>{lands:+.2f}</b> — aggressive to plaster — so "
+                    f"this pool cannot hold that pH without more calcium to make room.")
         out.append(dict(pri="do", title="Bring pH down",
-            src=prov_pod(),
+            src=prov_pod() if not cost else prov_pod() + " · " + saturation_sources(sat),
             detail=f"{ph:.2f} against a target of {TG['ph'][1]:.1f}. At this pH only about "
                    f"{hocl_fraction(ph):.0f}% of the free chlorine is in the active form, "
                    f"against {hocl_fraction(7.4):.0f}% at 7.4 — the same chlorine, mostly "
-                   f"switched off.",
+                   f"switched off." + cost,
             dose=f"{amt} of {acid_pct:g}% muriatic acid" if amt else "",
             note="Pour slowly over a return with the pump running, never into the skimmer."
                  + ("" if public else " Log it on the Chemicals tab.")))
     elif ph is not None and ph < TG["ph"][0]:
+        # "Makes the water aggressive" was asserted with nothing consulted. It
+        # is a claim about the saturation index, and where the index is known
+        # the card says what it actually is -- including when the calcium is
+        # holding it up and the claim would have been false.
+        if s_now is None:
+            low_says = "Low pH with this pool's calcium makes the water aggressive to plaster."
+        elif s_now < LO:
+            low_says = (f"At the water's {s_temp:.0f}°F that puts the saturation index at "
+                        f"<b>{s_now:+.2f}</b> — aggressive to plaster.")
+        else:
+            low_says = (f"At the water's {s_temp:.0f}°F the saturation index is still "
+                        f"{s_now:+.2f}, inside the balanced band — the calcium is "
+                        f"holding it up, so the plaster is not paying for this yet.")
         out.append(dict(pri="watch", title="pH is below target",
-            src=prov_pod(),
-            detail=f"{ph:.2f} against {TG['ph'][0]:.1f}–{TG['ph'][2]:.1f}. Low pH with this "
-                   f"pool's calcium makes the water aggressive to plaster.",
+            src=prov_pod() if s_now is None else saturation_sources(sat),
+            detail=f"{ph:.2f} against {TG['ph'][0]:.1f}–{TG['ph'][2]:.1f}. " + low_says,
             dose="", note="Aerate rather than dose — the spillover raises pH on its own."))
 
     # 3. Free chlorine, judged against CYA rather than a fixed band.
@@ -880,6 +1309,43 @@ def actions(LAB, latest, TG, chems, health, gallons, acid_pct, traj=None,
                    f"range the cell throttles back or stops.",
             dose=dose_line('salt', TG['salt'][1] - salt, 'salt', 'pool salt'),
             note="Brush it off the floor and run the pump a day before re-testing."))
+
+    # 4b. The index somewhere other than today's pool. Watch items: nothing is
+    # being damaged at this moment, and each names the temperature it is
+    # about, because the same water is balanced at one and not at another.
+    if s_now is not None and s_now > HI:
+        out.append(dict(pri="watch", title="The water is inclined to scale",
+            detail=(f"The saturation index at the water's {s_temp:.0f}°F is "
+                    f"<b>{s_now:+.2f}</b>, above {HI:+.1f}. Scale forms first on the "
+                    f"salt cell plates, where it cuts chlorine output, and on the "
+                    f"hottest surface the water touches."),
+            dose="", src=saturation_sources(sat),
+            note="pH is the lever: nothing but replacing water takes calcium out."))
+    elif (s_spa is not None and s_spa > HI and (s_now is None or s_now <= HI)):
+        sp = sat["spa"]
+        out.append(dict(pri="watch", title="The heated spa is inclined to scale",
+            detail=(f"The same water at the spa's {sp['temp_f']:.0f}°F "
+                    f"{'setpoint' if sp['kind'] == 'setpoint' else 'reading'} gives a "
+                    f"saturation index of <b>{s_spa:+.2f}</b>, above {HI:+.1f}. Warm "
+                    f"water holds less calcium carbonate, and it comes out of solution "
+                    f"on the heater's exchanger first — the most expensive surface "
+                    f"in the system to descale."
+                    + ("" if sp.get("shares") is True else
+                       " This assumes the spa shares the pool's water; if it is "
+                       "filled separately, these readings are not its readings.")),
+            dose="", src=saturation_sources(sat),
+            note="Holding pH at the low end of its band is what buys the spa room."))
+    if s_cold is not None and s_now is not None and s_cold < LO <= s_now:
+        cd = sat["coldest"]
+        out.append(dict(pri="watch", title="Cold water turns this pool aggressive",
+            detail=(f"Balanced at the water's {s_temp:.0f}°F, but at {cd['temp_f']:.0f}°F — "
+                    f"the coldest the water has been in the last {cd['days']} days, "
+                    f"{cd['age']} — the same readings give <b>{s_cold:+.2f}</b>. "
+                    f"Colder water holds more calcium carbonate before it is "
+                    f"saturated, so it goes looking for some in the plaster; winter is "
+                    f"when this happens, and colder nights will push it further."),
+            dose="", src=saturation_sources(sat),
+            note="Raise calcium before the cold rather than pH during it."))
 
     # 5. WHAT THE POD IS COMPLAINING ABOUT, IN THIS PAGE'S OWN VOICE.
     #
@@ -992,6 +1458,25 @@ def actions(LAB, latest, TG, chems, health, gallons, acid_pct, traj=None,
                            "Log one on the Chemicals tab, or with bin/chem.")))
     return out
 
+def stock_actions(summary):
+    """Home's items for a shelf running low, LAST and as "keep an eye on".
+
+    Last because Home is ordered by consequence and a jug to buy is the least
+    consequential thing on it: nothing is wrong with the water. At
+    stock.HOME_PRI, which says why. And with no dose, so the queue above does
+    not take it for a water change and tell it to wait.
+    """
+    from . import stock as _stock
+    out = []
+    for e in _stock.needs_buying(summary or []):
+        title, detail = _stock.action_text(e)
+        out.append(dict(pri=_stock.HOME_PRI, title=title, detail=html.escape(detail),
+                        dose="", src="",
+                        note=("Record what you buy, or a count of what is on "
+                              "the shelf, on the Chemicals tab.")))
+    return out
+
+
 def hocl_fraction(ph):
     """Percentage of free chlorine present as hypochlorous acid — the form that
     actually sanitises. The reason pH matters more than the chlorine number."""
@@ -1094,6 +1579,25 @@ def verdict(v, band, measure=None):
 # ------------------------------------------------------------------ day rollup
 SEG_MAX = dt.timedelta(minutes=20)   # a sample covers at most this much time
 
+def sample_spans(samples):
+    """(when, span, sample) for every sample, oldest first: the time it stands for.
+
+    THE ONE PLACE A SAMPLE BECOMES TIME. by_day() folds these into calendar
+    days and fit.py folds them into the stretch between two readings; if each
+    worked out spans for itself, the day strip and the coefficient fit could
+    disagree about how long the pump ran — which is the one number both of
+    them rest on. A sample stands for the quarter-hour after it, capped at
+    SEG_MAX, so an outage is a gap and not hours of fictional pumping.
+    """
+    S = sorted([(when(s.get("ts")), s) for s in samples if when(s.get("ts"))],
+               key=lambda p: p[0])
+    for i, (t, s) in enumerate(S):
+        nxt = S[i + 1][0] if i + 1 < len(S) else None
+        span = min(nxt - t, SEG_MAX) if nxt else SEG_MAX
+        if span.total_seconds() <= 0:
+            continue
+        yield t, span, s
+
 def by_day(samples, chems, readings):
     """Fold the 15-minute sample stream into one record per calendar day.
 
@@ -1115,12 +1619,7 @@ def by_day(samples, chems, readings):
             "chem": [], "reading": None,
         })
 
-    S = sorted([s for s in samples if when(s.get("ts"))], key=lambda s: when(s["ts"]))
-    for i, s in enumerate(S):
-        t = when(s["ts"])
-        nxt = when(S[i + 1]["ts"]) if i + 1 < len(S) else None
-        span = min(nxt - t, SEG_MAX) if nxt else SEG_MAX
-        if span.total_seconds() <= 0: continue
+    for t, span, s in sample_spans(samples):
         d = slot(t.date().isoformat())
 
         for key, col in (("pump", "pump"), ("spa", "spa"), ("sheer", "sheer"),
@@ -2855,6 +3354,14 @@ PRIVATE_MUST_SURVIVE_COUNTS = (
 # build refuses if the marker is not found exactly once. See the strip loop.
 PUBLIC_MIN_BYTES = 300_000
 
+# The marker on the one card that carries this household's computed saturation
+# index. A pattern for the public build's leak list; see build().
+HOUSEHOLD_LSI_MARK = r'data-lsi="household"'
+# And the card that carries this household's fitted coefficients. Home is cut
+# from the public build whole, and the fit is not even computed for it; this is
+# what says so if either stops being true.
+HOUSEHOLD_FIT_MARK = r'data-fit="household"'
+
 def build(public=False, out_name=None):
     """Render the page, one render at a time. See _build() for what it renders.
 
@@ -2933,6 +3440,11 @@ def _build(public=False, out_name=None):
     leslies  = rows("leslies.csv")      # Leslie's — bench photometer
     manual   = rows("manual.csv")       # entered by hand: a kit, strips, another store
     chems    = rows("chemicals.csv")
+    # Open-Meteo, per ended day. Optional: absent, every day row simply carries
+    # no weather text. Rendered only into Home, which is private.
+    from . import weather as _wx
+    weather_rows = rows(_wx.FILE)
+    WX = weather_by_day(weather_rows)
 
     # Newest MEASURED, not last appended. These were [-1], which is file order —
     # so any out-of-order append reordered reality, including the
@@ -3153,6 +3665,13 @@ def _build(public=False, out_name=None):
             f'water {d["temp"]:.0f}\u00b0' if d["temp"] is not None else "",
             f'spa {d["spa_temp"]:.0f}\u00b0' if d["spa_temp"] is not None else "",
             f'salt {d["salt"]:.0f}' if d["salt"] is not None else "") if x)}</span>
+        <!-- The day's weather, beside what the equipment did that day: the
+             causes the fit cannot see from inside the pool. Text only, and
+             absent rather than "—" on a day with none, so an install without
+             [weather] reads exactly as it did. -->
+        {(f'<span class="wx" title="weather that day, Open-Meteo">'
+          f'{html.escape(weather_line(WX.get(d["date"])))}</span>')
+         if weather_line(WX.get(d["date"])) else ""}
       </div>
       <div class="dchips">{"".join(chips)}</div>
     </div>''')
@@ -3180,24 +3699,76 @@ def _build(public=False, out_name=None):
                 f'is as far back as the {MAX_RENDER:,} rendered rows reach. '
                 f'Earlier rows are in the CSV rather than in this page, so those '
                 f'days are shown here but do not open.')
+        # CREDITED WHERE IT IS SHOWN. Open-Meteo's data is CC BY 4.0, which
+        # asks for attribution beside the use, and the reader is owed the two
+        # facts that qualify every figure: it is for a rounded location, not
+        # this garden, and "provisional" is a model's figure the archive has
+        # not yet replaced.
+        if any(d["date"] in WX for d in shown_days):
+            from . import weather as _wx
+            say.append(
+                f'Weather is Open-Meteo’s (CC BY 4.0) for the pool’s '
+                f'location rounded to {_wx.ROUND_DEG:g}°: sun is the '
+                f'day’s solar energy, air is the high and low. '
+                f'“Provisional” marks a forecast model’s figure '
+                f'that the archive has not yet replaced.')
         if say:
             rowhtml.append(f'<p class="dt-note">{" ".join(say)}</p>')
 
     # -- what to do next ------------------------------------------------------
-    HEALTH = collector_health(samples, readings, leslies)
+    HEALTH = collector_health(samples, readings, leslies, weather_rows)
     TRAJ = trajectory(readings, samples, "free_cl")
+    # Not even computed for the public build. Home is cut out of that page
+    # whole, but "it is in a panel that gets removed" is the hidden-not-absent
+    # argument this project refuses everywhere else: the computed index is a
+    # fact about this household's water, so it never enters that assembly.
+    SAT = None if public else current_saturation(samples)
     ACTS = actions(LAB, latest, TG, chems, HEALTH,
                    config.volume(CFG),
                    float(POOL.get("acid_pct", 31.45)), traj=TRAJ, DAILY=DAILY,
-                   public=public)
+                   public=public, sat=SAT)
+    # Equipment health: the filter, the cell, the heater. Private -- it is this
+    # household's equipment, and its one control writes. All of it lives in
+    # equipment.py; these lines only hand it what the loaders already read.
+    from . import equipment as _equipment, audit as _audit, fit as _cellfit
+    EQUIP = None if public else _equipment.assess(
+        samples, readings, chems, rows(_equipment.FILE), _audit.load(CFG),
+        dt.datetime.now(), when, num,
+        # fit.py's k_prod, window by window: the same estimator as "What
+        # moves this pool", so the cell's yield and that table's "chlorine
+        # the salt cell makes" cannot disagree about one coefficient.
+        fit=lambda r, s: _cellfit.cell_rate(
+            r, s, chems,
+            [(lab, "WaterGuru lab"), (leslies, "Leslie's"), (manual, "By hand")],
+            WX, config.volume(CFG)),
+        salt_low=(TG.get("salt") or (None,))[0], cfg=CFG, weather=WX)
+    ACTS += _equipment.actions(EQUIP)
+    # Anomalies: what is wrong THIS hour -- a heater with no water through it,
+    # a spa too hot, a freezing night with the pump stopped. Private, like
+    # equipment health. watch.anomaly_inputs() is what bin/watch hands the
+    # same detector, so the alert and this list cannot disagree; long_runs is
+    # equipment's answer, handed through rather than computed twice.
+    from . import anomaly as _anomaly, watch as _watch
+    ANOM = None if public else _anomaly.detect(
+        samples, dt.datetime.now(), when, num, cfg=CFG,
+        long=(EQUIP or {}).get("long"),
+        **_watch.anomaly_inputs(CFG, samples))
+    _an_acts = _anomaly.actions(ANOM)
+    # An open serious anomaly goes FIRST: a heater firing with no water
+    # through it outranks any dose, and outranks a volume nobody has set.
+    ACTS = ([a for a in _an_acts if a["pri"] == "fix"] + ACTS
+            + [a for a in _an_acts if a["pri"] != "fix"])
     # What keeping it balanced takes, by the week and the year. Private: it is
     # this household's consumption, read off this household's record.
     from . import upkeep as _upkeep
     UPKEEP = None if public else _upkeep.estimate(
         days, samples, chems, readings, config.volume(CFG), current_ta(),
         float(POOL.get("acid_pct", 31.45)), (TG.get("cya") or (None,) * 3)[1],
-        dt.datetime.now(), when, num,
-        prices={k: config.chemical_price(k, CFG) for k in config.PRICE_SETTINGS})
+        dt.datetime.now(), when, num, prices=household_prices())
+    # What is on the shelf, and how long it lasts at that rate. Private for the
+    # reason the upkeep is: it is this household's cupboard.
+    STOCK = None if public else stock_now(UPKEEP)
+    ACTS += stock_actions(STOCK)
     PRI = {"do": ("Do this", "act-do"), "fix": ("Fix", "act-fix"),
            "watch": ("Keep an eye on", "act-watch")}
     # The badge counts only what is actionable now. Counting "keep an eye on"
@@ -3320,15 +3891,44 @@ def _build(public=False, out_name=None):
     n_days = len(days)
     paired = [d for d in days if d["reading"] and sum(d["hours"].values()) > 0]
     n_pair = len(paired)
-    ready = n_pair >= 30
-    model = (f'<p><b>{n_read}</b> chemistry reading{"s" if n_read != 1 else ""} against '
-             f'<b>{n_days}</b> day{"s" if n_days != 1 else ""} of equipment runtime, '
-             f'which pair up on <b>{n_pair}</b> day{"s" if n_pair != 1 else ""}. '
-             + ("Enough to fit the coefficients — see THEORY.md."
-                if ready else
-                f"Fitting the pH and FC coefficients needs about 30 paired days; "
-                f"{30 - n_pair} more to go. Until then this page is a "
-                f"record, not a model.") + "</p>")
+    # THE COUNTDOWN IS GONE BECAUSE THE FIT EXISTS. This sentence used to end
+    # "needs about 30 paired days; N more to go. Until then this page is a
+    # record, not a model" -- a promise about a fit nothing performed. The fit
+    # now says for itself, per coefficient, how many days it used and what
+    # would settle the rest, so a second, rounder threshold here would be a
+    # second answer to the same question.
+    model = (f'<p class="sub" style="margin:0 0 12px"><b>{n_read}</b> chemistry '
+             f'reading{"s" if n_read != 1 else ""} against <b>{n_days}</b> '
+             f'day{"s" if n_days != 1 else ""} of equipment runtime, which pair up '
+             f'on <b>{n_pair}</b> day{"s" if n_pair != 1 else ""}.</p>')
+
+    # -- what moves this pool --------------------------------------------------
+    # THEORY.md's coefficient table, fitted. Private for the reason the
+    # saturation index is: every figure is this household's water. Not even
+    # computed for the public build -- "it is in a panel that gets cut" is the
+    # hidden-not-absent argument, and HOUSEHOLD_FIT_MARK on the leak list is
+    # what says so if that ever stops being true.
+    #
+    # A FIT THAT RAISES DOES NOT TAKE THE PAGE WITH IT. It reads every file the
+    # household has and runs a regression over them, and a render that dies
+    # takes Pool control with it. The failure is printed where the fit would
+    # have been, by name, so it is not quiet either.
+    FIT_HTML = ""
+    if not public:
+        from . import fit as _fit
+        try:
+            FIT = _fit.analyse(
+                samples, readings, manual, chems,
+                [(lab, "WaterGuru lab"), (leslies, "Leslie's"), (manual, "By hand")],
+                WX, config.volume(CFG), float(POOL.get("acid_pct", 31.45)))
+            FIT_HTML = _fit.block(FIT)
+        except Exception as e:                       # noqa: BLE001
+            print(f"  the coefficient fit failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            FIT_HTML = (f'<div class="card" data-fit="household"><p class="empty">'
+                        f'The fit could not run on this record '
+                        f'({html.escape(type(e).__name__)}). Everything else on '
+                        f'this page is unaffected.</p></div>')
 
     # -- raw tables (the non-colour route to every number on this page) --------
     # Only the authenticated build carries download links. The route is gated
@@ -3432,7 +4032,11 @@ def _build(public=False, out_name=None):
         return nav + (ROLE_NOTE if role_note else "") + body
 
     page = fill(TEMPLATE,
-        css=style.CSS, extra_css=chemistry.EXTRA_CSS,
+        css=style.CSS, extra_css=(chemistry.EXTRA_CSS + _equipment.EXTRA_CSS
+                                  + _anomaly.EXTRA_CSS),
+        anomalies=_anomaly.section(ANOM, CFG, has_samples=bool(samples)),
+        equipment=_equipment.section(EQUIP, name_svg),
+        equipment_js=_equipment.JS,
         chemistry_panel=wrap(chemistry.panel(public=public), "chem"),
         control_panel=wrap(panels.control_panel(), "ctl", role_note=True),
         help_panel=wrap(helpdoc.help_panel(public=public), "help"),
@@ -3516,7 +4120,7 @@ def _build(public=False, out_name=None):
         icon_policies=icon("shield", 15),
         policies_panel=wrap(_policies.panel(public=public), "policies"),
         policy_links=_policies.footer_links(),
-        chemicals_panel=wrap(panels.chemicals_panel(UPKEEP), "dose", role_note=True),
+        chemicals_panel=wrap(panels.chemicals_panel(UPKEEP, STOCK), "dose", role_note=True),
         collection_panel=wrap(_collection.panel(public=public), "col"),
         info_panel=wrap(_info.panel(public=public), "info"),
         ask_panel=wrap(_assistant.panel(public=public), "ask"),
@@ -3544,7 +4148,7 @@ def _build(public=False, out_name=None):
         alert_html=alert_html, tiles="".join(tiles),
         fc_chart=fc_chart, ph_chart=ph_chart,
         fc_state=fc_state, ph_state=ph_state,
-        rows="".join(rowhtml), model=model, tables=tables,
+        rows="".join(rowhtml), model=model, fit=FIT_HTML, tables=tables,
         power=power_block(
             energy(days, samples, rated=config.pump_watts(CFG),
                    cost=config.kwh_cost(CFG)),
@@ -3572,6 +4176,9 @@ def _build(public=False, out_name=None):
         role_levels=json.dumps(list(_access.LEVELS)),
         role_operate=json.dumps(_access.ui_selector("operate")),
         role_admin=json.dumps(_access.ui_selector("admin")),
+        schedule_js=_schedule_ui.SCRIPT,
+        programs_js=_programs_ui.script(),
+        scenes_js=_scenes_ui.SCRIPT,
     )
     # Home's sections live in the template itself, so its nav is inserted after
     # the page is assembled rather than around a pre-built string.
@@ -3733,9 +4340,15 @@ def _build(public=False, out_name=None):
         from . import vault as _vault
         _legacy = [re.escape(str(spec["legacy"]))
                    for spec in _vault.SERVICES.values() if spec.get("legacy")]
+        # data-lsi="household" is chemistry.saturation_household()'s marker:
+        # this pool's computed saturation index, at this household's water and
+        # spa temperatures. Pool chemistry is public and that card sits inside
+        # it, so nothing about the tab excision removes it -- the card is not
+        # rendered for the public build at all, and this is what says so if
+        # that ever stops being true.
         patterns = [r"192\.168\.\d+\.\d+", r"/Users/", r"smtp_credentials",
                     r"agent\.token", r"ctl-circuits", r"ctl-hist",
-                    r"priv:start"] + _legacy + _routes
+                    r"priv:start", HOUSEHOLD_LSI_MARK, HOUSEHOLD_FIT_MARK] + _legacy + _routes
         patterns += [re.escape(str(s)) for s in
                      (CFG.get("site", {}).get("never_publish") or [])]
         # And the other direction. The excision above removes markup and script
@@ -4124,9 +4737,20 @@ TEMPLATE = """<!doctype html>
   @@power@@
 </section>
 
-<section>
-  <h2>Model readiness</h2>
-  <div class="card sub" style="margin:0">@@model@@</div>
+@@anomalies@@
+
+@@equipment@@
+
+<section id="what-moves">
+  <h2>What moves this pool</h2>
+  <p class="sub">The coefficients THEORY.md says this record should recover:
+  how much chlorine the cell makes and the sun takes, how far each hour of
+  pump, sheer descent and spa pushes pH, and what a fluid ounce of acid does
+  here. Each is fitted from this pool&rsquo;s own days, and each says whether
+  the record has actually pinned it down &mdash; two things that always move
+  together are reported together, not split by arithmetic.</p>
+  @@model@@
+  @@fit@@
 </section>
 
 <details>
@@ -4706,6 +5330,10 @@ document.addEventListener('click', function (e) {
     })
     .catch(function (err) { b.disabled = false; alert('Could not remove it: ' + err.message); });
 });
+/* priv:end */
+
+/* priv:start */   /* mark a cleaning done -- equipment.JS */
+@@equipment_js@@
 /* priv:end */
 
 /* priv:start */   /* doses, by month */
@@ -5659,10 +6287,15 @@ document.addEventListener('click', function (e) {
            to be overwritten by setpoint progress, so for twenty minutes the one
            card that could answer "is the most expensive thing in the pool on"
            answered a different question instead. */
-        var st = states[dev];
-        if (st !== undefined) {
-          row.dataset.state = st;
-          set(row.querySelector('.st'), st, st === 'unknown' ? 'no reading' : st);
+        /* And now that a heater has a switch of its own, its badge follows a
+           press the way a switch's does: "on, waiting" until the panel says so,
+           rather than the last report's "off" a second after "Spa heater on". */
+        var rs = stateOf(dev);
+        if (rs) {
+          row.dataset.state = rs[0];
+          set(row.querySelector('.st'), rs[0],
+              rs[0] === 'pending' ? rs[1] + ', waiting'
+            : rs[0] === 'unknown' ? 'no reading' : rs[1]);
         }
         /* "now 88" was baked into the file by whichever process rendered it and
            never refreshed, so an open tab showed an arbitrarily old setpoint --
@@ -6004,7 +6637,9 @@ document.addEventListener('click', function (e) {
     document.querySelectorAll('.ctl[data-device]').forEach(function (row) {
       var dev = row.dataset.device;
       if (pending[dev] === undefined) return;
-      if (row.classList.contains('set')) {
+      /* A heater card is both: "on"/"off" is its switch, a number its setpoint. */
+      var isState = pending[dev] === 'on' || pending[dev] === 'off';
+      if (row.classList.contains('set') && !isState) {
         if (markedSet[dev] === undefined) { markedSet[dev] = String(pending[dev]); found = true; }
       } else if (marked[dev] === undefined) {
         marked[dev] = String(pending[dev]); found = true;
@@ -6505,6 +7140,135 @@ function wroteOk(el, j, done) {
       });
   });
 })();
+/* priv:end */
+
+/* priv:start */   /* stock form */
+/* ------------------------------------------------------------- stock form ---
+   A purchase or a count of what is on the shelf. The units come from the
+   catalogue chemicals.py exports, so a solid is never OFFERED a volume -- and
+   the server refuses one anyway, through the validator bin/chem uses. Edit
+   loads a row into this same form, as a dose's Edit does, so there is one set
+   of inputs and one set of checks. Nothing here computes a stock figure:
+   that is stock.py's, and the page is re-rendered after every write. */
+(function () {
+  var form = document.getElementById('stock-form');
+  if (!form) return;
+  var CAT = JSON.parse(document.getElementById('catalogue').textContent);
+  var kind = document.getElementById('stock-kind'),
+      sel = document.getElementById('stock-chem'),
+      unit = document.getElementById('stock-unit'),
+      pct = document.getElementById('stock-pct'),
+      paidF = document.getElementById('stock-paid-f'),
+      paid = document.getElementById('stock-paid'),
+      when = document.getElementById('stock-ts'),
+      msg = document.getElementById('stock-msg'),
+      sub = form.querySelector('button[type=submit]');
+  var fresh = when.value;
+
+  function fillUnits(keepPct) {
+    var c = CAT.chemicals[sel.value];
+    if (!c) return;
+    var keep = unit.value;
+    /* createElement, not an HTML string: no markup is built from data here. */
+    unit.textContent = '';
+    c.units.forEach(function (u) {
+      var o = document.createElement('option');
+      o.value = u; o.textContent = u; unit.appendChild(o);
+    });
+    /* Bought by the jug or the bag, so the default is the unit it is sold by. */
+    unit.value = c.units.indexOf(keep) >= 0 ? keep : (c.phase === 'liquid' ? 'gal' : 'lb');
+    if (!keepPct) pct.value = c.default_pct;
+  }
+  /* A count has no price. The box is hidden rather than left to be typed
+     into and silently dropped by the server. */
+  function fillKind() {
+    var buying = kind.value === 'purchase';
+    paidF.hidden = !buying;
+    if (!buying) paid.value = '';
+  }
+  sel.addEventListener('change', function () { fillUnits(false); });
+  kind.addEventListener('change', fillKind);
+  fillUnits(false); fillKind();
+
+  function stopEditing() {
+    delete form.dataset.editingId;
+    sub.textContent = 'Record it';
+    when.value = fresh;
+  }
+
+  document.querySelectorAll('.stock-edit').forEach(function (b) {
+    b.addEventListener('click', function () {
+      kind.value = b.dataset.kind || 'purchase';
+      sel.value = b.dataset.chemical || '';
+      unit.value = '';
+      fillUnits(true);
+      unit.value = b.dataset.unit || unit.value;
+      form.querySelector('[name=amount]').value = b.dataset.amount || '';
+      pct.value = b.dataset.pct || '';
+      paid.value = b.dataset.paid || '';
+      form.querySelector('[name=note]').value = b.dataset.note || '';
+      when.value = (b.dataset.ts || '').slice(0, 16);
+      fillKind();
+      form.dataset.editingId = b.dataset.id || '';
+      form.dataset.editingTs = (b.dataset.ts || '').slice(0, 16);
+      sub.textContent = 'Save the change';
+      msg.textContent = 'editing the entry from ' + (b.dataset.ts || '').slice(0, 16).replace('T', ' ') +
+                        ' — press Escape to record a new one instead';
+      msg.className = 'fmsg';
+      form.scrollIntoView({behavior: 'smooth', block: 'center'});
+      form.querySelector('[name=amount]').focus();
+    });
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || !form.dataset.editingId) return;
+    stopEditing();
+    msg.textContent = ''; msg.className = 'fmsg';
+  });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!API) return;
+    var data = {};
+    new FormData(form).forEach(function (v, k) { data[k] = v; });
+    var editing = form.dataset.editingId;
+    if (editing) {
+      data.id = editing;
+      /* The time is sent as new_ts only when it was changed, so an amount-only
+         edit cannot move the row by the seconds the form does not show. */
+      if (data.ts !== form.dataset.editingTs) { data.new_ts = data.ts; }
+      delete data.ts;
+    }
+    msg.textContent = 'saving…'; msg.className = 'fmsg';
+    fetch(editing ? '/api/chemical/stock/edit' : '/api/chemical/stock',
+          {method: 'POST', headers: postHeaders(), body: JSON.stringify(data)})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error(res.j.error || 'refused');
+        if (wroteOk(msg, res.j, editing ? 'changed' : 'recorded')) {
+          setTimeout(function () { location.reload(); }, 600);
+        }
+      })
+      .catch(function (err) {
+        msg.textContent = String(err.message || err); msg.className = 'fmsg bad';
+      });
+  });
+})();
+
+document.addEventListener('click', function (e) {
+  var b = e.target.closest('[data-stock-del]');
+  if (!b || !API) return;
+  if (!confirm('Remove this purchase or count from the record? What is on hand will be worked out without it.')) return;
+  b.disabled = true;
+  fetch('/api/chemical/stock/delete', {method: 'POST', headers: postHeaders(),
+                                       body: JSON.stringify({id: b.dataset.stockDel})})
+    .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+    .then(function (res) {
+      if (!res.ok) throw new Error(res.j.error || 'refused');
+      location.reload();
+    })
+    .catch(function (err) { b.disabled = false; alert('Could not remove it: ' + err.message); });
+});
 /* priv:end */
 
 
@@ -7816,11 +8580,18 @@ var Detect = (function () {
 
     if (kind === 'on') {
       if (dev === 'Spa') {
-        return 'Spa mode diverts flow and runs the cell harder, and on this panel ' +
-               'it is what the spa heater follows.\\n\\nSwitch the spa on?';
+        return 'Spa mode diverts flow and runs the cell harder.\\n\\nSwitch the spa on?';
       }
       return null;          /* switching things on is cheap and reversible */
     }
+
+    /* A heater's own switch: the burner, not its temperature. */
+    if (kind === 'heat-on') {
+      var at = row.getAttribute('data-current');
+      return 'Gas heating is the most expensive thing this pool does.\\n\\nSwitch the ' +
+             label.toLowerCase() + ' on' + (at ? ', to heat to ' + at + '\\u00B0F' : '') + '?';
+    }
+    if (kind === 'heat-off') return null;   /* stopping the gas costs nothing */
 
     /* kind === 'set' */
     if (dev === 'Pool_Heater' || dev === 'Spa_Heater') {
@@ -7867,6 +8638,14 @@ var Detect = (function () {
     });
   };
 
+  /* "Then off after", where the card offers it. Only an ON carries one; the
+     server refuses it on anything else, and schedule_ui.py owns the control. */
+  function offAfter(body, row) {
+    var sel = row.querySelector('.ctl-offafter');
+    if (sel && sel.value && !(body.action === 'set' && !body.value)) body.off_after_h = Number(sel.value);
+    return body;
+  }
+
   function send(body, el, label) {
     if (!API) { say(el, 'Needs the write API.', 'bad'); return; }
     say(el, 'sending…');
@@ -7881,7 +8660,11 @@ var Detect = (function () {
              page could not take back. */
           say(el, j.what + ' — sent, waiting for the panel', '');
         } else if (j.result && j.result.ok) {
-          say(el, j.what + ' — accepted, waiting for the panel to report it', 'ok');
+          say(el, j.what + ' — accepted, waiting for the panel to report it'
+                  + (j.off_after_h ? '; off again in ' + j.off_after_h + ' h' : '')
+                  + (j.schedule_error ? '. ' + j.schedule_error : ''),
+              j.schedule_error ? 'bad' : 'ok');
+          if (window.reloadSchedules) window.reloadSchedules();
           /* Tagged so the pending poll can come back and finish this sentence.
              Without the tag the line is a one-shot written at send time, which
              is exactly how it came to outlive the thing it described. */
@@ -7926,7 +8709,18 @@ var Detect = (function () {
         var on = b.dataset.v === '1';
         var q = confirmFor(dev, on ? 'on' : 'off', on ? 1 : 0, row);
         if (q && !confirm(q)) return;
-        send({action: 'set', device: dev, value: on ? 1 : 0}, el, dev);
+        send(offAfter({action: 'set', device: dev, value: on ? 1 : 0}, row), el, dev);
+      });
+    });
+
+    /* The heater's own switch, beside its temperature: `heat`, not `set` --
+       the agent refuses a heater on the switches' route. */
+    row.querySelectorAll('.ctl-heat-on, .ctl-heat-off').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var on = b.dataset.v === '1';
+        var q = confirmFor(dev, on ? 'heat-on' : 'heat-off', on ? 1 : 0, row);
+        if (q && !confirm(q)) return;
+        send(offAfter({action: 'heat', device: dev, value: on ? 1 : 0}, row), el, dev);
       });
     });
 
@@ -7944,7 +8738,7 @@ var Detect = (function () {
       }
       var q = confirmFor(dev, 'set', v, row);
       if (q && !confirm(q)) return;
-      send({action: 'setpoint', device: dev, value: Number(v)}, el, dev);
+      send(offAfter({action: 'setpoint', device: dev, value: Number(v)}, row), el, dev);
     });
   });
 
@@ -8041,6 +8835,12 @@ var Detect = (function () {
     send({action: 'resync'}, msgEl, 'resync');
   });
 })();
+/* priv:end */
+
+/* priv:start */
+@@schedule_js@@
+@@programs_js@@
+@@scenes_js@@
 /* priv:end */
 
 /* priv:start */   /* refresh on demand */

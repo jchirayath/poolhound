@@ -229,6 +229,84 @@ PROBE = r"""
 """
 
 
+# EQUIPMENT HEALTH, asked of the browser. The section is private, so its
+# absence from the public build is half the assertion; on the private build its
+# one control writes, so a `view` reader must find it dimmed by the role
+# wiring rather than live and refused, and every reading pill must carry its
+# word -- the state is never colour alone.
+EQUIP_PROBE = r"""
+() => {
+  const sec = document.getElementById('home-equipment');
+  const btn = document.querySelector('#maint-form button');
+  const pills = sec ? [...sec.querySelectorAll('.pill')] : [];
+  return {
+    present: !!sec,
+    form: !!document.getElementById('maint-form'),
+    heading: sec ? (sec.querySelector('h2') || {}).textContent || '' : '',
+    wordless: pills.filter(p => !(p.textContent || '').trim()).length,
+    pills: pills.length,
+    button: btn ? (btn.getAttribute('aria-label') || btn.textContent || '').trim() : '',
+    disabled: btn ? btn.disabled : null,
+  };
+}
+"""
+# ANOMALIES, the same two questions: absent from the public build, and on the
+# private one every severity and state is a word, never a tint alone -- and
+# the section sits directly above Equipment health, where the brief put it.
+ANOM_PROBE = r"""
+() => {
+  const sec = document.getElementById('home-anomalies');
+  const pills = sec ? [...sec.querySelectorAll('.pill')] : [];
+  const next = sec ? sec.nextElementSibling : null;
+  return {
+    present: !!sec,
+    heading: sec ? (sec.querySelector('h2') || {}).textContent || '' : '',
+    wordless: pills.filter(p => !(p.textContent || '').trim()).length,
+    above: next ? next.id : '',
+    width: sec ? sec.scrollWidth - sec.clientWidth : 0,
+  };
+}
+"""
+STOCK_FORM = r"""() => {
+  const f = document.getElementById('stock-form');
+  if (!f) return null;
+  const kind = f.querySelector('#stock-kind'), chem = f.querySelector('#stock-chem'),
+        unit = f.querySelector('#stock-unit'), paid = f.querySelector('#stock-paid-f');
+  const pick = (el, v) => { el.value = v; el.dispatchEvent(new Event('change', {bubbles: true})); };
+  const units = () => [...unit.options].map(o => o.value);
+  const shown = el => !el.hidden && getComputedStyle(el).display !== 'none';
+  pick(kind, 'purchase'); pick(chem, 'salt');
+  const salt = {units: units(), unit: unit.value, paid: shown(paid)};
+  pick(chem, 'acid');
+  const acid = {units: units(), unit: unit.value};
+  pick(kind, 'stocktake');
+  const counted = shown(paid);
+  pick(kind, 'purchase');
+  return {salt, acid, counted};
+}"""
+
+
+def stock_form(pg):
+    """The stock form, by real change events: the units follow the chemical, a
+    solid is never offered a volume, and a count has no price box.
+
+    The server refuses a gallon of salt whatever the page offers; this is that
+    the page does not offer it, and that the price box a count cannot use is
+    not left there to be typed into and silently dropped.
+    """
+    r = pg.evaluate(STOCK_FORM)
+    print("    -- the stock form")
+    check("the stock form is on the page", r is not None, True)
+    if not r:
+        return
+    check("salt is offered no volume unit",
+          [u for u in r["salt"]["units"] if u in ("gal", "qt", "l", "floz")], [])
+    check("and defaults to the pound it is sold by", r["salt"]["unit"], "lb")
+    check("acid defaults to the gallon", r["acid"]["unit"], "gal")
+    check("a purchase shows the price box", r["salt"]["paid"], True)
+    check("a count hides it", r["counted"], False)
+
+
 def drive_live(url, sync_playwright):
     """Drive the page a real visitor gets, over the network.
 
@@ -269,6 +347,133 @@ def drive_live(url, sync_playwright):
         # shipped once — would refuse that page's script and still answer 200.
         check("the served policy refused nothing the page needs", violations, [])
         browser.close()
+    return len(FAILS) == fails_before
+
+
+SCHEDULE_PROBE = r"""() => {
+  const nameOf = e => e.getAttribute('aria-label') || (e.textContent || '').trim();
+  const rows = [...document.querySelectorAll('#sched-list tr')];
+  const cancels = [...document.querySelectorAll('#sched-list [data-sched-cancel]')];
+  return {
+    rows: rows.map(r => r.textContent.trim()),
+    cancelNames: cancels.map(nameOf),
+    afterSelects: [...document.querySelectorAll('.ctl-offafter')].map(nameOf),
+    hist: [...document.querySelectorAll('#sched-hist tr')].map(r => r.textContent.trim()),
+    alive: (document.getElementById('sched-alive') || {}).textContent || '',
+  };
+}"""
+
+
+def drive_schedule(sync_playwright, port):
+    """Create a schedule and cancel it, through the page, against a REAL server.
+
+    The rest of this file serves the built pages from a stand-in that answers
+    /api/health and nothing else, which is right for what it asks. A schedule
+    is the opposite case: the whole point is the round trip -- the form posts,
+    the server validates and writes schedules.json, the list is re-read from
+    /api/schedules -- and a stand-in would be testing itself. So this starts
+    bin/serve in a sandbox of its own (a synthetic pool from bin/demo-data, its
+    own data, site and vault directories, notifications off) and drives that.
+    Nothing it does can reach a real pool: there is no agent, and the schedule
+    is for tomorrow and is cancelled before the process exits.
+    """
+    import shutil, subprocess, tempfile, time, urllib.request
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    box = tempfile.mkdtemp(prefix="poolhound-drive-")
+    env = dict(os.environ,
+               POOLHOUND_DATA=os.path.join(box, "data"),
+               POOLHOUND_SITE=os.path.join(box, "site"),
+               POOLHOUND_CONFIG=os.path.join(box, "config.toml"),
+               POOLHOUND_VAULT=os.path.join(box, "vault"),
+               POOLHOUND_PORT=str(port), POOLHOUND_NO_NOTIFY="1")
+    env.pop("POOLHOUND_REQUIRE_DATA", None)
+    proc = None
+    fails_before = len(FAILS)
+    try:
+        subprocess.run([sys.executable, os.path.join(here, "bin", "demo-data"), box],
+                       env=env, check=True, capture_output=True, timeout=120)
+        proc = subprocess.Popen([sys.executable, os.path.join(here, "bin", "serve")],
+                                env=env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        url = f"http://127.0.0.1:{port}"
+        for _ in range(120):
+            try:
+                urllib.request.urlopen(url + "/api/health", timeout=1).read()
+                break
+            except Exception:                              # noqa: BLE001
+                time.sleep(0.25)
+        print("\n  admin.html — a schedule created and cancelled, against bin/serve")
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            pg = browser.new_page(viewport={"width": 390, "height": 800})
+            errors, dialogs = [], []
+            pg.on("pageerror", lambda e: errors.append(str(e)))
+            violations = csp_watch(pg)
+
+            def on_dialog(d):
+                dialogs.append(d.message)
+                d.accept()
+            pg.on("dialog", on_dialog)
+            pg.goto(url + "/admin.html", wait_until="networkidle")
+            pg.click('[data-tab="control"]')
+            pg.wait_for_function(
+                "() => !/Reading/.test(document.getElementById('sched-list').textContent)",
+                timeout=10000)
+            before = pg.evaluate(SCHEDULE_PROBE)
+            check("the list is read from the server, and starts empty",
+                  before["rows"], ["Nothing is scheduled."])
+            check("the scheduler says it is alive",
+                  "The scheduler checks every" in before["alive"], True)
+            check("every 'then off after' names its device",
+                  len(set(before["afterSelects"])) == len(before["afterSelects"]) > 0,
+                  True)
+            import datetime as _dt
+            tomorrow = (_dt.date.today() + _dt.timedelta(days=1)).isoformat()
+            pg.select_option("#sched-what", "set|Aux_1|1")
+            pg.select_option("#sched-rep", "once")
+            pg.fill("#sched-date", tomorrow)
+            pg.fill("#sched-time", "07:30")
+            pg.click("#sched-add")
+            pg.wait_for_function(
+                "() => document.querySelectorAll('#sched-list [data-sched-cancel]').length === 1",
+                timeout=10000)
+            made = pg.evaluate(SCHEDULE_PROBE)
+            check("the new schedule is listed, with a countdown",
+                  len(made["rows"]) == 1 and made["rows"][0].startswith("in "), True)
+            # NAMED FOR WHAT IT CANCELS, the On/Off defect this file opens
+            # with: a column of buttons all called "Cancel" is "press the third
+            # one" again.
+            names = made["cancelNames"]
+            check("its Cancel button says which schedule it ends",
+                  len(names) == 1
+                  and names[0].startswith("Cancel the schedule: Pool light on, ")
+                  and names[0].endswith("07:30"), True)
+            pg.click("#sched-list [data-sched-cancel]")
+            pg.wait_for_function(
+                "() => /Nothing is scheduled/.test(document.getElementById('sched-list').textContent)",
+                timeout=10000)
+            after = pg.evaluate(SCHEDULE_PROBE)
+            check("cancelled, it is gone from the list", after["rows"],
+                  ["Nothing is scheduled."])
+            check("and the history says who cancelled it",
+                  any("cancelled" in h for h in after["hist"]), True)
+            check("the cancel asked first", len(dialogs), 1)
+            check("and the script raised nothing", errors, [])
+            check("the policy refused nothing the page needs", violations, [])
+            with open(os.path.join(box, "data", "schedules.json")) as f:
+                on_disk = json.load(f)
+            check("and the file on disk agrees", on_disk["schedules"], [])
+            browser.close()
+    except subprocess.CalledProcessError as e:
+        check("the sandbox could be built", e.stderr.decode()[-300:], "")
+    finally:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(box, ignore_errors=True)
     return len(FAILS) == fails_before
 
 
@@ -357,6 +562,57 @@ def main():
                 # depend on finding the one width where it shows.
                 check("marking a section current changes no link's width",
                       pg.evaluate(STEADY_JUMPS), [])
+                # WHAT MOVES THIS POOL. Its last column is a sentence, and under
+                # the base td nowrap the table laid out 2,810px wide in a 358px
+                # card: every reason a figure was not yet measured had to be
+                # dragged into view. It must fit its card at phone width, every
+                # status must carry its word and not only its colour, and the
+                # public build must not carry it at all.
+                fit = pg.evaluate("""() => {
+                    document.querySelector('[data-tab="home"]')?.click();
+                    const t = document.querySelector('[data-fit] table.fit');
+                    if (!t) return {present: !!document.querySelector('[data-fit]')};
+                    const sc = t.closest('.scroll');
+                    return {present: true,
+                            overflow: sc.scrollWidth - sc.clientWidth,
+                            wordless: [...t.querySelectorAll('.pill')]
+                                .filter(p => !p.textContent.trim()).length,
+                            rows: t.querySelectorAll('tbody tr').length};
+                }""")
+                if page_name == "admin.html":
+                    check("the fitted coefficients are on Home", fit["present"], True)
+                    check("their table fits its card at phone width",
+                          fit.get("overflow", 1) <= 1, True)
+                    check("and every status says its word", fit.get("wordless"), 0)
+                else:
+                    check("the public page carries no fitted coefficients",
+                          fit["present"], False)
+                eq = pg.evaluate(EQUIP_PROBE)
+                if page_name == "admin.html":
+                    check("Equipment health is on Home", eq["heading"].strip(),
+                          "Equipment health")
+                    check("and every reading in it carries its word",
+                          (eq["pills"] > 0, eq["wordless"]), (True, 0))
+                    check("marking a cleaning is a named control",
+                          eq["button"], "Mark it done")
+                    check("which a view-only reader finds dimmed, not live",
+                          eq["disabled"], True)
+                else:
+                    check("the household's equipment is not in the public build",
+                          (eq["present"], eq["form"]), (False, False))
+                an = pg.evaluate(ANOM_PROBE)
+                if page_name == "admin.html":
+                    check("Anomalies is on Home, above Equipment health",
+                          (an["heading"].strip(), an["above"]),
+                          ("Anomalies", "home-equipment"))
+                    check("and every severity in it is a word", an["wordless"], 0)
+                    check("and nothing in it is wider than the phone",
+                          an["width"] <= 0, True)
+                else:
+                    check("the household's anomalies are not in the public build",
+                          an["present"], False)
+                if page_name == "admin.html":
+                    stock_form(pg)
                 pg.close()
 
             # AND AGAIN IN THE DARK, which nothing drove until now.
@@ -425,6 +681,10 @@ def main():
         if httpd:
             httpd.shutdown()
             httpd.server_close()
+
+    # A real server, not the stand-in: the schedule is a round trip or it is
+    # nothing. Its own port, so a stand-in still releasing 8788 cannot collide.
+    drive_schedule(sync_playwright, port + 1)
 
     print()
     if FAILS:
