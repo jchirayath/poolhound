@@ -543,6 +543,8 @@ PROGRAM_FOLLOW_S = 240
 # Set by main(): how a follow-up pushes a fresh report the moment a change
 # lands, so the page does not wait half an hour to show it.
 _REPORT = None
+# Set by main(): the Pi's scheduler, whose health rides on the schedules report.
+_RUNNER = None
 
 
 def change_program(cmd, guard, poke=None, get=None, follow=None):
@@ -950,7 +952,8 @@ def read_schedules(get=None):
     except Exception:
         names = None
     return P.snapshot(out["programs"], out["programs_err"],
-                      out["schedules"], out["schedules_err"], names=names)
+                      out["schedules"], out["schedules_err"], names=names,
+                      runner=dict(_RUNNER.health) if _RUNNER is not None else None)
 
 
 def aq_poke(path, timeout=15):
@@ -1144,10 +1147,11 @@ class Activity:
         return e
 
     def app_ran(self, device, now=None):
-        """Did poolhound execute a command on `device` within APP_WINDOW_S?"""
+        """Did poolhound execute a command on `device` within APP_WINDOW_S --
+        for the app, or for the Pi's own runner (pirunner._source)?"""
         now = time.time() if now is None else now
         with self._lock:
-            return any(e.get("how") == "poolhound app" and e.get("ok")
+            return any(e.get("how") in AGENT_SOURCES and e.get("ok")
                        and (e.get("device") == device or e.get("device") == "*")
                        and 0 <= now - float(e["t"]) <= APP_WINDOW_S
                        for e in self.events)
@@ -1159,8 +1163,15 @@ class Activity:
                     for e in reversed(self.events[-n:])]
 
 
-def record_command(activity, cmd, result):
-    """One activity row for a command the server sent and this agent handled."""
+# Every way this agent itself runs a command, as the activity list names it.
+# A panel change within APP_WINDOW_S of one of these is that command, not a
+# second change at the panel.
+AGENT_SOURCES = ("poolhound app", "poolhound local", "a schedule", "an automatic off")
+
+
+def record_command(activity, cmd, result, source="poolhound app"):
+    """One activity row for a command this agent ran: from the server, or from
+    the Pi's own runner (a schedule, an automatic off, poolhound local)."""
     if activity is None:
         return
     what = C.describe(cmd)
@@ -1169,7 +1180,7 @@ def record_command(activity, cmd, result):
     elif not result.get("ok"):
         what += " — failed"
     device = "*" if cmd.get("action") == "all_off" else cmd.get("device")
-    activity.add(what, "poolhound app", ok=bool(result.get("ok")), device=device)
+    activity.add(what, source, ok=bool(result.get("ok")), device=device)
 
 
 def record_change(activity, changes, door):
@@ -1197,53 +1208,45 @@ def record_change(activity, changes, door):
         activity.add(what, how, device=dev, now=now)
 
 
-# Scenes for poolhound local, the page on the Pi that drives AqualinkD itself.
-# Fetched from the server and kept IN MEMORY ONLY -- nothing writes to this
-# card -- so a scene can be run at the pool while the server is unreachable,
-# from the last list this agent saw. A failed fetch keeps that list and says
-# why; it never empties it.
-SCENES_EVERY = 600
+# poolhound local's edits: POST /local/<one of these>. See claim_server.
+LOCAL_EDITS = ("scene/save", "scene/delete", "scene/run", "schedule/create", "schedule/cancel")
+LOCAL_HEADER = "X-Poolhound-Local"
 
 
-class SceneCache:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.scenes, self.fetched_at, self.error = [], None, "not fetched yet"
+def local_host_ok(host, extra=None):
+    """Is this a name the house uses for the Pi? An IP address, localhost, a
+    .local name, or one listed in POOLHOUND_LOCAL_HOSTS.
 
-    def put(self, scenes, now):
-        with self._lock:
-            self.scenes, self.fetched_at, self.error = scenes, now, None
-
-    def fail(self, why):
-        with self._lock:
-            self.error = why
-
-    def view(self):
-        with self._lock:
-            return {"scenes": list(self.scenes), "fetched_at": self.fetched_at,
-                    "error": self.error,
-                    "note": "the household's scenes as this Pi last fetched them; "
-                            "\"then switch off after\" is arranged only by the "
-                            "poolhound server"}
-
-
-def scenes_fetcher(server, stop, cache, clock=time.time):
-    """Fetch the scenes now and every SCENES_EVERY. Never fatal."""
-    while not stop.is_set():
-        try:
-            with server._req("/api/agent/scenes", None, "GET", 20) as r:
-                body = json.loads(r.read().decode())
-            got = body.get("scenes") if isinstance(body, dict) else None
-            if not isinstance(got, list):
-                raise ValueError("not a scenes list")
-            cache.put(got[:50], int(clock()))
-        except Exception as e:
-            cache.fail(f"{type(e).__name__} fetching the scenes")
-            log(f"scenes fetch failed: {type(e).__name__}")
-        stop.wait(SCENES_EVERY)
+    AGAINST DNS REBINDING. The header and the JSON body stop a page on another
+    site -- while it IS another site. A page whose own name has been pointed at
+    the Pi's address is, to the visitor's browser, the same site, and sends
+    both freely; what gives it away is the name it asked for. AqualinkD has the
+    same exposure and no answer to it; this does."""
+    import ipaddress
+    h = str(host or "").strip().lower()
+    if h.startswith("["):
+        h = h[1:].split("]", 1)[0]
+    elif h.count(":") == 1:
+        h = h.split(":", 1)[0]
+    if not h:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    names = {"localhost"} | {x.strip().lower() for x in (extra if extra is not None else
+             os.environ.get("POOLHOUND_LOCAL_HOSTS", "")).split(",") if x.strip()}
+    # NOT a bare name ("pool-pi") by default: with a DNS search domain a bare
+    # name resolves wherever that domain says, so whether it is safe depends
+    # on the network. A household that uses one lists it.
+    return h in names or (h.endswith(".local") and h.count(".") == 1)
 
 
-def claim_server(claims, clock=None, activity=None, scenes=None):
+_LOCAL_SCENE = threading.Lock()
+
+
+def claim_server(claims, clock=None, activity=None, runner=None):
     """The loopback endpoint. Records a door's claim, and reads back activity.
 
     Returns the HTTPServer so a caller can shut it down; serve_forever() is the
@@ -1259,13 +1262,37 @@ def claim_server(claims, clock=None, activity=None, scenes=None):
         def log_message(self, *a):     # its own log line, not stderr noise
             pass
 
+        def _host_refused(self):
+            """EVERY path here answers only to the Pi's own names (see
+            local_host_ok): a rebound site must not read the schedules or
+            claim a door any more than it may edit."""
+            if local_host_ok(self.headers.get("Host")):
+                return False
+            self._reply(403, {"error": "reach poolhound local by the Pi's own address "
+                                       "or name (POOLHOUND_LOCAL_HOSTS)"})
+            return True
+
         def do_GET(self):
-            # The scenes, for the page to offer -- read-only, like /activity:
-            # names and the commands they are made of, which anybody on this
-            # LAN can already send to AqualinkD directly.
+            if self._host_refused():
+                return
+            # Scenes and schedules, as the Pi holds and runs them, for
+            # poolhound local. Read-only, and never WHO (Runner.view).
+            if self.path.split("?")[0] == "/local":
+                if runner is None:
+                    return self._reply(503, {"error": "the runner is not running"})
+                try:
+                    return self._reply(200, runner.view())
+                except Exception as e:                        # noqa: BLE001
+                    return self._reply(500, {"error": f"{type(e).__name__}"})
+            # The older page's list: the scenes in running order.
             if self.path.split("?")[0] == "/scenes":
-                return self._reply(200, scenes.view() if scenes else
-                                   {"scenes": [], "fetched_at": None, "error": "no scene cache"})
+                if runner is None:
+                    return self._reply(200, {"scenes": [], "error": "the runner is not running"})
+                sc = runner.view()["scenes"]["scenes"]
+                return self._reply(200, {"scenes": [
+                    {"id": x["id"], "name": x["name"], "off_after_h": x.get("off_after_h"),
+                     "what": x.get("what"), "steps": x["steps"]} for x in sc],
+                    "fetched_at": int(time.time()), "error": None})
             if self.path.split("?")[0] != "/activity":
                 return self._reply(404, {"error": "no such path"})
             events = activity.recent() if activity else []
@@ -1276,7 +1303,12 @@ def claim_server(claims, clock=None, activity=None, scenes=None):
                         "restarting, not the Pi rebooting"})
 
         def do_POST(self):
-            if self.path.split("?")[0] != "/claim":
+            if self._host_refused():
+                return
+            path = self.path.split("?")[0]
+            if path.startswith("/local/"):
+                return self._local(path[len("/local/"):])
+            if path != "/claim":
                 return self._reply(404, {"error": "no such path"})
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -1295,6 +1327,54 @@ def claim_server(claims, clock=None, activity=None, scenes=None):
             claims.add(door, clock())
             log(f"claim from {door}")
             return self._reply(200, {"noted": door})
+
+        def _local(self, what):
+            """An edit from poolhound local.
+
+            ONLY WITH OUR HEADER AND A JSON BODY. Both make a browser send a
+            CORS preflight first, which this server never answers, so a page
+            on some other site cannot make a visitor's browser save a scene
+            or a schedule here. The house network itself is trusted, as it
+            already is by AqualinkD (docs/LOCAL-AND-SYNC.md).
+            """
+            if runner is None:
+                return self._reply(503, {"error": "the runner is not running"})
+            if what not in LOCAL_EDITS:
+                return self._reply(404, {"error": "no such action"})
+            if self.headers.get(LOCAL_HEADER) != "1" or \
+                    not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                return self._reply(403, {"error": "poolhound local only"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > 16384:
+                    return self._reply(413, {"error": "too large"})
+                body = json.loads(self.rfile.read(n) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("not an object")
+            except Exception:
+                return self._reply(400, {"error": "expected a JSON object"})
+            if what == "scene/run":
+                # A scene takes a minute; this server answers one request at
+                # a time. Started, and followed on the activity list -- ONE at
+                # a time, so a caller cannot pile up threads, each waiting to
+                # press the heater.
+                if not _LOCAL_SCENE.acquire(blocking=False):
+                    return self._reply(409, {"error": "a scene is already running"})
+
+                def run():
+                    try:
+                        runner.edit(what, body)
+                    finally:
+                        _LOCAL_SCENE.release()
+                threading.Thread(target=run, daemon=True, name="poolhound-local-scene").start()
+                return self._reply(202, {"started": True})
+            try:
+                result, err = runner.edit(what, body)
+            except Exception as e:                            # noqa: BLE001
+                return self._reply(500, {"error": f"{type(e).__name__}: {e}"[:200]})
+            if err:
+                return self._reply(400, {"error": err})
+            return self._reply(200, {"ok": True, "result": result})
 
         def _reply(self, code, obj):
             raw = json.dumps(obj).encode()
@@ -1429,9 +1509,6 @@ def main():
     stop = threading.Event()
     threading.Thread(target=sampler, args=(server, stop), daemon=True,
                      name="poolhound-sampler").start()
-    # Both kinds of equipment schedule, read off AqualinkD. See programs.py.
-    threading.Thread(target=schedules_reporter, args=(server, stop), daemon=True,
-                     name="poolhound-schedules").start()
     global _REPORT
     def _report_now():
         with server._req("/api/agent/schedules", read_schedules(), "POST", 20):
@@ -1441,17 +1518,33 @@ def main():
     # docstrings. One answers "what is the pool doing", the other "when did it
     # change", and a pool that is quiet must still produce the first.
     claims = Claims()
-    # Scenes for poolhound local. See SceneCache.
-    scene_cache = SceneCache()
-    threading.Thread(target=scenes_fetcher, args=(server, stop, scene_cache), daemon=True,
-                     name="poolhound-scenes").start()
     # What poolhound local's activity list reads. See Activity.
     activity = Activity()
+    # THE PI RUNS THE SCENES AND SCHEDULES, and keeps them in step with the
+    # server only when either side changed (pirunner.py, docs/LOCAL-AND-SYNC.md).
+    # Every command, from the server or from here, goes through it, so one
+    # lock serialises them and every one gets its automatic off recorded.
+    from . import pirunner
+    runner = pirunner.Runner(
+        execute, guard, read_sample, server=server, log=log,
+        record=lambda cmd, result, source: record_command(activity, cmd, result, source),
+        after_ok=lambda cmd: (cmd.get("action") in ("set", "setpoint", "heat", "all_off")
+                              and threading.Thread(target=confirm_and_push, args=(server, cmd),
+                                                   daemon=True, name="poolhound-confirm").start()))
+    runner.start()
+    global _RUNNER
+    _RUNNER = runner
+    # Both kinds of equipment schedule, read off AqualinkD (programs.py), and
+    # with them the runner's health -- so started AFTER the runner: the first
+    # report went out without it, and Pool control said the Pi had not
+    # reported its scheduler for the next half hour.
+    threading.Thread(target=schedules_reporter, args=(server, stop), daemon=True,
+                     name="poolhound-schedules").start()
     # RECORD-ONLY, ON LOOPBACK. See CLAIM_HOST for what this can and cannot do.
     # A failure to bind is not fatal: the watch is the floor and still captures
     # every change from every door, with no door named.
     try:
-        claim_srv = claim_server(claims, activity=activity, scenes=scene_cache)
+        claim_srv = claim_server(claims, activity=activity, runner=runner)
         threading.Thread(target=claim_srv.serve_forever, daemon=True,
                          name="poolhound-claims").start()
         log(f"claims on http://{CLAIM_HOST}:{CLAIM_PORT}/claim, "
@@ -1480,32 +1573,22 @@ def main():
 
     while True:
         try:
+            # Connected (again): whatever changed on either side while the
+            # link was down is exchanged now.
+            runner.wake.set()
             for cmd in server.stream():
                 backoff = 1.0
-                cid = str(cmd.get("id", ""))[:8]
-                try:
-                    result = execute(cmd, guard)
-                    log(f"ran {cid} {C.describe(cmd)} -> {result['detail']}")
-                except C.Refused as e:
-                    result = {"ok": False, "refused": str(e)}
-                    log(f"refused {cid}: {e}")
-                except Exception as e:
-                    result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-                    log(f"failed {cid}: {e}")
-                # BEFORE the ack, which is a network call of up to 20s: the
-                # watcher sees the panel move within about ten, and finding no
-                # app row yet it would credit the change to the panel.
-                record_command(activity, cmd, result)
+                if cmd.get("type") == "sync":
+                    # The server's scenes or schedules changed. Not a command.
+                    runner.wake.set()
+                    continue
+                # The runner records the activity row BEFORE the ack, which is
+                # a network call of up to 20s: the watcher sees the panel move
+                # within about ten, and finding no app row yet it would credit
+                # the change to the panel. It also reads the panel back and
+                # pushes it, on its own thread, for a command that did something.
+                result = runner.run_command(cmd)
                 server.ack(cmd.get("id"), result)
-
-                # Read the panel back and push it, on its own thread so the
-                # command stream is not blocked while this waits for the panel
-                # to catch up. Only for commands that actually did something —
-                # a refusal has nothing to confirm.
-                if result.get("ok") and cmd.get("action") in ("set", "setpoint", "all_off"):
-                    threading.Thread(target=confirm_and_push, args=(server, cmd),
-                                     daemon=True,
-                                     name="poolhound-confirm").start()
 
             log("stream closed by the other end")
         except KeyboardInterrupt:

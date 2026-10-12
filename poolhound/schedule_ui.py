@@ -327,14 +327,32 @@ SCRIPT = r"""
     document.getElementById('sched-hist-note').textContent =
       'Showing ' + j.history.length + ' of ' + j.history_total + ' entries kept'
       + (j.unreadable ? '. THE SCHEDULE FILE COULD NOT BE READ — nothing will run until a person looks at it.' : '.');
-    alive(j.scheduler);
+    alive(j.scheduler, j.runner);
   }
 
   /* Whether anything is going to run these at all. A thread that died inside
      a live server is exactly what the serving process can report. */
-  function alive(sc) {
+  function alive(sc, rn) {
     var el = document.getElementById('sched-alive');
     var dead = document.getElementById('sched-dead');
+    /* Once the Pi has taken over, IT runs these: at the pool, whether or not
+       this site is up. Its health arrives with its half-hourly report. */
+    if (rn && rn.on_pi) {
+      var p = rn.pi || {};
+      var mins = rn.report_age_s == null ? null : Math.round(rn.report_age_s / 60);
+      el.textContent = 'These run on the Pi at the pool, so they run when this site is down. '
+        + (mins === null ? 'The Pi has not reported its scheduler yet.'
+                         : 'It reported ' + (mins < 1 ? 'just now' : mins + ' min ago')
+                           + (p.last_tick ? ', its scheduler looking every 20 s' : '') + '.')
+        + (p.errors ? ' ' + p.errors + ' failed look(s), the last: ' + p.last_error : '')
+        + (p.sync_error ? ' Its last sync failed: ' + p.sync_error + '.' : '');
+      dead.hidden = !rn.stale;
+      dead.textContent = rn.stale
+        ? 'The Pi has not reported its scheduler recently. If its agent is down, nothing '
+          + 'below will run and no automatic off will happen until it is back.'
+        : '';
+      return;
+    }
     if (!sc) { el.textContent = ''; return; }
     var ago = sc.last_tick ? Math.round((Date.now() - new Date(sc.last_tick).getTime()) / 1000) : null;
     el.textContent = sc.running

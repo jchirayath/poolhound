@@ -64,6 +64,14 @@ Group=poolhound
 # `systemctl show` and in /proc to any local user.
 EnvironmentFile=/etc/poolhound/agent.env
 ExecStart=/usr/bin/python3 /opt/poolhound/bin/agent
+# THE PI RUNS THE SCENES AND SCHEDULES (docs/LOCAL-AND-SYNC.md), so they must
+# survive a reboot on a Pi with no server to fetch them from. Kept in
+# /var/lib/poolhound, which systemd creates owned by this user; written only
+# when something changed -- a save, a delete, a firing, a sync that brought a
+# change -- never on a timer. The interlocks stay in /run, which is RAM.
+Environment=POOLHOUND_DATA=/var/lib/poolhound
+StateDirectory=poolhound
+StateDirectoryMode=0700
 Restart=always
 RestartSec=10
 
@@ -99,7 +107,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/poolhound
+ReadWritePaths=/run/poolhound /var/lib/poolhound
 RuntimeDirectory=poolhound
 ProtectKernelTunables=true
 ProtectKernelModules=true

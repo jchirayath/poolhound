@@ -1623,7 +1623,7 @@ def _ingest_sample_locked(sample, ts, path, cols):
     # after the lock is released — see the reasoning there.
     return {"stored": True, "ts": ts}, None
 
-def issue_control(data, cfg, who):
+def issue_control(data, cfg, who, off_after_h=None):
     """Queue one command for the pool, and wait a moment for the answer.
 
     Validated here so a mistake is refused while the person is still looking at
@@ -1659,8 +1659,10 @@ def issue_control(data, cfg, who):
         return None, ("no agent is connected, so nothing can reach the panel. The "
                       "pool keeps running its own schedule meanwhile.")
     try:
+        # "Then off after" rides on the command: the Pi arranges the
+        # automatic off, because the Pi runs them (docs/LOCAL-AND-SYNC.md).
         cmd, delivered = QUEUE.issue(data.get("action"), data.get("device"),
-                                     data.get("value"), who)
+                                     data.get("value"), who, off_after_h)
     except CMD.Refused as e:
         return None, str(e)
     result = QUEUE.result_for(cmd["id"], wait=3.0)
@@ -1686,10 +1688,16 @@ def command(data, cfg, who):
     from . import schedule
     if data.get("action") == "scene":
         return run_scene(data, cfg, who)
-    off_after, err = schedule.check_off_after(data, cfg)
+    if data.get("_scene_off_after"):
+        # A scene's own "then off after", validated when the scene was saved
+        # (scenes.clean) and applied to its ON steps but the pump -- not the
+        # per-device [schedule.auto_off] list a single press is held to.
+        off_after, err = float(data["_scene_off_after"]), None
+    else:
+        off_after, err = schedule.check_off_after(data, cfg)
     if err:
         return None, err
-    result, err = issue_control(data, cfg, who)
+    result, err = issue_control(data, cfg, who, off_after)
     if err:
         return None, err
     # On the share, not in the queue. The queue is what is PENDING and is
@@ -1714,7 +1722,10 @@ def command(data, cfg, who):
     res = (result or {}).get("result")
     if res is None or res.get("ok"):
         try:
-            schedule.note_command(data, who, off_after, cfg)
+            # Once the Pi runs the schedules it also keeps the automatic offs,
+            # and it records this one itself when it runs the command.
+            if not schedule.pi_runs():
+                schedule.note_command(data, who, off_after, cfg)
         except Exception as e:                            # noqa: BLE001
             # The command has happened. Say loudly that its auto-off has not
             # been arranged, rather than turning a working press into an error.
@@ -1741,8 +1752,13 @@ def run_scene(data, cfg, who):
     if scene is None:
         return None, "no such scene — it may have been deleted"
     ran = []
+    off_after = scene.get("off_after_h")
+    off_devs = SC.off_steps(scene["steps"]) if off_after else []
     for st in sorted(scene["steps"], key=SC.order_key):
-        r, err = command(dict(st), cfg, who)
+        step = dict(st)
+        if st["device"] in off_devs and st["action"] != "setpoint":
+            step["_scene_off_after"] = off_after
+        r, err = command(step, cfg, who)
         res = (r or {}).get("result")
         why = err or (res.get("refused") or res.get("error") or "refused"
                       if res is not None and not res.get("ok") else None)
@@ -1755,11 +1771,6 @@ def run_scene(data, cfg, who):
                     "pending": False}, None
         ran.append({"what": r.get("what"), "action": st["action"], "device": st["device"],
                     "value": st["value"], "pending": bool(r.get("pending"))})
-    off_after = scene.get("off_after_h")
-    if off_after:
-        for st in scene["steps"]:
-            if st["device"] in SC.off_steps([st]):
-                schedule.note_command(st, who, off_after, cfg)
     audit.record("scene", scene["name"],
                  SC.describe(scene, cfg)[:360]
                  + (f"; off again after {off_after:g} h" if off_after else ""),
@@ -2721,25 +2732,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(421, {"error": "unrecognised Host"})
         if self.path.split("?")[0] == "/api/agent/commands":
             return self.stream_commands()
-        if self.path.split("?")[0] == "/api/agent/scenes":
-            # The household's scenes, for poolhound local on the Pi: the agent
-            # keeps them in memory and hands them to the page, so a scene can
-            # be run at the pool with the server unreachable. Steps come in
-            # the order they must run (scenes.order_key), so the page does
-            # not decide it.
-            ok, unavailable = self.agent_ok()
-            if not ok:
-                return self._json(503 if unavailable else 403,
-                                  {"error": "the agent token could not be read" if unavailable
-                                   else "agent authentication failed"})
-            from . import scenes as _SC
-            _cfg = config.load()
-            return self._json(200, {"scenes": [
-                {"id": sc["id"], "name": sc["name"], "off_after_h": sc.get("off_after_h"),
-                 "what": _SC.describe(sc, _cfg),
-                 "steps": [{**st, "label": CMD.label_for(st["device"], _cfg)}
-                           for st in sorted(sc["steps"], key=_SC.order_key)]}
-                for sc in _SC.load(_cfg)]})
         # The authenticated page is never served without an identity, whatever
         # the proxy did with the path — including how it spelled it.
         #
@@ -3204,6 +3196,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 r, e = ingest_sample(body, config.load())
             elif route == "/api/agent/note":
                 r, e = record_panel_change(body, config.load())
+            elif route == "/api/agent/sync":
+                # Scenes and schedules, kept in step with the Pi, which runs
+                # them. Only when something changed (docs/LOCAL-AND-SYNC.md).
+                from . import sync as _sync
+                r, e = _sync.exchange(body, config.load())
             elif route == "/api/agent/schedules":
                 # Both kinds of equipment schedule as the Pi read them. A
                 # snapshot, replaced whole each time, so it is a JSON file and
@@ -3407,6 +3404,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             result, err = import_credentials(data, cfg, self.whoami())
         elif route == "/api/control":
             # command() issues AND audits -- the one path a schedule takes too.
+            # Keys starting "_" are the server's own (a scene's off-after);
+            # a request does not get to set them.
+            data = {k: v for k, v in data.items() if not str(k).startswith("_")}
             result, err = command(data, cfg, self.whoami())
         elif route in ("/api/scene", "/api/scene/delete"):
             from . import scenes as _SC
@@ -3418,6 +3418,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                              (_SC.describe(result, cfg)[:360] if route == "/api/scene"
                               else "deleted"),
                              by=self.whoami(), cfg=cfg, id=(result or {}).get("id", ""))
+                QUEUE.nudge()          # the Pi holds the scenes too: sync now
                 return self._json(200, result)
         elif route in ("/api/schedule", "/api/schedule/delete"):
             from . import schedule
@@ -3432,6 +3433,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                               f"{schedule.describe_when(result)}"
                               if route == "/api/schedule" else "cancelled"),
                              by=self.whoami(), cfg=cfg, id=(result or {}).get("id", ""))
+                QUEUE.nudge()          # the Pi runs the schedules: sync now
                 # Nothing on the rendered page depends on a schedule, and a
                 # render is the slow part of a write: answered now.
                 return self._json(200, result)

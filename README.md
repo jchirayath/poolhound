@@ -2169,28 +2169,44 @@ decided.
 commands -- a switch on or off, a heater on or off, a heater's temperature --
 and running one is `/api/control` with `action: "scene"`. `server.command()`
 expands it and issues each step through itself, so every step is validated,
-rate-limited, audited as whoever ran it and checked by the Pi's Guard; the
-agent never sees a scene. `scenes.py` decides the order, whatever order it was
+rate-limited, audited as whoever ran it and checked by the Pi's Guard.
+poolhound local has the same scenes and can make, change, delete and run
+them; the Pi keeps a copy and runs one itself when it is run there or
+scheduled (*poolhound local and poolhound, kept in step*, below). `scenes.py` decides the order, whatever order it was
 saved in: heaters off, other things off, the pump off last; then the pump on
 first, other things on, temperatures, heaters on last. A scene **stops at the
 first step refused**, so a heater is never started after its pump was
 refused. "Then switch off after" arranges an automatic off for everything the
 scene turned on **except the filter pump**, whose hours belong to the panel's
-program. A scene can be scheduled like any command, and is then fired through
-the same `server.command()`, with the ON grace and the authority asked again at
-every firing.
+program. A scene can be scheduled like any command, and is then fired by the Pi with
+the same ON grace as any schedule.
+
+### poolhound local and poolhound, kept in step
+
+poolhound local, the page on the Pi, has the same scenes and schedules as the
+app, so a household without the server loses nothing. The Pi keeps them in
+`/var/lib/poolhound` and runs every schedule and every automatic off; the
+server keeps a copy, edits it, shows what the Pi did and mails what needs
+telling. A change made on either page reaches the other at the next sync,
+**only when something changed**, and **the later change wins**, per scene and
+per schedule; a deletion travels like an edit. The design and its decisions are
+in [`docs/LOCAL-AND-SYNC.md`](docs/LOCAL-AND-SYNC.md).
+
+What the Pi cannot do alone, the server does: it withdraws a schedule whose
+author has lost `operate` (a schedule made at poolhound local is the house
+network's, and stays), and it sends the alerts. poolhound local never shows who
+made something; an address is shown as "poolhound app".
 
 ### Schedules, and switching off what was left on
 
 "Spa ready at seven" is a **deferred command**, and it is built as exactly
-that. `schedule.py` keeps the schedule in `$POOLHOUND_DATA/schedules.json` —
-on the share, under its own lock, because it has to survive a
-`--force-recreate` the way the in-memory queue deliberately does not — and a
-thread in `bin/serve` looks at the clock every twenty seconds. At the due time
-it calls `server.command()`, the same function a button press reaches, with
-`by` set to `schedule` or `auto-off`. So a scheduled command is validated,
-rate-limited, audited and refused by the Pi's Guard exactly as a press is;
-there is no second way into the panel, and the Pi stores nothing.
+that. `schedule.py` keeps the schedules in `schedules.json`, and **the Pi runs
+them**: its agent looks at the clock every twenty seconds and, at the due time,
+issues the command through its own path — validated, through the Guard, the
+panel woken first and the result judged by what the panel reports — with `by`
+set to `schedule` or `auto-off`. The server keeps a copy, kept in step, and
+fires nothing once the Pi has synced (*poolhound local and poolhound, kept in
+step*, below).
 
 The two directions are not treated alike. An **ON** runs only within fifteen
 minutes of its time; later than that — the server was down all evening — it is
@@ -2697,7 +2713,7 @@ whole of the protocol, and `docs/AGENT-PROTOCOL.md` is the reference:
 | `/api/agent/sample` | POST | One controller sample. A stored sample re-renders both builds. |
 | `/api/agent/ack` | POST | What the agent did with a command, and what the panel said. |
 | `/api/agent/note` | POST | Which circuits changed and, when a door claimed it, which door: the story beside a sample, kept out of `samples.csv`. |
-| `/api/agent/scenes` | GET | The household's scenes in the order they run, which the agent keeps in memory and hands to poolhound local at `/scenes`, so a scene runs at the pool with the server unreachable. |
+| `/api/agent/sync` | POST | Scenes and schedules, kept in step with the Pi, which runs them (`docs/LOCAL-AND-SYNC.md`). First fingerprints only (`{"same": true}` ends it); then both lists, merged with the later change winning, and the settings the Pi needs. The stream carries `{"type": "sync"}` when the server's side changed. |
 | `/api/agent/schedules` | POST | Both kinds of equipment schedule as the Pi read them — the panel's own programs and AqualinkD's cron schedules — every 30 minutes, and at once when a program change finishes, carrying the panel's own answer to it. A snapshot, replaced whole, in `panel_schedules.json`. |
 
 
@@ -2879,13 +2895,20 @@ poolhound/
   commands.py           THE command vocabulary, shared by server and agent
   queue_.py             the command queue and the SSE fan-out
   schedule.py           commands that wait for a time, the auto-off, and
-                        the household max-on net; a thread in bin/serve
+                        the household max-on net; run on the Pi (pirunner),
+                        mirrored and alerted on by a thread in bin/serve
   schedule_ui.py        the schedule section of Pool control, and its script
   programs.py           the panel's own programs and AqualinkD's schedules:
                         their shape, shared by the agent and the server
   programs_ui.py        Pool control's section showing both, and its script
   scenes.py             scenes: several controls in one tap, their safe order
   scenes_ui.py          Pool control's Scenes section and its editor
+  syncdefs.py           how two copies of the scenes and schedules merge:
+                        last update wins, deletions as dated markers
+  sync.py               the exchange that keeps the Pi and the server in step,
+                        only when something changed (docs/LOCAL-AND-SYNC.md)
+  pirunner.py           on the Pi: runs scenes and schedules, keeps them on the
+                        card, serves poolhound local's editors, syncs
   agent.py              runs on the Pi: pushes samples on a heartbeat AND
                         the moment the panel changes, executes commands
   server.py             the write API and the two agent endpoints
@@ -2931,6 +2954,7 @@ poolhound/
   checks_heaters.py     a heater's own switch, and a temperature that arrives
   checks_scenes.py      scenes: their order, refusals, the pump, stopping short
   checks_cron.py        saving AqualinkD's schedules: rebuilt fields, stale pages, read-back
+  checks_sync.py        poolhound local and poolhound in step: merge, one runner, the card
   checks_upkeep.py      the acid balance, the salt trend, what follows
   checks_equipment.py   the filter, cell and heater estimators, and refusal
   checks_anomaly.py     each anomaly rule fires on its fault and not on an

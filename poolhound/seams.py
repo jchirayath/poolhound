@@ -147,7 +147,9 @@ SEAMS = [
       "commands.py": "parses its own issued-at stamps",
       "corrections.py": "parses its own append-only log",
       "watch.py": "parses its own state file",
-      "schedule.py": "parses its own state file"}),
+      "schedule.py": "parses its own state file",
+      "syncdefs.py": "parses the update stamps it and schedule.py write; "
+                     "a stamp with no zone is read as UTC"}),
 
     # \b ON THE RIGHT, because the bare pattern also matches the -9999px that
     # parks the skip link offscreen. Found the moment _code_only stopped

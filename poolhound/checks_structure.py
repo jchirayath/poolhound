@@ -3009,8 +3009,8 @@ def _register_schedule():
          _sched_live('sev = SEVERE if C.is_off(cmd) else "info"', 'sev = "info"'),
          "a missed OFF graded as ordinary"),
         (K.t_a_schedule_is_withdrawn_when_its_author_loses_operate,
-         _sched_live('ok, need, held = access.may(s.get("by"), "/api/schedule", cfg)',
-                     'ok, need, held = True, "", ""'),
+         _sched_live('authority = authority or (lambda who: access.may(who, "/api/schedule", cfg))',
+                     'authority = authority or (lambda who: (True, "", ""))'),
          "a schedule firing on the authority of somebody since demoted"),
         (K.t_inside_the_grace_window_it_runs_and_says_how_late,
          lambda: _patch(S, "GRACE_S", 0),
@@ -3160,11 +3160,6 @@ def _register_scenes():
                                   'return f"scene {sc[\'name\']}" if sc else "a scene that has since been deleted"',
                                   'return C.describe(cmd)'),
          "a scheduled scene listed as a bare id"),
-        (K.t_the_pi_keeps_the_last_scenes_it_saw_when_the_server_is_away,
-         lambda: _break_live_code("poolhound/agent.py", "poolhound.agent",
-                                  "        with self._lock:\n            self.error = why\n",
-                                  "        with self._lock:\n            self.error = why\n            self.scenes = []\n"),
-         "the Pi's scenes emptied by one failed fetch"),
     ])
 
 
@@ -3210,6 +3205,73 @@ def _register_cron():
 
 
 _register_cron()
+
+
+def _register_sync():
+    """Breakers for poolhound local and poolhound kept in step."""
+    from . import checks_sync as K
+
+    def live(path, mod, needle, replacement):
+        return lambda: _break_live_code(path, mod, needle, replacement)
+    PROVES.extend([
+        (K.t_the_later_update_wins_and_a_deletion_stays_deleted,
+         live("poolhound/syncdefs.py", "poolhound.syncdefs",
+              "            when, is_del, row = options[-1]\n",
+              "            when, is_del, row = options[0]\n"),
+         "an older copy overwriting a newer one"),
+        (K.t_a_change_on_either_page_reaches_the_other,
+         live("poolhound/pirunner.py", "poolhound.pirunner",
+              "        changed = SY.install(merged, self.cfg())\n",
+              "        changed = False\n"),
+         "the server's changes never reaching the Pi"),
+        (K.t_the_pi_writes_its_card_only_when_something_changed,
+         live("poolhound/schedule.py", "poolhound.schedule",
+              "        if alive or _fp(st) != before:\n",
+              "        if True:\n"),
+         "the SD card written on every tick"),
+        (K.t_the_pi_runs_a_schedule_once_and_records_its_automatic_off,
+         live("poolhound/pirunner.py", "poolhound.pirunner",
+              '                S.note_command(cmd, by or cmd.get("by") or "", cmd.get("off_after_h"), self.cfg())\n',
+              "                pass\n"),
+         "a spa switched on by the Pi with no automatic off to follow"),
+        (K.t_once_the_pi_runs_them_the_server_never_fires_one,
+         live("poolhound/schedule.py", "poolhound.schedule",
+              "    if pi_runs(data, now):\n", "    if False:\n"),
+         "a schedule fired by both the server and the Pi"),
+        (K.t_a_press_the_panel_ignored_is_not_reported_as_done,
+         live("poolhound/pirunner.py", "poolhound.pirunner",
+              "                    if took is False:\n", "                    if False:\n"),
+         "a scheduled press reported done on AqualinkD's word while the panel slept"),
+        (K.t_a_page_rebound_to_the_pi_cannot_edit_its_schedules,
+         live("poolhound/agent.py", "poolhound.agent",
+              "    if not h:\n        return False\n", "    return True\n"),
+         "a site rebound to the Pi's address saving a heater schedule"),
+        (K.t_a_heater_sent_but_not_yet_seen_still_gets_its_automatic_off,
+         live("poolhound/pirunner.py", "poolhound.pirunner",
+              '        if sent and cmd.get("action") in ("set", "setpoint", "heat"):\n',
+              '        if result.get("ok") and cmd.get("action") in ("set", "setpoint", "heat"):\n'),
+         "a heater that lit late with no automatic off to follow"),
+        (K.t_a_runner_that_just_started_is_not_reported_dead,
+         live("poolhound/schedule.py", "poolhound.schedule",
+              ' or _parse((r or {}).get("started"))', ''),
+         "every restart of the Pi shown as a dead scheduler for half an hour"),
+        (K.t_an_edit_on_the_website_tells_the_pi_at_once,
+         live("poolhound/server.py", "poolhound.server",
+              "                QUEUE.nudge()          # the Pi holds the scenes too: sync now\n",
+              "                pass\n"),
+         "a scene changed on the website waiting for the Pi's next restart"),
+        (K.t_a_nudge_reaches_the_agent_as_a_sync_not_a_command,
+         live("poolhound/queue_.py", "poolhound.queue_",
+              '                    q.put_nowait({"type": "sync"})\n', "                    pass\n"),
+         "a nudge that never reaches the agent"),
+        (K.t_poolhound_local_never_shows_who,
+         live("poolhound/pirunner.py", "poolhound.pirunner",
+              '                row["by"] = _door(row.get("by"))\n', "                pass\n"),
+         "a signed-in address shown to the house network"),
+    ])
+
+
+_register_sync()
 
 
 def _register_agent_stream_auth():

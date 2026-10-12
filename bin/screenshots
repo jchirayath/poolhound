@@ -183,9 +183,32 @@ def _pi_payloads(data):
     return devices, status, {"events": list(reversed(events))[:12]}
 
 
+def _pi_local_view():
+    """What the agent's /local answers, from its own code, on a scratch disk."""
+    import tempfile
+    from poolhound import pirunner, scenes as _scenes, schedule as _schedule
+    prev = os.environ.get("POOLHOUND_DATA")
+    d = tempfile.mkdtemp(prefix="poolhound-pi-shot-")
+    os.environ["POOLHOUND_DATA"] = d
+    try:
+        r = pirunner.Runner(lambda c, g: {"ok": True}, None, lambda: {"pump": 1},
+                            log=lambda *a: None, sleep=lambda s: None)
+        for t in _scenes.templates()[2:]:
+            _scenes.save(t, "door:pool.html", {})
+        _schedule.create({"action": "set", "device": "Aux_1", "value": 1,
+                          "repeat": "daily", "time": "19:30"}, "door:pool.html", {})
+        r.health["last_tick"] = _schedule._iso(_schedule.utcnow())
+        return {**r.view(), "connected": False}
+    finally:
+        if prev is None:
+            os.environ.pop("POOLHOUND_DATA", None)
+        else:
+            os.environ["POOLHOUND_DATA"] = prev
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _pi_page(browser, data, out):
     import json
-    from poolhound import scenes as _scenes
     devices, status, activity = _pi_payloads(data)
     with open(os.path.join(ROOT, "deploy", "poolhound-local.html"), encoding="utf-8") as f:
         page_html = f.read()
@@ -194,12 +217,10 @@ def _pi_page(browser, data, out):
                                         json.dumps({"devices": devices})),
                "/poolapi/api/status": ("application/json", json.dumps(status)),
                "/poolactivity": ("application/json", json.dumps(activity)),
-               # The scenes block, from the same starting points the app offers,
-               # in the order they run -- pictures of scenes nobody has saved.
-               "/poolscenes": ("application/json", json.dumps({"scenes": [
-                   {"id": f"demo{i}", "name": t["name"], "off_after_h": t["off_after_h"],
-                    "steps": sorted(t["steps"], key=_scenes.order_key)}
-                   for i, t in enumerate(_scenes.templates()[2:])], "error": None}))}
+               # Scenes and schedules, as the Pi's runner would serve them,
+               # built by that runner in a scratch directory from the starting
+               # points the app offers -- pictures of things nobody saved.
+               "/poollocal": ("application/json", json.dumps(_pi_local_view()))}
 
     def answer(route):
         from urllib.parse import urlsplit

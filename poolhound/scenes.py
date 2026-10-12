@@ -26,11 +26,15 @@ belong to the panel's own program: a spa session ending must not cut short
 the day's filtering.
 
 Stored in $POOLHOUND_DATA/scenes.json, replaced atomically under its lock. A
-scene is a decision somebody made, so it lives where the schedules do.
+scene is a decision somebody made, so it lives where the schedules do -- on
+the server AND on the Pi, kept in step by syncdefs (docs/LOCAL-AND-SYNC.md).
+So every save stamps `updated_at`, and a delete leaves a marker in `deleted`
+rather than simply vanishing: the other side's older copy must not bring it
+back.
 """
-import json, os, re, time, uuid
+import datetime as dt, json, os, re, time, uuid
 
-from . import commands as C
+from . import commands as C, syncdefs as SD
 
 FILE = "scenes.json"
 SCENES_MAX = 20
@@ -124,23 +128,48 @@ def path(cfg):
     return os.path.join(config.data_dir(cfg), FILE)
 
 
-def load(cfg):
-    """Every scene, or [] -- never raises, so a bad file costs the scenes and
-    not the Control tab."""
+def _read(cfg):
+    """(scenes, deletion markers) -- never raises, so a bad file costs the
+    scenes and not the Control tab."""
     try:
         with open(path(cfg)) as f:
             rec = json.load(f)
     except (OSError, ValueError):
-        return []
-    sc = rec.get("scenes") if isinstance(rec, dict) else None
-    return [s for s in (sc or []) if isinstance(s, dict) and s.get("id")
-            and isinstance(s.get("steps"), list)]
+        return [], []
+    rec = rec if isinstance(rec, dict) else {}
+    sc = [s for s in (rec.get("scenes") or []) if isinstance(s, dict) and s.get("id")
+          and isinstance(s.get("steps"), list)]
+    return sc, [d for d in (rec.get("deleted") or []) if isinstance(d, dict)]
 
 
-def _save(cfg, scenes):
+def load(cfg):
+    """Every scene, or []."""
+    return _read(cfg)[0]
+
+
+def deleted(cfg):
+    """The markers of scenes deleted in the last TOMBSTONE_DAYS."""
+    return _read(cfg)[1]
+
+
+def _save(cfg, scenes, gone):
     from . import locking
     locking.replace_atomically(path(cfg), lambda f: json.dump(
-        {"version": 1, "scenes": scenes}, f, indent=1))
+        {"version": 1, "scenes": scenes, "deleted": SD.prune(gone)}, f, indent=1))
+
+
+def replace_all(cfg, scenes, gone):
+    """Install a merged list from syncdefs.merge(). True if anything changed:
+    the file is written only then, because on the Pi it is the SD card."""
+    from . import config, locking
+    with locking.exclusive(config.data_dir(cfg), "scenes"):
+        old, old_gone = _read(cfg)
+        if (SD.fingerprint(sorted(old, key=lambda r: r["id"])) ==
+                SD.fingerprint(sorted(scenes, key=lambda r: r["id"]))
+                and SD.prune(old_gone) == SD.prune(gone)):
+            return False
+        _save(cfg, scenes, gone)
+    return True
 
 
 def get(cfg, sid):
@@ -155,7 +184,7 @@ def save(body, who, cfg, now=None):
         return None, err
     sid = _s(body.get("id"), 16)
     with locking.exclusive(config.data_dir(cfg), "scenes"):
-        scenes = load(cfg)
+        scenes, gone = _read(cfg)
         old = next((s for s in scenes if s["id"] == sid), None) if sid else None
         if sid and old is None:
             return None, "no such scene — it may have been deleted"
@@ -163,10 +192,12 @@ def save(body, who, cfg, now=None):
             return None, f"{SCENES_MAX} scenes is the limit; delete one first"
         if any(s["name"].lower() == scene["name"].lower() and s is not old for s in scenes):
             return None, f"there is already a scene called {scene['name']}"
+        t = now or time.time()
         row = {**(old or {}), **scene, "id": sid or uuid.uuid4().hex[:10],
-               "by": _s(who, 120), "saved": int(now or time.time())}
+               "by": _s(who, 120), "saved": int(t),
+               "updated_at": SD.stamp(dt.datetime.fromtimestamp(t, dt.timezone.utc))}
         scenes = [row if s is old else s for s in scenes] if old else scenes + [row]
-        _save(cfg, scenes)
+        _save(cfg, scenes, gone)
     return row, None
 
 
@@ -174,11 +205,11 @@ def delete(body, who, cfg):
     from . import config, locking
     sid = _s(body.get("id"), 16)
     with locking.exclusive(config.data_dir(cfg), "scenes"):
-        scenes = load(cfg)
+        scenes, gone = _read(cfg)
         left = [s for s in scenes if s["id"] != sid]
         if len(left) == len(scenes):
             return None, "no such scene — it may already have been deleted"
-        _save(cfg, left)
+        _save(cfg, left, gone + [SD.tombstone("scene", sid)])
     return {"id": sid}, None
 
 

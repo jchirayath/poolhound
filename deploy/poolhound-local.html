@@ -14,7 +14,7 @@
   the page can be read, adapted and photographed — bin/screenshots drives it
   against a synthetic AqualinkD for the landing page's card. It needs the Pi's
   web server to proxy /poolapi/ to AqualinkD, and, for the activity list and
-  the door claim and the scenes, /poolactivity, /poolclaim and /poolscenes
+  the door claim and the scenes and schedules, /poolactivity, /poolclaim and /poollocal
   to the agent (deploy/README.md,
   "Naming the door a panel change came through"). /resync is a household
   extra and answers nothing without its own small service.
@@ -148,10 +148,32 @@ button.danger:hover:not(:disabled){border-color:var(--bad);background:rgba(210,8
 .ro .v{font-size:1.5rem;font-weight:300;margin-top:.15rem;font-variant-numeric:tabular-nums}
 .ro .v small{font-size:.85rem;color:var(--muted)}
 
-#scenes{display:flex;flex-wrap:wrap;gap:.5rem;margin:.6rem 0 .2rem}
-#scenes button{min-height:2.6rem}
-#scenes-note{color:var(--faint);font-family:var(--mono);font-size:.7rem;margin:.3rem 0 0}
-#scenes-note.bad{color:var(--bad)}
+/* Scenes and schedules: the same ones the poolhound app has, run by this Pi. */
+.cards{display:grid;gap:.7rem;grid-template-columns:repeat(auto-fit,minmax(16rem,1fr));margin:.8rem 0}
+.card{padding:.95rem 1.05rem;border:1px solid var(--line);border-radius:var(--radius);
+      background:linear-gradient(160deg,var(--panel),var(--ink-2));min-width:0}
+.card .nm{font-size:1rem;font-weight:500;margin:0 0 .3rem}
+.card .what{font-size:.82rem;color:var(--muted);margin:0 0 .3rem;overflow-wrap:anywhere}
+.card .meta{font-family:var(--mono);font-size:.68rem;color:var(--faint);margin:0 0 .6rem}
+.acts{display:flex;flex-wrap:wrap;gap:.45rem}
+.note{font-family:var(--mono);font-size:.72rem;color:var(--faint);margin:.4rem 0 0}
+.note.bad{color:var(--bad)} .note.ok{color:var(--ok)} .note.warn{color:var(--warn)}
+details.form{margin:.6rem 0 1rem;border:1px solid var(--line);border-radius:var(--radius);
+      background:var(--ink-2);padding:.2rem 1rem}
+details.form summary{cursor:pointer;padding:.6rem 0;font-size:.88rem;color:var(--water-lt)}
+.frm{display:grid;gap:.6rem;padding:.2rem 0 1rem}
+.frm label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:var(--muted)}
+.frm select,.frm input{font:inherit;font-size:.9rem;color:var(--text);background:var(--ink);
+      border:1px solid var(--line);border-radius:10px;padding:.5rem .6rem;min-height:2.6rem;max-width:100%}
+.frm .row{display:flex;flex-wrap:wrap;gap:.6rem}
+.frm .row>label{flex:1 1 9rem}
+.steps{display:grid;gap:.35rem}
+.step{display:grid;grid-template-columns:minmax(7rem,1fr) auto auto;gap:.4rem;align-items:center;font-size:.85rem}
+.step select,.step input{min-height:2.3rem;padding:.3rem .5rem}
+.step input{width:5.2rem}
+.hist{font-family:var(--mono);font-size:.74rem;color:var(--muted)}
+.hist div{padding:.25rem 0;border-bottom:1px solid var(--line-soft)}
+.hist .bad{color:var(--bad)}
 h2{font-family:var(--display);font-weight:400;font-size:1.35rem;margin:1.8rem 0 .2rem}
 .sub2{color:var(--faint);font-family:var(--mono);font-size:.7rem;
       letter-spacing:.1em;text-transform:uppercase;margin-bottom:.9rem}
@@ -230,9 +252,18 @@ footer{margin-top:2.4rem;padding:1.4rem 0 2.2rem;border-top:1px solid var(--line
   <div class="grid" id="circuits"></div>
 
   <h2>Scenes</h2>
-  <div class="sub2">several controls in one tap · made in the poolhound app · run here, one step at a time</div>
-  <div id="scenes"><span class="sub2">loading…</span></div>
-  <p id="scenes-note"></p>
+  <div class="sub2">several controls in one tap · the same scenes as the poolhound app</div>
+  <div class="cards" id="scenes"><span class="sub2">loading…</span></div>
+  <p class="note" id="scenes-note" role="status"></p>
+  <details class="form" id="scene-form"><summary>New scene</summary><div id="scene-editor"></div></details>
+
+  <h2>Schedules</h2>
+  <div class="sub2">run by this Pi · the same schedules as the poolhound app</div>
+  <p class="note" id="sched-status" role="status">loading…</p>
+  <div class="cards" id="sched-list"></div>
+  <details class="form" id="sched-form"><summary>New schedule</summary><div id="sched-editor"></div></details>
+  <div id="sched-offs"></div>
+  <details class="form"><summary>What the schedules did</summary><div class="hist" id="sched-hist"></div></details>
 
   <div class="call">
     <span class="lbl">If you script against this API yourself</span>
@@ -714,112 +745,364 @@ footer{margin-top:2.4rem;padding:1.4rem 0 2.2rem;border-top:1px solid var(--line
   }
 
 
-  // Scenes, made in the poolhound app and handed to this page by its agent
-  // (/poolscenes -> the agent's /scenes, kept in memory on the Pi), so they
-  // run here even when the poolhound server cannot be reached. The steps
-  // arrive in the order they must run -- the pump first, a heater's
-  // temperature before the heater -- and are run that way, one at a time,
-  // with the same wake / claim / press / wait / verify every button here
-  // uses, because the panel drops the first command after a sleep. A scene
-  // STOPS at the first step that does not take: a heater is never started
-  // after its pump failed. "Then switch off after" is the poolhound server's
-  // to arrange; a scene run from this page does not switch itself off.
-  var scenesBusy = false;
+  // SCENES AND SCHEDULES -- the same ones the poolhound app has, kept on this
+  // Pi and run by it, so they work with the server and the internet away
+  // (poolhound docs/LOCAL-AND-SYNC.md). This page edits them through the
+  // agent (/poollocal -> its /local) and never presses a button for them
+  // itself: the agent wakes the panel, presses, reads it back, and arranges
+  // the "then off after". A change here reaches the poolhound app at the next
+  // sync, and one made there reaches here; the later change wins.
+  //
+  // Every string below is drawn as text: anyone on this network can name a
+  // scene, so a name is never markup.
+  var LOCAL = '/poollocal';
+  var local = null, editingScene = null;
 
-  function stepWords(st) {
-    var nm = (NAMES[st.device] || {}).name || st.label || st.device;
-    if (st.action === 'setpoint') return nm + ' to ' + st.value + '°F';
-    return nm + (Number(st.value) ? ' on' : ' off');
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = String(text);
+    return e;
+  }
+  function btn(text, cls, fn) {
+    var b = el('button', cls || null, text);
+    b.type = 'button';
+    b.addEventListener('click', fn);
+    return b;
+  }
+  function note(id, text, cls) {
+    var n = document.getElementById(id);
+    n.textContent = text || '';
+    n.className = 'note' + (cls ? ' ' + cls : '');
+  }
+  function post(what, body) {
+    // The header and the JSON type make a browser ask first before sending
+    // this from any other site, and the agent never says yes: only this page
+    // can save here.
+    return fetch(LOCAL + '/' + what, {method: 'POST', body: JSON.stringify(body),
+      headers: {'Content-Type': 'application/json', 'X-Poolhound-Local': '1'}})
+      .then(function (r) { return r.json().catch(function () { return {}; })
+        .then(function (j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  function label(dev) {
+    var c = local && local.devices || {};
+    var s = (c.switches || {})[dev] || (c.setpoints || {})[dev];
+    return s ? s.label : ((NAMES[dev] || {}).name || dev);
+  }
+  function hours(h) { return h + ' h'; }
+  function clock(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'});
   }
 
-  function runStep(st) {
-    var isTemp = st.action === 'setpoint';
-    var path = '/' + st.device + (isTemp ? '/setpoint/set' : '/set');
-    var wait = isTemp ? 20000 : (SLOW[st.device] ? SETTLE_SLOW : SETTLE);
-    function took() {
-      var d = state[st.device];
-      if (!d) return false;
-      return isTemp ? Number(d.spvalue) === Number(st.value)
-                    : d.state === (Number(st.value) ? 'on' : 'off');
-    }
-    function attempt(n) {
-      return fetchJSON(API + '/status').catch(function () { return null; })   // wake it
-        .then(function () { return new Promise(function (r) { setTimeout(r, 5000); }); })
-        .then(function () { return command(path, st.value); })
-        .catch(function () { return null; })
-        .then(function () { return new Promise(function (r) { setTimeout(r, wait); }); })
-        .then(read)
-        .then(function () {
-          if (took()) return true;
-          if (n < 3) { log('    attempt ' + n + ' did not take — retrying', 'warn'); return attempt(n + 1); }
-          return false;
-        });
-    }
-    return attempt(1);
+  // ------------------------------------------------------------- scenes
+  function paintScenes() {
+    var host = document.getElementById('scenes');
+    host.textContent = '';
+    var list = (local.scenes || {}).scenes || [];
+    if (!list.length) host.appendChild(el('span', 'sub2', 'no scenes yet — make one below'));
+    list.forEach(function (sc) {
+      var c = el('div', 'card');
+      c.appendChild(el('p', 'nm', sc.name));
+      c.appendChild(el('p', 'what', sc.what));
+      c.appendChild(el('p', 'meta', sc.off_after_h
+        ? 'then off after ' + hours(sc.off_after_h) + ': ' + (sc.then_off || []).join(', ')
+        : 'stays on until switched off'));
+      var a = el('div', 'acts');
+      a.appendChild(btn('Run', 'primary', function () { runScene(sc); }));
+      a.appendChild(btn('Edit', null, function () { editScene(sc); }));
+      a.appendChild(btn('Delete', 'danger', function () {
+        if (!window.confirm('Delete the scene ' + sc.name + '? It goes from the poolhound app too.')) return;
+        post('scene/delete', {id: sc.id}).then(function () { note('scenes-note', 'deleted ' + sc.name, 'ok'); load(); })
+          .catch(function (e) { note('scenes-note', 'not deleted: ' + e.message, 'bad'); });
+      }));
+      c.appendChild(a);
+      host.appendChild(c);
+    });
   }
 
   function runScene(sc) {
-    if (scenesBusy) return;
-    var heats = sc.steps.some(function (s) { return s.action === 'heat' && Number(s.value); });
-    var words = sc.steps.map(stepWords);
-    if (!window.confirm((heats ? 'This lights a gas heater.\n\n' : '') + 'Run ' + sc.name + '?\n\n'
-        + words.join('\n') + '\n\nAbout ' + Math.round(sc.steps.length * 25) + ' s, one step at a time.'
-        + (sc.off_after_h ? '\n\nIt will NOT switch itself off after ' + sc.off_after_h
-           + ' h from this page — that happens only when it is run from the poolhound app.' : ''))) return;
-    scenesBusy = true; paintScenes(lastScenes);
-    log('scene ' + sc.name + ': ' + words.join(' → '));
-    var i = 0;
-    function next() {
-      if (i >= sc.steps.length) { log('scene ' + sc.name + ': done', 'ok'); return Promise.resolve(); }
-      var st = sc.steps[i++];
-      log('  → ' + stepWords(st));
-      return runStep(st).then(function (ok) {
-        if (ok) return next();
-        log('scene ' + sc.name + ' stopped: ' + stepWords(st) + ' did not take, so nothing after it was pressed', 'bad');
-      });
-    }
-    next().catch(function () {}).then(function () {
-      scenesBusy = false; paintScenes(lastScenes); loadActivity(); paint();
-    });
+    var gas = sc.steps.some(function (s) { return s.action === 'heat' && Number(s.value); });
+    if (!window.confirm((gas ? 'This lights a gas heater.\n\n' : '') + 'Run ' + sc.name + '?\n\n'
+        + sc.what + (sc.off_after_h ? '\n\nThen off after ' + hours(sc.off_after_h) + '.' : '')
+        + '\n\nThe Pi runs it one step at a time, waking the panel and checking each step,'
+        + ' about 20–50 s a step.')) return;
+    post('scene/run', {id: sc.id}).then(function () {
+      note('scenes-note', 'running ' + sc.name + ' — each step appears under Activity as the panel takes it', 'ok');
+      log('scene ' + sc.name + ': started on the Pi');
+      var n = 0, t = setInterval(function () { loadActivity(); read(); if (++n > 30) clearInterval(t); }, 10000);
+    }).catch(function (e) { note('scenes-note', 'not started: ' + e.message, 'bad'); });
   }
 
-  var lastScenes = null;
-  function paintScenes(j) {
-    var host = document.getElementById('scenes');
-    var note = document.getElementById('scenes-note');
-    host.textContent = '';
-    note.className = '';
-    if (!j) { note.textContent = ''; return; }
-    var list = j.scenes || [];
-    if (!list.length) {
-      var e = document.createElement('span');
-      e.className = 'sub2';
-      e.textContent = j.error ? 'no scenes yet — ' + j.error : 'no scenes yet — make them in the poolhound app';
-      host.appendChild(e);
-    }
-    list.forEach(function (sc) {
-      var b = document.createElement('button');
-      b.className = 'primary';
-      b.textContent = sc.name;
-      b.title = sc.steps.map(stepWords).join(' → ');
-      b.setAttribute('aria-label', 'Run the scene ' + sc.name);
-      b.disabled = scenesBusy;
-      b.addEventListener('click', function () { runScene(sc); });
-      host.appendChild(b);
+  // The editor: one row per switch and heater, "no change" by default.
+  function editScene(sc) {
+    editingScene = sc || null;
+    var box = document.getElementById('scene-editor');
+    var form = document.getElementById('scene-form');
+    form.open = true;
+    form.querySelector('summary').textContent = sc ? 'Edit ' + sc.name : 'New scene';
+    box.textContent = '';
+    var f = el('div', 'frm');
+    var nameL = el('label', null, 'Name');
+    var name = el('input');
+    name.maxLength = 40; name.value = sc ? sc.name : '';
+    nameL.appendChild(name);
+    f.appendChild(nameL);
+
+    var have = {};
+    (sc ? sc.steps : []).forEach(function (s) { have[s.action + ':' + s.device] = s.value; });
+    var steps = el('div', 'steps');
+    var rows = [];
+    var cat = local.devices || {};
+    Object.keys(cat.switches || {}).forEach(function (dev) {
+      if (dev.indexOf('/') >= 0) return;
+      var r = el('div', 'step');
+      r.appendChild(el('span', null, label(dev)));
+      var s = el('select');
+      [['', 'no change'], ['1', 'on'], ['0', 'off']].forEach(function (o) {
+        var op = el('option', null, o[1]); op.value = o[0]; s.appendChild(op); });
+      var k = 'set:' + dev;
+      s.value = k in have ? String(Number(have[k])) : '';
+      s.setAttribute('aria-label', label(dev));
+      r.appendChild(s); r.appendChild(el('span'));
+      steps.appendChild(r);
+      rows.push(function () { return s.value === '' ? null : {action: 'set', device: dev, value: Number(s.value)}; });
     });
-    note.textContent = scenesBusy ? 'running a scene — see the log below'
-      : (j.error && list.length ? 'from the last list the Pi fetched; the server could not be reached just now' : '');
-    if (j.error && list.length) note.className = 'bad';
+    (cat.heaters || []).forEach(function (dev) {
+      var sp = (cat.setpoints || {})[dev] || {min: 60, max: 104};
+      var r = el('div', 'step');
+      r.appendChild(el('span', null, label(dev)));
+      var s = el('select');
+      [['', 'no change'], ['1', 'on'], ['0', 'off']].forEach(function (o) {
+        var op = el('option', null, o[1]); op.value = o[0]; s.appendChild(op); });
+      s.value = ('heat:' + dev) in have ? String(Number(have['heat:' + dev])) : '';
+      s.setAttribute('aria-label', label(dev));
+      var t = el('input');
+      t.type = 'number'; t.min = sp.min; t.max = sp.max; t.placeholder = '°F';
+      t.setAttribute('aria-label', label(dev) + ' temperature, °F');
+      if (('setpoint:' + dev) in have) t.value = have['setpoint:' + dev];
+      r.appendChild(s); r.appendChild(t);
+      steps.appendChild(r);
+      rows.push(function () { return s.value === '' ? null : {action: 'heat', device: dev, value: Number(s.value)}; });
+      rows.push(function () { return t.value === '' ? null : {action: 'setpoint', device: dev, value: Number(t.value)}; });
+    });
+    f.appendChild(steps);
+
+    var offL = el('label', null, 'Then switch off after');
+    var off = el('select');
+    var o0 = el('option', null, 'never'); o0.value = ''; off.appendChild(o0);
+    ((local.schedules || {}).off_after_choices || []).forEach(function (h) {
+      var o = el('option', null, hours(h)); o.value = String(h); off.appendChild(o); });
+    off.value = sc && sc.off_after_h ? String(sc.off_after_h) : '';
+    offL.appendChild(off);
+    f.appendChild(offL);
+    f.appendChild(el('p', 'note', 'Switching off afterwards leaves the filter pump to the panel’s own program.'));
+
+    var a = el('div', 'acts');
+    var msg = el('p', 'note');
+    a.appendChild(btn('Save', 'primary', function () {
+      var body = {name: name.value, off_after_h: off.value ? Number(off.value) : null,
+                  steps: rows.map(function (g) { return g(); }).filter(Boolean)};
+      if (editingScene) body.id = editingScene.id;
+      post('scene/save', body).then(function () {
+        msg.textContent = ''; form.open = false; editingScene = null;
+        note('scenes-note', 'saved ' + body.name + ' — the poolhound app gets it at the next sync', 'ok');
+        load();
+      }).catch(function (e) { msg.textContent = 'not saved: ' + e.message; msg.className = 'note bad'; });
+    }));
+    a.appendChild(btn('Cancel', null, function () { form.open = false; editingScene = null; }));
+    if (!sc) ((local.scenes || {}).templates || []).forEach(function (t) {
+      a.appendChild(btn('Start from: ' + t.name, null, function () {
+        editScene({name: t.name, steps: t.steps, off_after_h: t.off_after_h, id: null});
+        editingScene = null;
+      }));
+    });
+    f.appendChild(a);
+    f.appendChild(msg);
+    box.appendChild(f);
+    name.focus();
   }
-  function loadScenes() {
-    return fetchJSON('/poolscenes').then(function (j) { lastScenes = j; paintScenes(j); })
-      .catch(function () {
-        lastScenes = {scenes: [], error: 'poolhound’s agent is not answering'};
-        paintScenes(lastScenes);
+
+  // ------------------------------------------------------------- schedules
+  function paintSchedules() {
+    var s = local.schedules || {}, h = local.health || {};
+    var age = h.last_tick ? Math.round((Date.now() - new Date(h.last_tick).getTime()) / 1000) : null;
+    note('sched-status',
+      (age === null ? 'the Pi’s scheduler has not looked yet'
+        : age > 120 ? 'the Pi’s scheduler last looked ' + Math.round(age / 60) + ' min ago — it may be stuck'
+        : 'the Pi’s scheduler looks every 20 s')
+      + (h.errors ? ' · ' + h.errors + ' failed look(s): ' + h.last_error : '')
+      + (local.connected ? (h.sync_error ? ' · last sync with poolhound failed: ' + h.sync_error
+                                        : h.last_sync ? ' · in step with poolhound' : ' · not synced yet')
+                         : ' · no poolhound server: these run here alone'),
+      age === null || age > 120 || h.errors || h.sync_error ? 'warn' : '');
+
+    var host = document.getElementById('sched-list');
+    host.textContent = '';
+    if (!(s.schedules || []).length) host.appendChild(el('span', 'sub2', 'no schedules — make one below'));
+    (s.schedules || []).forEach(function (x) {
+      var c = el('div', 'card');
+      c.appendChild(el('p', 'nm', x.what));
+      c.appendChild(el('p', 'what', x.when + (x.off_after_h ? ', then off after ' + hours(x.off_after_h) : '')));
+      c.appendChild(el('p', 'meta', (x.next ? 'next ' + clock(x.next) : 'not due again')
+        + (x.by ? ' · from ' + x.by : '')));
+      var a = el('div', 'acts');
+      a.appendChild(btn('Cancel it', 'danger', function () {
+        if (!window.confirm('Cancel: ' + x.what + ', ' + x.when + '? It goes from the poolhound app too.')) return;
+        post('schedule/cancel', {id: x.id}).then(load)
+          .catch(function (e) { note('sched-status', 'not cancelled: ' + e.message, 'bad'); });
+      }));
+      c.appendChild(a);
+      host.appendChild(c);
+    });
+
+    var offs = document.getElementById('sched-offs');
+    offs.textContent = '';
+    if ((s.autooffs || []).length) {
+      offs.appendChild(el('h2', null, 'Switching off later'));
+      var cards = el('div', 'cards');
+      s.autooffs.forEach(function (o) {
+        var c = el('div', 'card');
+        c.appendChild(el('p', 'nm', o.what));
+        c.appendChild(el('p', 'what', 'due ' + clock(o.due)
+          + (o.cause === 'max-on' ? ' · the household limit — not cancelled here' : '')
+          + (o.attempts ? ' · tried ' + o.attempts + ' time(s)' : '')));
+        if (o.cancellable) {
+          var a = el('div', 'acts');
+          a.appendChild(btn('Leave it on', null, function () {
+            if (!window.confirm('Leave it on — no automatic off for ' + o.label + '?')) return;
+            post('schedule/cancel', {id: o.id}).then(load)
+              .catch(function (e) { note('sched-status', 'not changed: ' + e.message, 'bad'); });
+          }));
+          c.appendChild(a);
+        }
+        cards.appendChild(c);
       });
+      offs.appendChild(cards);
+    }
+
+    var hist = document.getElementById('sched-hist');
+    hist.textContent = '';
+    (s.history || []).slice(0, 25).forEach(function (r) {
+      var d = el('div', r.severity === 'serious' ? 'bad' : null,
+        clock(r.at) + ' · ' + r.what + ' — ' + r.outcome + (r.detail ? ': ' + r.detail : ''));
+      hist.appendChild(d);
+    });
+    if (!hist.firstChild) hist.appendChild(el('div', null, 'nothing yet'));
   }
-  loadScenes();
-  setInterval(function () { if (!scenesBusy) loadScenes(); }, 60000);
+
+  // What a schedule can do: switch something, set a temperature, run a scene.
+  function scheduleForm() {
+    var box = document.getElementById('sched-editor');
+    box.textContent = '';
+    var f = el('div', 'frm');
+    var cat = local.devices || {}, s = local.schedules || {};
+    var whatL = el('label', null, 'What');
+    var what = el('select');
+    function opt(text, val) { var o = el('option', null, text); o.value = JSON.stringify(val); what.appendChild(o); }
+    Object.keys(cat.switches || {}).forEach(function (dev) {
+      if (dev.indexOf('/') >= 0) return;
+      opt(label(dev) + ' on', {action: 'set', device: dev, value: 1});
+      opt(label(dev) + ' off', {action: 'set', device: dev, value: 0});
+    });
+    (cat.heaters || []).forEach(function (dev) {
+      opt(label(dev) + ' on (gas)', {action: 'heat', device: dev, value: 1});
+      opt(label(dev) + ' off', {action: 'heat', device: dev, value: 0});
+      opt(label(dev) + ': set the temperature', {action: 'setpoint', device: dev});
+    });
+    ((local.scenes || {}).scenes || []).forEach(function (sc) {
+      opt('Run the scene ' + sc.name, {action: 'scene', device: sc.id});
+    });
+    whatL.appendChild(what);
+    f.appendChild(whatL);
+
+    var tempL = el('label', null, 'Temperature, °F');
+    var temp = el('input'); temp.type = 'number';
+    tempL.appendChild(temp);
+    f.appendChild(tempL);
+
+    var row = el('div', 'row');
+    var repL = el('label', null, 'When');
+    var rep = el('select');
+    [['daily', 'every day'], ['weekdays', 'weekdays'], ['weekends', 'weekends'], ['once', 'once']]
+      .forEach(function (o) { var op = el('option', null, o[1]); op.value = o[0]; rep.appendChild(op); });
+    repL.appendChild(rep);
+    var timeL = el('label', null, 'At');
+    var time = el('input'); time.type = 'time'; time.value = '19:00';
+    timeL.appendChild(time);
+    var atL = el('label', null, 'On');
+    var at = el('input'); at.type = 'datetime-local';
+    atL.appendChild(at);
+    row.appendChild(repL); row.appendChild(timeL); row.appendChild(atL);
+    f.appendChild(row);
+
+    var offL = el('label', null, 'Then switch off after');
+    var off = el('select');
+    offL.appendChild(off);
+    f.appendChild(offL);
+
+    function sync() {
+      var v = JSON.parse(what.value);
+      tempL.hidden = v.action !== 'setpoint';
+      if (v.action === 'setpoint') {
+        var sp = (cat.setpoints || {})[v.device] || {};
+        temp.min = sp.min; temp.max = sp.max;
+      }
+      timeL.hidden = rep.value === 'once';
+      atL.hidden = rep.value !== 'once';
+      // Only something switched ON, of the kinds the household allows.
+      var can = v.action !== 'scene' && v.value === 1 && (v.device in (s.auto_off || {}));
+      off.textContent = '';
+      var n = el('option', null, 'never'); n.value = ''; off.appendChild(n);
+      if (can) (s.off_after_choices || []).forEach(function (h) {
+        var o = el('option', null, hours(h)); o.value = String(h); off.appendChild(o); });
+      if (can) off.value = String(s.auto_off[v.device]);
+      offL.hidden = !can;
+    }
+    what.addEventListener('change', sync);
+    rep.addEventListener('change', sync);
+    sync();
+
+    var msg = el('p', 'note');
+    var a = el('div', 'acts');
+    a.appendChild(btn('Save', 'primary', function () {
+      var v = JSON.parse(what.value);
+      var body = {action: v.action, device: v.device, repeat: rep.value,
+                  value: v.action === 'setpoint' ? Number(temp.value) : v.value,
+                  off_after_h: off.value ? Number(off.value) : null};
+      if (rep.value === 'once') body.at = at.value; else body.time = time.value;
+      if (v.action === 'heat' && v.value === 1 && !window.confirm(
+          'This schedule lights a gas heater with nobody here to see it. Save it?')) return;
+      post('schedule/create', body).then(function () {
+        msg.textContent = ''; document.getElementById('sched-form').open = false;
+        note('sched-status', 'saved — the poolhound app gets it at the next sync', 'ok');
+        load();
+      }).catch(function (e) { msg.textContent = 'not saved: ' + e.message; msg.className = 'note bad'; });
+    }));
+    f.appendChild(a);
+    f.appendChild(msg);
+    box.appendChild(f);
+  }
+
+  function load() {
+    return fetchJSON(LOCAL).then(function (j) {
+      local = j;
+      paintScenes();
+      paintSchedules();
+      if (!document.getElementById('sched-form').open) scheduleForm();
+    }).catch(function () {
+      note('scenes-note', 'poolhound’s agent on this Pi is not answering, so scenes and schedules cannot be shown', 'bad');
+      note('sched-status', 'not available', 'bad');
+    });
+  }
+  document.getElementById('scene-form').addEventListener('toggle', function (e) {
+    if (e.target.open && !document.getElementById('scene-editor').firstChild) editScene(null);
+  });
+  load();
+  setInterval(function () {
+    if (!document.getElementById('scene-form').open && !document.getElementById('sched-form').open) load();
+  }, 30000);
 
   loadActivity();
   setInterval(loadActivity, 20000);

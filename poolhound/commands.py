@@ -384,14 +384,18 @@ RATE_LIMIT, RATE_WINDOW_S = 12, 60
 class Refused(Exception):
     """Raised with a reason fit to show a person and to write to the log."""
 
-def new_command(action, device=None, value=None, by=None):
-    """Construct one. Used by the server; the agent never trusts the result."""
-    return {
+def new_command(action, device=None, value=None, by=None, off_after_h=None):
+    """Construct one. Used by the server and by the Pi's own scheduler; the
+    agent never trusts the result."""
+    cmd = {
         "id": str(uuid.uuid4()),
         "issued": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "action": action, "device": device, "value": value,
         "by": (by or "unknown")[:120],
     }
+    if off_after_h not in (None, "", 0, "0"):
+        cmd["off_after_h"] = off_after_h
+    return cmd
 
 def _age_seconds(issued, now=None):
     try:
@@ -403,7 +407,34 @@ def _age_seconds(issued, now=None):
     now = now or dt.datetime.now(dt.timezone.utc)
     return (now - t).total_seconds()
 
+# "Then switch it off after" riding on a command, in hours. Here rather than in
+# schedule.py because the command now carries it to the Pi, which arranges the
+# automatic off (docs/LOCAL-AND-SYNC.md), and both ends check it here.
+OFF_AFTER_CHOICES = (0.5, 1, 2, 3, 4, 6, 8, 12)
+
+
 def validate(cmd, now=None):
+    """validate_shape(), and the optional `off_after_h` a press may carry:
+    one of OFF_AFTER_CHOICES, on a set, heat or setpoint. Whether that device
+    offers it is the scheduler's question (schedule.check_off_after), asked
+    by whichever machine records the automatic off."""
+    out = validate_shape(cmd, now)
+    raw = cmd.get("off_after_h") if isinstance(cmd, dict) else None
+    if raw not in (None, "", 0, "0"):
+        if out["action"] not in ("set", "heat", "setpoint"):
+            raise Refused("only a switch, a heater or a temperature can be switched off afterwards")
+        try:
+            h = float(raw)
+        except (TypeError, ValueError):
+            raise Refused("off_after_h must be a number of hours")
+        if h not in OFF_AFTER_CHOICES:
+            raise Refused("off after must be one of "
+                          + ", ".join(f"{c:g}" for c in OFF_AFTER_CHOICES) + " hours")
+        out["off_after_h"] = h
+    return out
+
+
+def validate_shape(cmd, now=None):
     """Check one command. Returns a normalised copy or raises Refused.
 
     Deliberately strict about shape as well as content. A command is a small

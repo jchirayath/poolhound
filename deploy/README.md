@@ -529,24 +529,42 @@ handle /poolactivity {
 }
 ```
 
-### Scenes at the pool
+### Scenes and schedules at the pool
 
-The page's Scenes buttons come from the same agent. It fetches the
-household's scenes from `/api/agent/scenes` every ten minutes and keeps them
-**in memory only**, so a scene can be run at the pool with the server
-unreachable, from the last list the Pi saw (the page says so when it is).
-The page runs a scene itself, one step at a time, with the same wake, claim,
-press, wait and verify as every button on it, and stops at the first step that
-does not take. "Then switch off after" is the server's to arrange, so a scene
-run from this page does not switch itself off, and its confirmation says so;
-the household max-on still applies, because it reads the panel.
+poolhound local has the same scenes and schedules as the poolhound app, so a
+household without the server loses nothing (`docs/LOCAL-AND-SYNC.md`). The
+agent keeps them in `/var/lib/poolhound` (its systemd `StateDirectory`),
+written only when one changes, and **the Pi runs them**: every schedule, every
+"then switch off after", the household max-on. For what it runs by itself it
+wakes the panel first and judges each press by what the panel reports
+afterwards, not by AqualinkD's 200.
+
+Edits from either page meet at the agent's next sync with the server: only
+when something changed, and the later change wins. The page talks only to the
+agent, never to AqualinkD, for these:
 
 ```
-handle /poolscenes {
-    rewrite * /scenes
+handle /poollocal* {
+    uri replace /poollocal /local
     reverse_proxy 127.0.0.1:8791
 }
 ```
+
+`GET /poollocal` is the whole view: scenes, schedules, pending automatic offs,
+what the schedules did, and the runner's health. It never says WHO: an
+address on a schedule made in the app is shown as "poolhound app". The edits
+are `POST /poollocal/{scene/save, scene/delete, scene/run, schedule/create,
+schedule/cancel}` and need the `X-Poolhound-Local: 1` header and a JSON body,
+which makes a browser ask before sending them from any other site; the agent
+never says yes. They are also refused unless the page reached the Pi by an IP
+address, `localhost` or a `.local` name (`pool-pi.local`): a site
+that points its own name at the Pi (DNS rebinding) would otherwise count as
+the same site. Another name the house uses goes in `POOLHOUND_LOCAL_HOSTS`
+(comma-separated) in `/etc/poolhound/agent.env`: a bare name such as
+`pool-pi`, or a Tailscale name.
+The same rule covers the claim and the activity list. Anyone on the house network
+can edit them, as anyone there can already switch the heater through
+AqualinkD.
 
 ## Why this directory has no real hostnames in it
 

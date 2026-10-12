@@ -7,21 +7,25 @@ the half that matters more, "and switch it off again afterwards". A schedule is
 a DEFERRED COMMAND: somebody with `operate` decides now what the pool will be
 told later. Everything below follows from taking that sentence literally.
 
-ONE COMMAND PATH, NOT TWO
+WHERE IT RUNS: ON THE PI (docs/LOCAL-AND-SYNC.md)
 
-At the due time this does not talk to the agent. It calls server.command() --
-the function a button press reaches -- with `by` set to "schedule" or
-"auto-off". So a scheduled command is validated by commands.validate(), rate
-limited by the queue, written to audit.csv, carried down the same SSE stream
-and refused by the same Guard on the Pi, with its 300 s heater cooldown and its
-MAX_AGE_S expiry. There is no second way into the panel to keep in step with
-the first, and nothing here can do what a person at the Control tab could not.
+The same code runs on both machines, and only one of them fires. The PI does,
+through pirunner: so a schedule fires when the internet or the server is down,
+poolhound local can make and change them, and nothing can fire twice. It
+issues each command through the agent's own path -- commands.validate() and
+the Guard, with its 300 s heater cooldown -- and judges it by what the panel
+reports afterwards. It keeps this file in /var/lib/poolhound, written only
+when something changed (tick() writes nothing on a quiet look), because the
+card is the thing that has died twice.
 
-The Pi stores nothing. It has destroyed two SD cards, and the schedule is not
-its business: it receives an ordinary command at the moment the command is
-due, exactly as it would from a person.
+The SERVER keeps a copy, kept in step by sync.py, and fires nothing once the
+Pi has synced (look(), pi_runs()). Its thread withdraws a schedule whose author
+lost the right, which the Pi cannot check, and mails the alerts the Pi
+records, which the Pi cannot send. Until the Pi has synced -- an older agent --
+the server fires them as it always did, through server.command(), the function
+a button press reaches.
 
-WHY IT IS ON THE SERVER'S DISK AND THE QUEUE IS NOT
+WHY IT IS ON DISK AND THE QUEUE IS NOT
 
 queue_.py is in memory on purpose -- a command older than five minutes is
 refused on arrival, so persisting the queue only preserves things too old to
@@ -103,7 +107,7 @@ different process, on cron -- reads, and alerts on when it goes stale.
 import csv, datetime as dt, json, os, sys, threading, time, traceback, uuid
 from zoneinfo import ZoneInfo
 
-from . import access, commands as C, config, locking
+from . import access, commands as C, config, locking, syncdefs as SD
 
 FILE = "schedules.json"
 
@@ -137,7 +141,7 @@ HISTORY_KEEP = 200
 SCHEDULES_MAX = 50
 
 # Offered on the page; anything else is refused.
-OFF_AFTER_CHOICES = (0.5, 1, 2, 3, 4, 6, 8, 12)
+OFF_AFTER_CHOICES = C.OFF_AFTER_CHOICES
 OFF_AFTER_MAX_H = max(OFF_AFTER_CHOICES)
 
 REPEATS = {
@@ -161,6 +165,11 @@ DEFAULT_AUTO_OFF_H = {"Spa": 2, "Spa_Heater": 2, "Pool_Heater": 6}
 DEFAULT_MAX_ON_H = {"Spa_Heater": 3}
 
 SEVERE = "serious"
+
+# The settings this process's describing and scene lookups use. The server
+# has its config.toml; the Pi has what the server last sent it, or nothing,
+# and must never call config.load() (which exits when there is no file).
+_CFG = {"cfg": None}
 
 # --------------------------------------------------------------- the clock
 _TZ = None
@@ -353,8 +362,11 @@ def path(data=None):
 
 
 def _empty():
+    # `deleted`: markers for schedules cancelled, withdrawn or run out, so a
+    # sync cannot bring one back (syncdefs). `pi_at`: on the server, when the
+    # Pi last sent its runner's state; once set, the Pi runs the schedules.
     return {"version": 1, "schedules": [], "autooffs": [], "net": {},
-            "history": [], "alive_at": None}
+            "history": [], "alive_at": None, "deleted": [], "pi_at": None}
 
 
 def _load(data, now):
@@ -416,6 +428,15 @@ def _save(data, st):
     locking.replace_atomically(path(data), lambda f: json.dump(st, f, indent=1))
 
 
+def _remove(st, row, now, kind="schedule"):
+    """Take a schedule (or an automatic off) out, and leave the marker that
+    tells the other machine it went."""
+    key = "schedules" if kind == "schedule" else "autooffs"
+    if row in st[key]:
+        st[key].remove(row)
+    st["deleted"] = SD.prune(st.get("deleted", []) + [SD.tombstone(kind, row.get("id"), now)], now)
+
+
 def _locked(data):
     return locking.exclusive(data or config.data_dir(), "schedules")
 
@@ -445,7 +466,7 @@ def _what(cmd):
     # was scheduled, the list says what it is called today.
     if cmd.get("action") == "scene":
         from . import scenes as SC
-        sc = SC.get(config.load(), str(cmd.get("device") or ""))
+        sc = SC.get(_CFG.get("cfg"), str(cmd.get("device") or ""))
         return f"scene {sc['name']}" if sc else "a scene that has since been deleted"
     return C.describe(cmd)
 
@@ -484,7 +505,7 @@ def create(body, who, cfg=None, data=None, now=None):
         return None, "repeat must be one of " + ", ".join(REPEATS)
     row = {"id": uuid.uuid4().hex[:12], **cmd, "repeat": rep,
            "by": str(who or "")[:120], "created": _iso(now), "last_key": None,
-           "off_after_h": None}
+           "off_after_h": None, "updated_at": SD.stamp(now)}
     if rep == "once":
         raw = str(body.get("at") or "").strip()
         try:
@@ -520,6 +541,85 @@ def create(body, who, cfg=None, data=None, now=None):
     return row, None
 
 
+def clean_synced(row, cfg=None):
+    """A schedule that arrived from the other machine, rebuilt field by field,
+    or None. Held to what create() accepts, except that a one-off may already
+    be in the past (it will be reported missed, not run) and a scene it names
+    may arrive in the same exchange."""
+    import re
+    if not isinstance(row, dict):
+        return None
+    rid = str(row.get("id") or "")
+    if not re.fullmatch(r"[0-9a-zA-Z]{6,40}", rid):
+        return None
+    cmd = {"action": row.get("action"), "device": row.get("device"), "value": row.get("value")}
+    if cmd["action"] == "scene":
+        if not re.fullmatch(r"[0-9a-zA-Z]{4,16}", str(cmd["device"] or "")):
+            return None
+        cmd["value"] = None
+        off = None
+    elif cmd["action"] in ("set", "setpoint", "heat"):
+        try:
+            v = C.validate({"id": "0" * 16, "issued": _iso(utcnow()), **cmd})
+        except C.Refused:
+            return None
+        cmd["value"] = v["value"]
+        off = row.get("off_after_h")
+        if off in (None, "", 0, "0"):
+            off = None
+        else:
+            try:
+                off = float(off)
+            except (TypeError, ValueError):
+                return None
+            if off not in OFF_AFTER_CHOICES:
+                return None
+    else:
+        return None
+    rep = row.get("repeat")
+    if rep not in REPEATS:
+        return None
+    out = {"id": rid, **cmd, "repeat": rep, "off_after_h": off,
+           "by": str(row.get("by") or "")[:120]}
+    for k in ("created", "updated_at"):
+        t = _parse(row.get(k))
+        if t:
+            out[k] = SD.stamp(t) if k == "updated_at" else _iso(t)
+    if rep == "once":
+        at = _parse(row.get("at"))
+        if not at:
+            return None
+        out["at"] = _iso(at)
+    else:
+        hm = _hhmm(row.get("time"))
+        if not hm:
+            return None
+        out["time"] = f"{hm[0]:02d}:{hm[1]:02d}"
+    lk = row.get("last_key")
+    out["last_key"] = lk if lk == "once" or (isinstance(lk, str) and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", lk)) else None
+    return out
+
+
+def adopt_autooffs(offs, data=None, now=None):
+    """The Pi's half of the hand-over: the automatic offs the server was
+    holding, run from here now. Added by id; never duplicated."""
+    now = now or utcnow()
+    offs = [o for o in offs or () if isinstance(o, dict) and o.get("id") and
+            isinstance(o.get("cmd"), dict)]
+    if not offs:
+        return False
+    with _locked(data):
+        st = _load_w(data, now)
+        have = {o.get("id") for o in st["autooffs"]}
+        new = [o for o in offs if o["id"] not in have]
+        if not new:
+            return False
+        st["autooffs"] += new
+        _save(data, st)
+    return True
+
+
 def cancel(body, who, cfg=None, data=None, now=None):
     """Cancel a schedule or a pending auto-off. (row, None) or (None, reason).
 
@@ -539,7 +639,7 @@ def cancel(body, who, cfg=None, data=None, now=None):
                     return None, ("this is the household safety net from "
                                   "[schedule.max_on] in config.toml, and it is "
                                   "not cancelled from the page")
-                st[key].remove(row)
+                _remove(st, row, now, "schedule" if key == "schedules" else "autooff")
                 what = _what(row.get("cmd") or row)
                 _history(st, now, "cancelled", what, "cancelled",
                          describe_when(row) if key == "schedules"
@@ -631,7 +731,34 @@ def listing(cfg=None, data=None, now=None):
             "max_on": max_on_hours(cfg), "auto_off": auto_off_hours(cfg),
             "off_after_choices": list(OFF_AFTER_CHOICES), "tz": config.DEPLOY_TZ,
             "grace_s": GRACE_S, "unreadable": bool(st.get("_unreadable")),
-            "scheduler": health(now)}
+            "scheduler": health(now), "runner": runner_view(cfg, st, now)}
+
+
+def runner_view(cfg, st, now):
+    """Who runs these, and how that runner is: for the page's liveness line.
+    On the server once the Pi has taken over, from the Pi's last schedules
+    report; stale when that report is, or when the Pi said its last look was
+    long before it reported."""
+    if not st.get("pi_at"):
+        return {"on_pi": False}
+    try:
+        from . import programs
+        rec = programs.load(cfg) or {}
+    except Exception:                                        # noqa: BLE001
+        rec = {}
+    r = rec.get("runner") or None
+    got = rec.get("received_at")
+    rep_age = (now.timestamp() - got) if isinstance(got, (int, float)) else None
+    # A runner that had just started when the report went out has not looked
+    # yet; its start stands in, so a restart does not read as a dead runner
+    # for the half hour until the next report.
+    last = _parse((r or {}).get("last_tick")) or _parse((r or {}).get("started"))
+    read = rec.get("read_at")
+    lag = (read - last.timestamp()) if (last and isinstance(read, (int, float))) else None
+    stale = (r is None or rep_age is None or rep_age > 3 * 1800
+             or lag is None or lag > TICK_S * 6)
+    return {"on_pi": True, "since": st.get("pi_at"), "pi": r,
+            "report_age_s": int(rep_age) if rep_age is not None else None, "stale": stale}
 
 
 # ------------------------------------------------------- reading the panel
@@ -734,7 +861,13 @@ def _refusal(result, err):
     return res.get("refused") or res.get("error") or "the agent did not accept it"
 
 
-def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None):
+def _fp(st):
+    """What a tick may have changed, without alive_at: whether to write."""
+    return SD.fingerprint({k: v for k, v in st.items() if k != "alive_at"})
+
+
+def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None,
+         authority=None, keep_alive=True):
     """One look at the clock. Returns what it did, for the selftest and the log.
 
     TWO LOCKED PHASES WITH THE SENDING BETWEEN THEM, not one lock around the
@@ -747,8 +880,13 @@ def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None):
     under the lock.
     """
     cfg = cfg if cfg is not None else config.load()
+    _CFG["cfg"] = cfg
     now = now or utcnow()
     issue = issue or _issue_default
+    # Who may still run a schedule. The server's [access]; the Pi has no
+    # access list and passes its own (docs/LOCAL-AND-SYNC.md: the server
+    # withdraws, and the withdrawal reaches the Pi as a deletion).
+    authority = authority or (lambda who: access.may(who, "/api/schedule", cfg))
     if samples is None:
         samples = recent_samples(data)
     zone = tz()
@@ -765,6 +903,7 @@ def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None):
             # bin/watch says nothing will run.
             raise RuntimeError(f"{path(data)} could not be read; nothing scheduled "
                                f"will run until a person repairs or removes it")
+        before = _fp(st)
         for s in list(st["schedules"]):
             got = latest_due(s, now, zone)
             if not got:
@@ -781,9 +920,9 @@ def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None):
             # come back the day the policy changed again, and nobody could
             # say when it had been agreed to. Auto-offs are not asked: they
             # only ever stop something, and they are the system's, not a person's.
-            ok, need, held = access.may(s.get("by"), "/api/schedule", cfg)
+            ok, need, held = authority(s.get("by"))
             if not ok:
-                st["schedules"].remove(s)
+                _remove(st, s, now)
                 _history(st, now, "withdrawn", _what(cmd), "withdrawn",
                          f"{describe_when(s)}, set by {s.get('by') or 'nobody named'}, "
                          f"who now holds {held} and it needs {need} — not sent, "
@@ -795,7 +934,7 @@ def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None):
                 continue
             late = (now - occ).total_seconds()
             if s["repeat"] == "once":
-                st["schedules"].remove(s)
+                _remove(st, s, now)
             else:
                 s["last_key"] = key
             if late > GRACE_S:
@@ -851,9 +990,16 @@ def tick(cfg=None, now=None, data=None, issue=None, notify=None, samples=None):
             o["last_try"] = _iso(now)
             jobs.append(("autooff", dict(o), dict(o.get("cmd") or {}), None))
 
-        if not st["alive_at"] or (now - _parse(st["alive_at"])).total_seconds() >= ALIVE_EVERY_S:
+        # WRITTEN ONLY WHEN SOMETHING CHANGED -- on the Pi this file is on the
+        # SD card, and a write every twenty seconds is 4,320 a day. alive_at is
+        # the exception the server keeps (bin/watch reads it from the file);
+        # the Pi says it is alive another way and passes keep_alive=False.
+        alive = keep_alive and (not st["alive_at"] or
+                                (now - _parse(st["alive_at"])).total_seconds() >= ALIVE_EVERY_S)
+        if alive:
             st["alive_at"] = _iso(now)
-        _save(data, st)
+        if alive or _fp(st) != before:
+            _save(data, st)
 
     # ---- 2. send, outside the lock
     outcomes = []
@@ -1112,7 +1258,118 @@ def net_lookup(data=None, now=None):
     return f
 
 
+# ------------------------------------------------------------- the sync
+# docs/LOCAL-AND-SYNC.md. The schedules people wrote ("defs") are merged with
+# syncdefs, last update wins; the runner's own state ("runtime": pending
+# automatic offs, the max-on net's memory, the history) belongs to the Pi and
+# is only shown by the server. History is the exception that both sides add
+# to -- a schedule created on either page is a row -- so it is a union by id.
+
+def export(data=None, now=None):
+    """(defs, runtime) as this side holds them."""
+    now = now or utcnow()
+    st = _load(data, now)
+    defs = {"schedules": [{k: r.get(k) for k in SD.SCHEDULE_FIELDS + ("last_key",) if k in r}
+                          for r in st["schedules"]],
+            "deleted": [d for d in SD.prune(st.get("deleted"), now)
+                        if d["kind"] in ("schedule", "autooff")]}
+    runtime = {"autooffs": st["autooffs"], "net": st["net"], "history": st["history"]}
+    return defs, runtime
+
+
+def runtime_fp(runtime):
+    """The runner's state, without the server's own `alerted` marks, which the
+    Pi never changes and must not make every sync look different."""
+    hist = [{k: v for k, v in h.items() if k != "alerted"} for h in runtime.get("history") or ()]
+    return SD.fingerprint({**runtime, "history": hist})
+
+
+def _union_history(a, b):
+    by = {}
+    for h in list(a or ()) + list(b or ()):
+        if not isinstance(h, dict) or not h.get("id"):
+            continue
+        old = by.get(h["id"])
+        if old is None:
+            by[h["id"]] = dict(h)
+        elif h.get("alerted") is True:
+            old["alerted"] = True          # told once is told
+    rows = sorted(by.values(), key=lambda h: str(h.get("at") or ""), reverse=True)
+    return rows[:HISTORY_KEEP]
+
+
+def apply_defs(merged, data=None, now=None):
+    """Install a merged list of schedules and deletion markers. True if this
+    changed anything; the file is written only then.
+
+    A schedule this side runs keeps its own last_key unless the merged one is
+    later (syncdefs already took the later). An automatic off named by an
+    "autooff" marker is dropped: the other page cancelled it.
+    """
+    now = now or utcnow()
+    with _locked(data):
+        st = _load_w(data, now)
+        before = _fp(st)
+        mine = {r["id"]: r for r in st["schedules"]}
+        rows = []
+        for r in merged.get("schedules") or ():
+            row = dict(mine.get(r["id"]) or {})
+            row.update({k: r.get(k) for k in SD.SCHEDULE_FIELDS if k in r})
+            row["last_key"] = r.get("last_key")
+            rows.append(row)
+        st["schedules"] = rows[:SCHEDULES_MAX]
+        gone = [d for d in merged.get("deleted") or () if d.get("kind") in ("schedule", "autooff")]
+        dropped = {d["id"] for d in gone if d["kind"] == "autooff"}
+        st["autooffs"] = [o for o in st["autooffs"]
+                          if o.get("id") not in dropped or o.get("cause") == "max-on"]
+        st["deleted"] = SD.prune(gone, now)
+        if _fp(st) == before:
+            return False
+        _save(data, st)
+    return True
+
+
+def mirror_runtime(runtime, data=None, now=None):
+    """The server's half: show what the Pi's runner holds. Its automatic offs
+    and net replace ours; history is merged. Marks that the Pi now runs the
+    schedules, after which this server never fires one (pi_runs())."""
+    now = now or utcnow()
+    with _locked(data):
+        st = _load_w(data, now)
+        before = _fp(st)
+        st["autooffs"] = [o for o in (runtime.get("autooffs") or []) if isinstance(o, dict)][:100]
+        st["net"] = runtime.get("net") if isinstance(runtime.get("net"), dict) else {}
+        st["history"] = _union_history(st["history"], runtime.get("history"))
+        first = not st.get("pi_at")
+        st["pi_at"] = st.get("pi_at") or _iso(now)
+        if _fp(st) != before or first:
+            _save(data, st)
+            return True
+    return False
+
+
+def pi_runs(data=None, now=None):
+    """Has the Pi taken over running the schedules? From then on, never fire
+    here: one runner, so nothing can run twice."""
+    return bool(_load(data, now or utcnow()).get("pi_at"))
+
+
+def handover(data=None, now=None):
+    """The automatic offs this server was holding when the Pi took over, for
+    the Pi to run; cleared here. Called once, at the first sync."""
+    now = now or utcnow()
+    with _locked(data):
+        st = _load_w(data, now)
+        if st.get("pi_at"):
+            return []
+        offs = list(st["autooffs"])
+        st["autooffs"] = []
+        _save(data, st)
+        return offs
+
+
 # ------------------------------------------------------------ the thread
+_TRIED = set()          # history rows this process has already tried to alert on
 _STATUS = {"started": None, "last_tick": None, "ticks": 0, "errors": 0,
            "last_error": None, "last_error_at": None}
 _THREAD = None
@@ -1134,10 +1391,75 @@ def health(now=None):
             "last_error_at": _STATUS["last_error_at"]}
 
 
+def server_duties(cfg=None, now=None, data=None, notify=None, nudge=None):
+    """What the server's thread does once the Pi runs the schedules.
+
+      * WITHDRAW a schedule whose author no longer holds the level to make
+        one -- the check tick() made at every firing, which the Pi cannot make
+        because it has no access list. Withdrawn here, it is a deletion, and
+        reaches the Pi at the next sync (nudge). A schedule made at poolhound
+        local (`door:`) is the house network's, and is kept.
+      * ALERT on what the Pi recorded -- a missed ON, an OFF that would not
+        take -- because the Pi cannot send mail.
+      * Stamp alive_at, so bin/watch still knows this thread is running.
+    """
+    cfg = cfg if cfg is not None else config.load()
+    _CFG["cfg"] = cfg
+    now = now or utcnow()
+    did, changed = [], False
+    with _locked(data):
+        st = _load_w(data, now)
+        for s in list(st["schedules"]):
+            if str(s.get("by") or "").startswith("door:"):
+                continue
+            ok, need, held = access.may(s.get("by"), "/api/schedule", cfg)
+            if ok:
+                continue
+            cmd = {k: s.get(k) for k in ("action", "device", "value")}
+            _remove(st, s, now)
+            _history(st, now, "withdrawn", _what(cmd), "withdrawn",
+                     f"{describe_when(s)}, set by {s.get('by') or 'nobody named'}, "
+                     f"who now holds {held} and it needs {need} — removed, here and "
+                     f"on the Pi", by=access.SCHEDULER,
+                     severity=SEVERE if C.is_off(cmd) else "info",
+                     device=cmd["device"], ref=s["id"])
+            did.append(("withdrawn", s["id"]))
+            changed = True
+        if changed or not st["alive_at"] or \
+                (now - _parse(st["alive_at"])).total_seconds() >= ALIVE_EVERY_S:
+            st["alive_at"] = _iso(now)
+            _save(data, st)
+        # One attempt each from here; bin/watch retries what is still
+        # unalerted ten minutes on, as it does for the scheduler's own rows.
+        pending = [h for h in st["history"]
+                   if h.get("severity") and h.get("alerted") is False
+                   and h.get("id") not in _TRIED]
+        _TRIED.update(h.get("id") for h in pending)
+    if changed and nudge:
+        nudge()
+    if pending:
+        sent = send_alerts(pending, cfg, notify)
+        if sent:
+            mark_alerted(sent, data=data, now=now)
+    return did
+
+
+def look(cfg=None, now=None, data=None, issue=None, notify=None, nudge=None):
+    """One look by the server's thread. ONE RUNNER: until the Pi has taken
+    over, this server fires the schedules as it always did; from the first
+    sync on, it never fires one again -- it mirrors, withdraws and alerts."""
+    if pi_runs(data, now):
+        if nudge is None:
+            from .server import QUEUE
+            nudge = QUEUE.nudge
+        return server_duties(cfg, now, data, notify, nudge)
+    return tick(cfg, now, data, issue, notify)
+
+
 def _loop():
     while not _STOP.is_set():
         try:
-            did = tick()
+            did = look()
             for d in did:
                 print(f"  schedule: {d[0]} {d[1]}", flush=True)
         # SystemExit too: config.load() exits the process when there is no

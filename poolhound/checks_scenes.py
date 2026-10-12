@@ -141,36 +141,3 @@ def t_a_scene_can_be_scheduled_and_is_named_by_its_name():
               S._what(sch), "a scene that has since been deleted")
     finally:
         _unbox(d, prev)
-
-
-def t_the_pi_keeps_the_last_scenes_it_saw_when_the_server_is_away():
-    print("\n  scenes — poolhound local can still run a scene with the server unreachable")
-    import json, threading
-    from . import agent as A
-    cache = A.SceneCache()
-    check("before any fetch it says so", (cache.view()["scenes"], cache.view()["error"]),
-          ([], "not fetched yet"))
-    one = [{"id": "a1", "name": "Evening", "steps": [{"action": "set", "device": "Aux_1", "value": 1}]}]
-    stop = threading.Event()
-    replies = iter([json.dumps({"scenes": one}), None])
-
-    class Resp:
-        def __init__(self, body): self.body = body
-        def read(self): return self.body.encode()
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-
-    class Srv:
-        def _req(self, path, data, method, timeout):
-            body = next(replies)
-            if body is None:
-                stop.set()
-                raise OSError("server unreachable")
-            return Resp(body)
-    real_wait = stop.wait
-    stop.wait = lambda s: real_wait(0)
-    A.scenes_fetcher(Srv(), stop, cache, clock=lambda: 1000)
-    v = cache.view()
-    check("a failed fetch keeps the last list it had", [s["name"] for s in v["scenes"]], ["Evening"])
-    check("and says why, without emptying it", "OSError" in (v["error"] or ""), True)
-    check("with when it last succeeded", v["fetched_at"], 1000)

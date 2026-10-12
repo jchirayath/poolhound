@@ -458,6 +458,16 @@ and Select opened ADD instead of CHANGE. It failed safe, and nothing changed.
 Press, `waitfor_pda_queue2empty()`, then wait for the SCREEN to show the
 change (`wait_until()` in `pda_programs.c`).
 
+**The Pi runs the scenes and schedules; the server mirrors them.**
+`docs/LOCAL-AND-SYNC.md`. Same `schedule.py` and `scenes.py` on both machines;
+`pirunner.py` runs `tick()` on the Pi with injected issue, panel and authority,
+and `schedule.look()` on the server fires nothing once `pi_runs()`. Never let
+the Pi write its card on a quiet tick (`tick()` saves only on a changed
+fingerprint), never sync on a timer (only on a change, a nudge or a
+reconnect), and never serve WHO on `/local`. A removal of any kind goes
+through `schedule._remove()`, which leaves the deletion marker; a bare
+`list.remove()` lets the other side's copy bring it back.
+
 **AqualinkD's schedules are replaced whole, and each field ends up in a root
 cron line.** `/api/schedules/set` rewrites `/etc/cron.d/aqualinkd` from the
 list it is sent, so a `cron` command carries the complete list plus `expect`,

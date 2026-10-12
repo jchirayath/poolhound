@@ -191,8 +191,26 @@ def names_from_aqualinkd(raw):
     return out
 
 
+def runner_from_agent(raw):
+    """The Pi's scheduler, as it reported itself: when it last looked, how many
+    looks failed and the last reason, when it last synced and why not. Rides
+    on this report, not on the sync, because it changes every twenty seconds
+    and the sync must stay quiet when nothing a person made has changed."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for k in ("started", "last_tick", "last_sync"):
+        v = _s(raw.get(k), 32)
+        out[k] = v if re.fullmatch(r"[0-9T:+.\-]{10,32}", v or "") else None
+    out["ticks"] = _i(raw.get("ticks"), 0, 2**40) or 0
+    out["errors"] = _i(raw.get("errors"), 0, 2**40) or 0
+    out["last_error"] = _s(raw.get("last_error"), 200)
+    out["sync_error"] = _s(raw.get("sync_error"), 200)
+    return out
+
+
 def snapshot(programs_raw, programs_err, schedules_raw, schedules_err, now=None,
-             names=None):
+             names=None, runner=None):
     """What the agent pushes: both kinds, each with its own error, so a Pi
     whose AqualinkD cannot read the panel still reports its cron schedules."""
     now = now if now is not None else time.time()
@@ -211,6 +229,7 @@ def snapshot(programs_raw, programs_err, schedules_raw, schedules_err, now=None,
         body["aqualinkd"] = {"error": _s(schedules_err, 80), "schedules": [],
                              "dropped": 0}
     body["aqualinkd"]["names"] = names_from_aqualinkd(names)
+    body["runner"] = runner_from_agent(runner)
     return body
 
 
@@ -247,7 +266,8 @@ def validate(body):
                           # the Pi's output: either means a save would lose
                           # entries nobody was shown.
                           "dropped": (_i(aqd.get("dropped"), 0, 999) or 0) + dropped,
-                          "names": names_from_aqualinkd(aqd.get("names"))}}, None
+                          "names": names_from_aqualinkd(aqd.get("names"))},
+            "runner": runner_from_agent(body.get("runner"))}, None
 
 
 # --------------------------------------------------------- changing one

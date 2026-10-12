@@ -117,7 +117,8 @@ agent ──── GET  /api/agent/commands ─────────►  hub 
 agent ──── POST /api/agent/ack ──────────────►  hub      what became of a command
 agent ──── POST /api/agent/note ─────────────►  hub      which door a change came through
 agent ──── POST /api/agent/schedules ────────►  hub      the panel's programs, every 30 min
-agent ──── GET  /api/agent/scenes ───────────►  hub      the scenes, for poolhound local
+agent ──── POST /api/agent/sync ─────────────►  hub      scenes and schedules, only on a change
+      ◄─── {"type": "sync"} down the stream ───  the hub's scenes or schedules changed
 ```
 
 Those are poolhound's paths. A generic implementation would name the upstream one

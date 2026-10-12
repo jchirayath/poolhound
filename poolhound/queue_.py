@@ -107,14 +107,26 @@ class CommandQueue:
             return len(self._subs)
 
     # --------------------------------------------------------------- issuing
-    def issue(self, action, device=None, value=None, by=None):
+    def nudge(self):
+        """Tell every connected agent that the scenes or schedules changed
+        here, so it syncs now (docs/LOCAL-AND-SYNC.md). Not a command: it
+        carries no action, is not rate limited and is not logged, and an agent
+        that misses it syncs anyway the next time it connects."""
+        with self._lock:
+            for q in list(self._subs):
+                try:
+                    q.put_nowait({"type": "sync"})
+                except queue.Full:
+                    pass
+
+    def issue(self, action, device=None, value=None, by=None, off_after_h=None):
         """Validate here as well as at the agent.
 
         Not because the agent's check can be skipped — it cannot — but because
         refusing a bad command at the point somebody pressed the button gives
         them an answer immediately, instead of a round trip and a silence.
         """
-        cmd = C.new_command(action, device, value, by)
+        cmd = C.new_command(action, device, value, by, off_after_h)
         cmd = C.validate(cmd)          # raises Refused, which the caller shows
         delivered = 0
         with self._lock:
