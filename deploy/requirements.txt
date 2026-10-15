@@ -4,10 +4,10 @@
 #
 # The WaterGuru collector needs the first four; the server, the renderer, the
 # agent and the Leslie's scraper are stdlib.
-boto3==1.43.108
+boto3==1.43.111
 pycognito==2024.5.1
 requests==2.34.2
-requests-aws4auth==1.3.2
+requests-aws4auth==1.4.0
 
 # The public volume calculator's photo tracer. Everything it needed was a host
 # binary — sips, magick, convert, exiftool — and this image had none of them, so
@@ -21,7 +21,7 @@ requests-aws4auth==1.3.2
 # packages in the image. pillow-heif 0.22.0 carried a 9.1 and Pillow 11.3.0
 # carried seventeen advisories while nothing in the repo scanned dependencies.
 Pillow==12.3.0
-pillow-heif==1.8.0
+pillow-heif==1.8.1
 
 # TRANSITIVE, AND PINNED HERE ON PURPOSE — each one for a reason the resolver
 # does not know about.
